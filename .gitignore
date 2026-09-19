@@ -18,3 +18,4 @@ config.local.yaml
 .vscode/
 *.swp
 claude.md
+llm-gateway-roadmap.md

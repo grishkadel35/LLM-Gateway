@@ -4,6 +4,59 @@ A reverse proxy that sits between your applications and LLM providers (OpenAI,
 Anthropic). Right now it forwards requests transparently and logs them. Rate
 limiting, response caching, and budget enforcement plug in later.
 
+## Project status
+
+**Last updated:** 2026-09-19
+**Stage:** Week 1 of 8 complete — transparent proxy working, no external
+dependencies yet.
+
+### What changed
+
+- Tests for all four internal packages: proxy forwarding and header handling,
+  the health endpoint and its routing, the logging middleware, and config
+  loading and validation.
+- Generated `go.sum` for the `gopkg.in/yaml.v3` dependency.
+- Removed `llm-gateway/go.mod`, a nested duplicate of the root module file.
+- Added this README and `.gitignore`.
+
+### Week 1 deliverables
+
+- [x] `cmd/gateway/main.go` — starts the HTTP server
+- [x] `internal/proxy/proxy.go` — reverse proxy with Director, ModifyResponse,
+      and ErrorHandler
+- [x] `internal/config/config.go` — YAML config (port, upstream URL, timeout)
+- [x] `internal/middleware/logging.go` — structured JSON request logging
+- [x] `internal/health/health.go` — `GET /health` → `{"status":"ok"}`
+- [x] `Makefile` — build, run, test targets
+- [x] Tests: proxy forwarding, health endpoint, logging doesn't break responses
+- [x] `go build`, `go vet ./...`, `go test ./...` all pass
+
+The Week 1 checkpoint is "point any OpenAI client at `localhost:8080` and it
+proxies transparently." That is verified with `curl` against a local fake
+upstream — the `Authorization` header passes through untouched, the Host is
+rewritten, `X-Forwarded-For` is set once, and `/health` is served locally
+without touching the upstream. It has **not** yet been exercised against a real
+provider with a live API key, or with a provider SDK rather than `curl`.
+
+### Next: Week 2 — API keys and per-tenant tracking
+
+Goal: every request is authenticated, and its token usage and dollar cost are
+logged.
+
+- Postgres schema: `tenants` and `usage_logs` tables
+- `internal/tenant/tenant.go` — API key generation (`crypto/rand` + bcrypt)
+- `internal/middleware/auth.go` — authenticate, attach the tenant to the
+  request context
+- `internal/tenant/usage.go` — parse the provider's `usage` field, compute cost
+  from a pricing table, write to `usage_logs`
+- `internal/pricing/pricing.go` — per-model pricing lookup
+- `GET /admin/tenants/{id}/usage` — usage summary endpoint
+
+This is the first week the gateway stops being dependency-free: it adds
+Postgres and the `pgx` driver. Auth middleware runs *before* the proxy, so a
+request with a bad key never reaches the provider; usage logging hooks into
+`ModifyResponse`, where the token counts arrive.
+
 ## Quick start
 
 ```sh
