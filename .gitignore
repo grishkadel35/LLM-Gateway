@@ -1,0 +1,20 @@
+# Compiled binaries
+/bin/
+gateway
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# Local config overrides — keep secrets and machine-specific settings out of git
+config.local.yaml
+.env
+.env.*
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+claude.md
