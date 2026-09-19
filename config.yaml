@@ -1,0 +1,17 @@
+# llm-gateway configuration.
+#
+# Any key you leave out falls back to the default shown in the comment.
+
+# Port the gateway itself listens on.
+port: 8080
+
+upstream:
+  # The LLM provider every non-/health request is forwarded to.
+  # Anthropic:  https://api.anthropic.com
+  # OpenAI:     https://api.openai.com
+  url: https://api.openai.com
+
+  # How long to wait for the upstream to start responding, in seconds.
+  # This is a response-header timeout, not a total-request timeout, so
+  # streaming responses are free to run longer than this.
+  timeout: 30
