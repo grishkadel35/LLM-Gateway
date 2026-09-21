@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -45,23 +46,67 @@ func main() {
 	}
 }
 
+// router builds the gateway's route table: one reverse proxy per configured
+// provider, plus /health and a catch-all that rejects unknown prefixes.
+//
+// It's separated from run() so tests can exercise routing without starting a
+// real server or handling signals.
+func router(cfg *config.Config, logger *slog.Logger) (http.Handler, error) {
+	providers, err := cfg.BuildProviders()
+	if err != nil {
+		return nil, err
+	}
+
+	// http.ServeMux is the standard library router. The most specific pattern
+	// wins, so "/health" beats "/openai/" beats the catch-all "/".
+	mux := http.NewServeMux()
+	mux.Handle("/health", health.Handler())
+
+	for _, p := range providers {
+		// A trailing slash makes this a subtree pattern: "/openai/" matches
+		// "/openai/v1/chat/completions". StripPrefix then removes "/openai"
+		// before the proxy's Director joins what's left onto the provider's
+		// base URL — so routing and path rewriting need no custom code.
+		prefix := "/" + p.Name
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, proxy.New(p, logger)))
+	}
+
+	// Anything that names no provider is rejected. There is deliberately no
+	// default upstream: a typo in a base URL must never silently send traffic
+	// — and spend — to the wrong provider.
+	mux.Handle("/", unknownProvider(cfg.ProviderNames()))
+
+	return mux, nil
+}
+
+// unknownProvider returns the handler for paths that match no configured
+// provider. It lists what is configured, because the usual cause is a
+// misspelled base URL.
+func unknownProvider(names []string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"type":      "unknown_provider",
+				"message":   "no provider matches this path; point your client's base URL at /<provider>",
+				"providers": names,
+			},
+		})
+	})
+}
+
 // run wires everything together and blocks until the process is asked to stop.
 //
 // Go note: keeping the real work in run() instead of main() means it returns an
 // error normally. os.Exit skips deferred functions, so we want exactly one place
 // (main) that calls it.
 func run(cfg *config.Config, logger *slog.Logger) error {
-	rp, err := proxy.New(cfg.Upstream.URL, cfg.Upstream.Timeout(), logger)
+	mux, err := router(cfg, logger)
 	if err != nil {
 		return err
 	}
-
-	// http.ServeMux is the standard library router. Longer patterns win, so
-	// "/health" is matched before the catch-all "/" — health checks never reach
-	// the proxy.
-	mux := http.NewServeMux()
-	mux.Handle("/health", health.Handler())
-	mux.Handle("/", rp)
 
 	handler := middleware.Logging(logger)(mux)
 
@@ -89,8 +134,13 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	go func() {
 		logger.Info("gateway listening",
 			"addr", srv.Addr,
-			"upstream", cfg.Upstream.URL,
-			"timeout_seconds", cfg.Upstream.TimeoutSeconds,
+			"providers", cfg.ProviderNames(),
+		)
+		// The gateway now holds real provider API keys but has no tenant
+		// authentication yet (that arrives with middleware/auth.go). Until
+		// then, anything that can reach this address can spend those keys.
+		logger.Warn("no tenant authentication configured: any client that can reach this address can spend the configured provider keys",
+			"addr", srv.Addr,
 		)
 		serverErr <- srv.ListenAndServe()
 	}()

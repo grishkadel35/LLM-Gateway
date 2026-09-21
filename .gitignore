@@ -1,6 +1,8 @@
 # Compiled binaries
 /bin/
-gateway
+# Leading slash anchors this to the repo root. Without it the pattern would
+# also match the cmd/gateway/ directory and silently ignore new files in it.
+/gateway
 
 # Test and coverage output
 *.test

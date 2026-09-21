@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/grishkadel/llm-gateway/internal/provider"
 )
 
 // discardLogger returns a logger that throws its output away, so test runs stay
@@ -32,16 +34,30 @@ func mustHost(t *testing.T, rawURL string) string {
 	return u.Host
 }
 
-// newTestProxy builds a proxy pointed at upstreamURL, failing the test if the
-// constructor errors.
+// testProvider builds a bearer-auth provider pointed at upstreamURL, the way
+// the config package would.
+func testProvider(t *testing.T, upstreamURL string) provider.Provider {
+	t.Helper()
+
+	u, err := url.Parse(upstreamURL)
+	if err != nil {
+		t.Fatalf("parsing %q: %v", upstreamURL, err)
+	}
+
+	return provider.Provider{
+		Name:    "testprovider",
+		URL:     u,
+		Timeout: 5 * time.Second,
+		Key:     "sk-gateway-key",
+		Auth:    provider.AuthBearer,
+	}
+}
+
+// newTestProxy builds a proxy pointed at upstreamURL.
 func newTestProxy(t *testing.T, upstreamURL string) http.Handler {
 	t.Helper()
 
-	p, err := New(upstreamURL, 5*time.Second, discardLogger())
-	if err != nil {
-		t.Fatalf("New(%q) returned error: %v", upstreamURL, err)
-	}
-	return p
+	return New(testProvider(t, upstreamURL), discardLogger())
 }
 
 // TestProxyForwardsRequestAndResponse is the core end-to-end test: stand up a
@@ -123,10 +139,13 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 	if gotBody != `{"model":"gpt-4"}` {
 		t.Errorf("upstream body = %q, want %q", gotBody, `{"model":"gpt-4"}`)
 	}
-	// The whole point of a transparent gateway: the caller's credentials reach
-	// the provider unchanged.
-	if gotAuth != "Bearer sk-test-123" {
-		t.Errorf("upstream Authorization = %q, want %q", gotAuth, "Bearer sk-test-123")
+	// The gateway holds the provider credentials now. The client's own key is
+	// stripped and replaced with the gateway's — it must never reach upstream.
+	if gotAuth == "Bearer sk-test-123" {
+		t.Error("upstream received the client's Authorization header; it must be stripped")
+	}
+	if gotAuth != "Bearer sk-gateway-key" {
+		t.Errorf("upstream Authorization = %q, want the gateway's own key %q", gotAuth, "Bearer sk-gateway-key")
 	}
 	// The Host header must be rewritten to the upstream, not left as the
 	// gateway's own host, or providers will route or TLS-verify incorrectly.
@@ -170,7 +189,9 @@ func TestProxySetsForwardedHeaders(t *testing.T) {
 }
 
 // TestProxyPreservesUpstreamBasePath covers an upstream URL that carries a path
-// prefix, e.g. https://host/openai/v1 in front of an Azure-style deployment.
+// prefix. This is the Groq case: its OpenAI-compatible API lives at
+// https://api.groq.com/openai, so /groq/v1/models must arrive upstream as
+// /openai/v1/models.
 func TestProxyPreservesUpstreamBasePath(t *testing.T) {
 	var gotPath string
 
@@ -248,26 +269,75 @@ func TestProxyErrorHandlerOnUnreachableUpstream(t *testing.T) {
 	}
 }
 
-// TestNewRejectsBadUpstreamURL checks the constructor's validation.
+// TestProxyAppliesProviderAuth runs each provider shape end-to-end through the
+// proxy and asserts the upstream sees the right credential header — and never
+// the client's.
 //
 // Go note: this is a "table-driven test", the idiomatic Go pattern for testing
 // many inputs. t.Run creates a named subtest per case, so a failure names the
 // case that broke.
-func TestNewRejectsBadUpstreamURL(t *testing.T) {
+func TestProxyAppliesProviderAuth(t *testing.T) {
 	cases := []struct {
-		name string
-		url  string
+		name       string
+		auth       provider.AuthStyle
+		headers    map[string]string
+		wantHeader string
+		wantValue  string
 	}{
-		{"empty", ""},
-		{"no scheme", "api.openai.com"},
-		{"scheme only", "https://"},
-		{"control character", "https://exa\x7fmple.com"},
+		{
+			name:       "openai",
+			auth:       provider.AuthBearer,
+			wantHeader: "Authorization",
+			wantValue:  "Bearer sk-gateway-key",
+		},
+		{
+			name:       "anthropic",
+			auth:       provider.AuthAPIKey,
+			headers:    map[string]string{"anthropic-version": "2023-06-01"},
+			wantHeader: "X-Api-Key",
+			wantValue:  "sk-gateway-key",
+		},
+		{
+			name:       "gemini",
+			auth:       provider.AuthGoogleKey,
+			wantHeader: "X-Goog-Api-Key",
+			wantValue:  "sk-gateway-key",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := New(tc.url, time.Second, discardLogger()); err == nil {
-				t.Errorf("New(%q) = nil error, want an error", tc.url)
+			var got http.Header
+
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Clone()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			p := testProvider(t, upstream.URL)
+			p.Name = tc.name
+			p.Auth = tc.auth
+			p.Headers = tc.headers
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			// The client sends its own key, which must not survive.
+			req.Header.Set("Authorization", "Bearer sk-CLIENT-LEAK")
+
+			New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+
+			if v := got.Get(tc.wantHeader); v != tc.wantValue {
+				t.Errorf("%s = %q, want %q", tc.wantHeader, v, tc.wantValue)
+			}
+			for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"} {
+				if got.Get(h) == "Bearer sk-CLIENT-LEAK" || got.Get(h) == "sk-CLIENT-LEAK" {
+					t.Errorf("%s leaked the client's credential to the upstream", h)
+				}
+			}
+			for name, want := range tc.headers {
+				if v := got.Get(name); v != want {
+					t.Errorf("%s = %q, want %q", name, v, want)
+				}
 			}
 		})
 	}

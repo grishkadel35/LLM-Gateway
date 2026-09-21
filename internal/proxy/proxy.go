@@ -4,7 +4,6 @@ package proxy
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -12,30 +11,21 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/grishkadel/llm-gateway/internal/provider"
 )
 
-// New returns a reverse proxy that forwards everything it receives to
-// upstreamURL.
+// New returns a reverse proxy that forwards everything it receives to p.
 //
-// Go note: this returns (*httputil.ReverseProxy, error) rather than panicking on
-// a bad URL. Constructors that can fail return an error; the caller handles it.
-func New(upstreamURL string, timeout time.Duration, logger *slog.Logger) (*httputil.ReverseProxy, error) {
-	target, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, fmt.Errorf("parsing upstream URL %q: %w", upstreamURL, err)
+// It takes no error return: p.URL is already parsed and validated by the config
+// package, which is the only thing that constructs a provider.Provider.
+func New(p provider.Provider, logger *slog.Logger) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Director:       director(p),
+		ModifyResponse: modifyResponse(p, logger),
+		ErrorHandler:   errorHandler(p, logger),
+		Transport:      transport(p.Timeout),
 	}
-	if target.Scheme == "" || target.Host == "" {
-		return nil, fmt.Errorf("upstream URL %q must include a scheme and host", upstreamURL)
-	}
-
-	proxy := &httputil.ReverseProxy{
-		Director:       director(target),
-		ModifyResponse: modifyResponse(logger),
-		ErrorHandler:   errorHandler(logger),
-		Transport:      transport(timeout),
-	}
-
-	return proxy, nil
 }
 
 // director rewrites each outbound request so it points at the upstream instead
@@ -45,7 +35,9 @@ func New(upstreamURL string, timeout time.Duration, logger *slog.Logger) (*httpu
 // Go, and the returned closure captures `target` and `logger` — the same idea as
 // a Python closure or functools.partial. It's how we inject dependencies into a
 // callback whose signature is fixed by the library.
-func director(target *url.URL) func(*http.Request) {
+func director(p provider.Provider) func(*http.Request) {
+	target := p.URL
+
 	return func(req *http.Request) {
 		// Capture the host the client asked for before we overwrite it below.
 		originalHost := req.Host
@@ -62,14 +54,11 @@ func director(target *url.URL) func(*http.Request) {
 		// "localhost:8080".
 		req.Host = target.Host
 
-		// The client's Authorization header is passed through untouched. We
-		// don't have to do anything for that — ReverseProxy copies the incoming
-		// headers onto the outbound request, and Authorization is not a
-		// hop-by-hop header, so it survives. The line below is deliberate
-		// documentation of that behaviour rather than a no-op: if you ever want
-		// the gateway to inject its own key instead, this is the place.
-		//
-		//   req.Header.Set("Authorization", "Bearer "+gatewayKey)
+		// Swap whatever credential the client sent for this provider's own key,
+		// in the header shape this provider expects. Apply strips every known
+		// credential header first, so a key meant for one provider can never
+		// reach another.
+		p.Apply(req.Header)
 
 		// X-Forwarded-* headers tell the upstream who originally made the call.
 		//
@@ -99,9 +88,10 @@ func director(target *url.URL) func(*http.Request) {
 // Go note: returning a non-nil error here makes ReverseProxy call ErrorHandler
 // instead of forwarding the response — that's how you'd reject or rewrite an
 // upstream response later on.
-func modifyResponse(logger *slog.Logger) func(*http.Response) error {
+func modifyResponse(p provider.Provider, logger *slog.Logger) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		logger.Info("upstream response",
+			"provider", p.Name,
 			"status", resp.StatusCode,
 			// ContentLength is -1 when the upstream uses chunked encoding,
 			// which is what streaming (SSE) completions do.
@@ -116,9 +106,10 @@ func modifyResponse(logger *slog.Logger) func(*http.Response) error {
 // errorHandler runs when we can't reach the upstream at all (DNS failure,
 // connection refused, timeout). Without it, ReverseProxy logs to stderr and
 // returns a bare 502 with an empty body; clients deserve JSON.
-func errorHandler(logger *slog.Logger) func(http.ResponseWriter, *http.Request, error) {
+func errorHandler(p provider.Provider, logger *slog.Logger) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		logger.Error("upstream request failed",
+			"provider", p.Name,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"error", err,
@@ -132,8 +123,9 @@ func errorHandler(logger *slog.Logger) func(http.ResponseWriter, *http.Request, 
 		// Go makes you write that out — an ignored error is always visible.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]string{
-				"type":    "upstream_unavailable",
-				"message": "the gateway could not reach the upstream provider",
+				"type":     "upstream_unavailable",
+				"provider": p.Name,
+				"message":  "the gateway could not reach the upstream provider",
 			},
 		})
 	}

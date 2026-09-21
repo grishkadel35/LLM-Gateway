@@ -1,17 +1,54 @@
 # llm-gateway configuration.
 #
 # Any key you leave out falls back to the default shown in the comment.
+#
+# API keys are NEVER written here. This file is committed to git. Keys are
+# environment references, expanded at startup; an unset variable is a startup
+# error, not a surprise 401 on the first request.
 
 # Port the gateway itself listens on.
 port: 8080
 
-upstream:
-  # The LLM provider every non-/health request is forwarded to.
-  # Anthropic:  https://api.anthropic.com
-  # OpenAI:     https://api.openai.com
-  url: https://api.openai.com
+# Address to bind to. Loopback by default and on purpose: the gateway holds
+# real provider keys but has no tenant authentication yet, so anything that can
+# reach this port can spend them. Change this only once auth exists.
+host: 127.0.0.1
 
-  # How long to wait for the upstream to start responding, in seconds.
-  # This is a response-header timeout, not a total-request timeout, so
-  # streaming responses are free to run longer than this.
-  timeout: 30
+# Each provider is reachable at /<name>/... — point your client's base URL at
+# the prefix and it speaks that provider's native API, unchanged. Adding a
+# provider is config only; no code changes.
+#
+#   OpenAI SDK   → base_url = "http://127.0.0.1:8080/openai/v1"
+#   Anthropic SDK→ base_url = "http://127.0.0.1:8080/anthropic"
+#
+# auth selects how the key is presented: bearer | x-api-key | x-goog-api-key
+# timeout is how long to wait for the provider to start responding, in seconds.
+# It is a response-header timeout, so streaming replies may run longer.
+providers:
+  openai:
+    url: https://api.openai.com
+    timeout: 30
+    key: ${OPENAI_API_KEY}
+    auth: bearer
+
+  anthropic:
+    url: https://api.anthropic.com
+    timeout: 30
+    key: ${ANTHROPIC_API_KEY}
+    auth: x-api-key
+    headers:
+      anthropic-version: "2023-06-01"
+
+  gemini:
+    url: https://generativelanguage.googleapis.com
+    timeout: 30
+    key: ${GEMINI_API_KEY}
+    auth: x-goog-api-key
+
+  # Groq serves an OpenAI-compatible API under a base path. Same auth style as
+  # OpenAI, different URL — proving a new provider of this kind is pure config.
+  groq:
+    url: https://api.groq.com/openai
+    timeout: 30
+    key: ${GROQ_API_KEY}
+    auth: bearer
