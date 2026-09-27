@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -338,6 +339,56 @@ func TestProxyAppliesProviderAuth(t *testing.T) {
 				if v := got.Get(name); v != want {
 					t.Errorf("%s = %q, want %q", name, v, want)
 				}
+			}
+		})
+	}
+}
+
+// TestProxyLogsStreamingFromContentType checks the "streaming" field of the
+// upstream-response log line. It must follow the Content-Type, not the
+// Content-Length: providers such as Groq send ordinary JSON replies with
+// chunked encoding (Content-Length -1), and those aren't streams.
+func TestProxyLogsStreamingFromContentType(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		chunked     bool
+		want        bool
+	}{
+		{"json with length", "application/json", false, false},
+		{"chunked json", "application/json", true, false},
+		{"sse", "text/event-stream", true, true},
+		{"sse with charset", "text/event-stream; charset=utf-8", true, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tt.contentType)
+				_, _ = io.WriteString(w, "{}")
+				if tt.chunked {
+					// Flushing before the handler returns means the length
+					// isn't known yet, so the server switches to chunked.
+					w.(http.Flusher).Flush()
+				}
+			}))
+			defer upstream.Close()
+
+			var logs strings.Builder
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			p := New(testProvider(t, upstream.URL), logger)
+
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+			var line struct {
+				Streaming bool `json:"streaming"`
+			}
+			if err := json.Unmarshal([]byte(logs.String()), &line); err != nil {
+				t.Fatalf("parsing log line %q: %v", logs.String(), err)
+			}
+			if line.Streaming != tt.want {
+				t.Errorf("streaming = %v, want %v (log: %s)", line.Streaming, tt.want, logs.String())
 			}
 		})
 	}

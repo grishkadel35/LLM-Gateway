@@ -5,6 +5,7 @@ package proxy
 import (
 	"encoding/json"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -93,14 +94,25 @@ func modifyResponse(p provider.Provider, logger *slog.Logger) func(*http.Respons
 		logger.Info("upstream response",
 			"provider", p.Name,
 			"status", resp.StatusCode,
-			// ContentLength is -1 when the upstream uses chunked encoding,
-			// which is what streaming (SSE) completions do.
+			// ContentLength is -1 when the upstream uses chunked encoding.
+			// That isn't the same as streaming: some providers (Groq) chunk
+			// ordinary JSON replies too.
 			"content_length", resp.ContentLength,
 			"content_type", resp.Header.Get("Content-Type"),
-			"streaming", resp.ContentLength < 0,
+			"streaming", isEventStream(resp),
 		)
 		return nil
 	}
+}
+
+// isEventStream reports whether resp is a server-sent event stream, which is
+// how every supported provider delivers streamed completions.
+//
+// Go note: mime.ParseMediaType drops parameters like "; charset=utf-8" and
+// lowercases the type, so we compare only the media type itself.
+func isEventStream(resp *http.Response) bool {
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	return err == nil && mediaType == "text/event-stream"
 }
 
 // errorHandler runs when we can't reach the upstream at all (DNS failure,
