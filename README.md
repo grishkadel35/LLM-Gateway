@@ -18,7 +18,8 @@ provider is a block of YAML, not code.
 
 **Last updated:** 2026-09-27
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
-routing. No external service dependencies yet.
+routing. Week 2 in progress: the mock provider is done. No external service
+dependencies yet.
 
 ### What changed
 
@@ -63,25 +64,25 @@ OpenAI and Anthropic have not been tried with live keys. OpenAI uses the same
 `bearer` path that Groq exercised; Anthropic's `x-api-key` style is covered by
 tests only.
 
-### Next: Week 2 — API keys and per-tenant tracking
+### In progress: Week 2 — API keys and per-tenant tracking
 
 Goal: every request is authenticated, and its token usage and dollar cost are
 logged — including streamed responses.
 
-- `cmd/mockprovider` — fake OpenAI, Anthropic and Gemini upstreams, streaming
+- [x] `cmd/mockprovider` — fake OpenAI, Anthropic and Gemini upstreams, streaming
   and non-streaming, so nothing below costs money to test
-- Postgres (via docker-compose) with `goose` migrations: `tenants` and
+- [ ] Postgres (via docker-compose) with `goose` migrations: `tenants` and
   `usage_logs` tables; CI running `go vet` and `go test`
-- `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
+- [ ] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
   indexed lookup
-- `internal/middleware/auth.go` — reads the gateway key from the client SDK's
+- [ ] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header and attaches the tenant to the request context
-- A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
+- [ ] A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
   usage parser for each
-- `internal/usage` — reads token counts from the response as it streams past,
+- [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
-- `internal/pricing` — per-model prices in integer micro-dollars
-- Admin routes behind a separate admin key: `POST /admin/tenants`,
+- [ ] `internal/pricing` — per-model prices in integer micro-dollars
+- [ ] Admin routes behind a separate admin key: `POST /admin/tenants`,
   `GET /admin/tenants/{id}/usage`
 
 This is the first week the gateway stops being dependency-free: it adds
@@ -129,6 +130,38 @@ from openai import OpenAI
 # which strips it and substitutes its own.
 client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key="unused")
 ```
+
+### Without API keys
+
+`cmd/mockprovider` serves fake OpenAI, Anthropic and Gemini APIs on one port,
+and `config.mock.yaml` points the gateway's providers at it. Nothing leaves the
+machine and nothing costs money:
+
+```sh
+make mock       # terminal 1: mock provider on 127.0.0.1:9090
+make run-mock   # terminal 2: gateway on 127.0.0.1:8080
+```
+
+Client base URLs are the same as against the real providers. Every reply is the
+same fixed text with the same usage numbers (20 prompt tokens, 5 of them
+cached, 10 output), so tests can assert exact counts. The mock reproduces the
+details a usage parser has to get right:
+
+- **OpenAI** streams report usage only when the request sets
+  `stream_options.include_usage`.
+- **Anthropic** puts input usage in `message_start` with a placeholder output
+  count; the real output count arrives in `message_delta`. `input_tokens`
+  excludes cache reads (it reports 15, plus 5 in `cache_read_input_tokens`).
+- **Gemini** sends `usageMetadata` on every chunk as a running total, not a
+  delta. It streams as SSE with `?alt=sse` (what the SDKs use) and as one JSON
+  array without it.
+
+It also checks each provider's credential header is present (and Anthropic's
+`anthropic-version`), so a provider configured with the wrong `auth` style
+gets a 401, as it would from the real API.
+
+The handlers live in `internal/mockprovider`, so Go tests can run them
+in-process with `httptest.NewServer(mockprovider.Handler())`.
 
 ## Configuration
 
@@ -204,16 +237,18 @@ rotation even though it is working fine.
 
 ## Make targets
 
-| Command      | What it does                          |
-| ------------ | ------------------------------------- |
-| `make build` | Compile to `./bin/gateway`            |
-| `make run`   | Build, then run                       |
-| `make test`  | Run all tests                         |
-| `make vet`   | Run `go vet` (catches suspicious code)|
-| `make fmt`   | Format all source files               |
-| `make tidy`  | Sync `go.mod` / `go.sum`              |
-| `make clean` | Remove `./bin`                        |
-| `make all`   | fmt, vet, test, build                 |
+| Command         | What it does                           |
+| --------------- | -------------------------------------- |
+| `make build`    | Compile to `./bin/gateway`             |
+| `make run`      | Build, then run                        |
+| `make mock`     | Run the mock provider on :9090         |
+| `make run-mock` | Run the gateway against the mock       |
+| `make test`     | Run all tests                          |
+| `make vet`      | Run `go vet` (catches suspicious code) |
+| `make fmt`      | Format all source files                |
+| `make tidy`     | Sync `go.mod` / `go.sum`               |
+| `make clean`    | Remove `./bin`                         |
+| `make all`      | fmt, vet, test, build                  |
 
 ## Layout
 
@@ -224,6 +259,8 @@ internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy and its hooks
 internal/middleware/      request logging
 internal/health/          GET /health
+internal/mockprovider/    fake OpenAI/Anthropic/Gemini APIs for testing
+cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 ```
 
 Routing costs no custom code: each provider is registered on `ServeMux` as
