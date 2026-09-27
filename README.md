@@ -16,9 +16,9 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-09-20
-**Stage:** Week 1 of 8 complete, plus multi-provider routing. No external
-service dependencies yet.
+**Last updated:** 2026-09-27
+**Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
+routing. No external service dependencies yet.
 
 ### What changed
 
@@ -52,9 +52,16 @@ right credential header is applied per provider, the client's own credential is
 stripped, Groq's base path is preserved, an unknown prefix returns 404 without
 contacting anything, and `/health` is served locally.
 
-It has **not** yet been exercised against a real provider with a live API key,
-or with a provider SDK rather than `curl`. That's the one remaining step to
-close the checkpoint.
+It has also been exercised against live providers through their official SDKs
+(2026-09-27): Groq via the `openai` Python SDK and Gemini via `google-genai`,
+one non-streaming and one streaming request each. Each client sent a bogus API
+key, so a successful reply shows the gateway substituted its own. Streams
+arrived incrementally rather than as one buffered block: Groq delivered 79
+chunks and Gemini 5, spread across the generation.
+
+OpenAI and Anthropic have not been tried with live keys. OpenAI uses the same
+`bearer` path that Groq exercised; Anthropic's `x-api-key` style is covered by
+tests only.
 
 ### Next: Week 2 — API keys and per-tenant tracking
 
