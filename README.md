@@ -59,21 +59,29 @@ close the checkpoint.
 ### Next: Week 2 — API keys and per-tenant tracking
 
 Goal: every request is authenticated, and its token usage and dollar cost are
-logged.
+logged — including streamed responses.
 
-- Postgres schema: `tenants` and `usage_logs` tables
-- `internal/tenant/tenant.go` — API key generation (`crypto/rand` + bcrypt)
-- `internal/middleware/auth.go` — authenticate, attach the tenant to the
-  request context
-- `internal/tenant/usage.go` — parse the provider's `usage` field, compute cost
-  from a pricing table, write to `usage_logs`
-- `internal/pricing/pricing.go` — per-model pricing lookup
-- `GET /admin/tenants/{id}/usage` — usage summary endpoint
+- `cmd/mockprovider` — fake OpenAI, Anthropic and Gemini upstreams, streaming
+  and non-streaming, so nothing below costs money to test
+- Postgres (via docker-compose) with `goose` migrations: `tenants` and
+  `usage_logs` tables; CI running `go vet` and `go test`
+- `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
+  indexed lookup
+- `internal/middleware/auth.go` — reads the gateway key from the client SDK's
+  native credential header and attaches the tenant to the request context
+- A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
+  usage parser for each
+- `internal/usage` — reads token counts from the response as it streams past,
+  without buffering it, and writes `usage_logs` rows in async batches
+- `internal/pricing` — per-model prices in integer micro-dollars
+- Admin routes behind a separate admin key: `POST /admin/tenants`,
+  `GET /admin/tenants/{id}/usage`
 
 This is the first week the gateway stops being dependency-free: it adds
 Postgres and the `pgx` driver. Auth middleware runs *before* the proxy, so a
-request with a bad key never reaches the provider; usage logging hooks into
-`ModifyResponse`, where the token counts arrive.
+request with a bad key never reaches the provider. Usage is counted by
+wrapping the response body in `ModifyResponse`, so streaming responses are
+metered too; otherwise `stream: true` would bypass every future limit.
 
 ## Quick start
 
