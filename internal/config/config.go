@@ -7,11 +7,14 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -21,14 +24,23 @@ import (
 
 // Default values used when a key is absent from config.yaml.
 const (
-	DefaultPort           = 8080
-	DefaultTimeoutSeconds = 30
+	DefaultPort = 8080
+	// DefaultTimeoutSeconds bounds the wait for a provider's response headers.
+	// A non-streaming completion sends no headers until generation finishes,
+	// which can take minutes, so this matches the official SDKs' own 10-minute
+	// default: the gateway should never give up before the client would.
+	DefaultTimeoutSeconds = 600
 	// DefaultHost is deliberately loopback-only. The gateway holds real
 	// provider API keys but has no tenant authentication yet, so anything that
 	// can reach the port can spend them. Binding to 0.0.0.0 is a decision the
 	// operator has to make explicitly.
 	DefaultHost = "127.0.0.1"
 )
+
+// validName is what a provider name may contain. The name becomes a URL path
+// segment and a ServeMux pattern, where a space or a brace changes the
+// pattern's meaning and panics at startup instead of failing validation.
+var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // reservedNames are provider names that would collide with the gateway's own
 // routes. A provider called "health" would shadow GET /health.
@@ -97,7 +109,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
 
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	// KnownFields makes an unrecognised key an error. Without it a typo such as
+	// "timout: 60" is silently ignored and the default applies instead. An
+	// empty file decodes to io.EOF; it falls through to Validate, which
+	// reports what's missing.
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}
 
@@ -136,21 +154,31 @@ func (c *Config) resolve() error {
 	return nil
 }
 
+// envRef matches a key written as exactly one environment reference, such as
+// ${OPENAI_API_KEY}, and captures the variable name.
+var envRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$`)
+
 // expandKey resolves a ${VAR} reference against the environment.
+//
+// The whole value must be one reference. A literal key would end up committed
+// to git, and a partial one ("${KEY}-suffix") would turn an unset variable
+// into a plausible-looking wrong key rather than an error.
 //
 // An unset variable is a startup error rather than an empty key, so a
 // misconfigured deployment fails immediately instead of on its first request
 // with a confusing 401 from the provider.
 func expandKey(name, raw string) (string, error) {
-	if raw == "" {
-		return "", fmt.Errorf("provider %q: key must be set (use an environment reference such as ${PROVIDER_API_KEY})", name)
+	m := envRef.FindStringSubmatch(raw)
+	if m == nil {
+		// raw is deliberately left out of the message: it may be a real key.
+		return "", fmt.Errorf("provider %q: key must be a single environment reference such as ${PROVIDER_API_KEY}, never a literal", name)
 	}
 
-	expanded := os.ExpandEnv(raw)
-	if expanded == "" {
+	value := os.Getenv(m[1])
+	if value == "" {
 		return "", fmt.Errorf("provider %q: key %q resolves to an empty value; is that environment variable set?", name, raw)
 	}
-	return expanded, nil
+	return value, nil
 }
 
 // Validate checks that the config makes sense before we try to serve traffic.
@@ -176,15 +204,11 @@ func (c *Config) Validate() error {
 
 // validate checks a single provider entry.
 func (pc ProviderConfig) validate(name string) error {
-	if name == "" {
-		return fmt.Errorf("provider names must not be empty")
+	if !validName.MatchString(name) {
+		return fmt.Errorf("provider name %q must be non-empty and contain only letters, digits, '-' and '_': it is used as a URL path prefix", name)
 	}
 	if reservedNames[name] {
 		return fmt.Errorf("provider name %q is reserved: it would shadow the gateway's own /%s route", name, name)
-	}
-	// The name becomes a URL path segment, so it must not contain a separator.
-	if strings.ContainsAny(name, "/?#") {
-		return fmt.Errorf("provider name %q must not contain '/', '?' or '#': it is used as a URL path prefix", name)
 	}
 
 	if pc.URL == "" {

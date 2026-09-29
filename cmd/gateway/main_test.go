@@ -50,26 +50,32 @@ func newTestRouter(t *testing.T) (http.Handler, map[string]*fakeUpstream) {
 		"groq":      newFakeUpstream(t),
 	}
 
+	// Keys must be environment references; the values are what the upstreams
+	// should receive.
+	for name := range ups {
+		t.Setenv("TEST_"+strings.ToUpper(name)+"_KEY", "sk-"+name)
+	}
+
 	// Groq's real API lives under a base path; keep that shape in the fake.
 	yaml := fmt.Sprintf(`
 providers:
   openai:
     url: %s
-    key: sk-openai
+    key: ${TEST_OPENAI_KEY}
     auth: bearer
   anthropic:
     url: %s
-    key: sk-anthropic
+    key: ${TEST_ANTHROPIC_KEY}
     auth: x-api-key
     headers:
       anthropic-version: "2023-06-01"
   gemini:
     url: %s
-    key: sk-gemini
+    key: ${TEST_GEMINI_KEY}
     auth: x-goog-api-key
   groq:
     url: %s/openai
-    key: sk-groq
+    key: ${TEST_GROQ_KEY}
     auth: bearer
 `, ups["openai"].server.URL, ups["anthropic"].server.URL,
 		ups["gemini"].server.URL, ups["groq"].server.URL)

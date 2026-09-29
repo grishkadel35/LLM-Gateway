@@ -37,7 +37,7 @@ dependencies yet.
 ### Week 1 deliverables
 
 - [x] `cmd/gateway/main.go` — starts the HTTP server
-- [x] `internal/proxy/proxy.go` — reverse proxy with Director, ModifyResponse,
+- [x] `internal/proxy/proxy.go` — reverse proxy with Rewrite, ModifyResponse,
       and ErrorHandler
 - [x] `internal/config/config.go` — YAML config (port, host, providers)
 - [x] `internal/middleware/logging.go` — structured JSON request logging
@@ -174,7 +174,7 @@ host: 127.0.0.1     # bind address — loopback until tenant auth exists
 providers:
   openai:
     url: https://api.openai.com
-    timeout: 30                  # seconds to wait for response headers
+    timeout: 600                 # seconds to wait for response headers
     key: ${OPENAI_API_KEY}       # environment reference, never a literal
     auth: bearer                 # bearer | x-api-key | x-goog-api-key
 
@@ -190,8 +190,10 @@ providers:
 `auth` are required per provider.
 
 **Keys are always environment references.** `config.yaml` is committed to git;
-a literal key there would be published. Expansion happens only on the `key`
-field, so other values containing `$` are left alone.
+a literal key there would be published, so `key` must be exactly one `${VAR}`
+and anything else is a startup error. Expansion happens only on the `key`
+field, so other values containing `$` are left alone. Unknown fields are
+startup errors too, so a typo can't silently fall back to a default.
 
 Point `GATEWAY_CONFIG` at a different file to use one:
 
@@ -201,7 +203,10 @@ GATEWAY_CONFIG=config.local.yaml make run
 
 `timeout` bounds how long we wait for a provider to *start* replying, not total
 request time. Streaming completions hold the connection open for minutes, and a
-total-request cap would cut them off mid-generation.
+total-request cap would cut them off mid-generation. A non-streaming reply
+sends no headers until the whole generation is done, which is why the default
+is 600 seconds, the same as the official SDKs. A timeout returns `504`; an
+unreachable provider returns `502`.
 
 ### Adding a provider
 

@@ -23,17 +23,19 @@ host: 127.0.0.1
 #
 # auth selects how the key is presented: bearer | x-api-key | x-goog-api-key
 # timeout is how long to wait for the provider to start responding, in seconds.
-# It is a response-header timeout, so streaming replies may run longer.
+# It is a response-header timeout, so streaming replies may run longer. A
+# non-streaming reply sends no headers until generation finishes, so this has
+# to cover the whole generation; 600 matches the official SDKs' default.
 providers:
   openai:
     url: https://api.openai.com
-    timeout: 30
+    timeout: 600
     key: ${OPENAI_API_KEY}
     auth: bearer
 
   anthropic:
     url: https://api.anthropic.com
-    timeout: 30
+    timeout: 600
     key: ${ANTHROPIC_API_KEY}
     auth: x-api-key
     headers:
@@ -41,7 +43,7 @@ providers:
 
   gemini:
     url: https://generativelanguage.googleapis.com
-    timeout: 30
+    timeout: 600
     key: ${GEMINI_API_KEY}
     auth: x-goog-api-key
 
@@ -49,6 +51,6 @@ providers:
   # OpenAI, different URL — proving a new provider of this kind is pure config.
   groq:
     url: https://api.groq.com/openai
-    timeout: 30
+    timeout: 600
     key: ${GROQ_API_KEY}
     auth: bearer

@@ -65,7 +65,7 @@ func router(cfg *config.Config, logger *slog.Logger) (http.Handler, error) {
 	for _, p := range providers {
 		// A trailing slash makes this a subtree pattern: "/openai/" matches
 		// "/openai/v1/chat/completions". StripPrefix then removes "/openai"
-		// before the proxy's Director joins what's left onto the provider's
+		// before the proxy's Rewrite joins what's left onto the provider's
 		// base URL — so routing and path rewriting need no custom code.
 		prefix := "/" + p.Name
 		mux.Handle(prefix+"/", http.StripPrefix(prefix, proxy.New(p, logger)))

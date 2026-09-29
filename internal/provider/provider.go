@@ -57,6 +57,11 @@ var credentialHeaders = []string{
 	"X-Goog-Api-Key",
 }
 
+// credentialParams is every query parameter the gateway treats as carrying a
+// secret. Gemini accepts its key as ?key=, so a client could put a key there
+// instead of in a header.
+var credentialParams = []string{"key"}
+
 // Provider is one configured upstream.
 type Provider struct {
 	// Name is the routing prefix: requests to /<Name>/... go here.
@@ -83,9 +88,24 @@ type Provider struct {
 // Stripping and setting happen together on purpose: they are a single
 // security-relevant operation, and splitting them across two call sites would
 // make it possible to forget the strip and forward a client's key upstream.
-func (p Provider) Apply(h http.Header) {
+func (p Provider) Apply(req *http.Request) {
+	h := req.Header
 	for _, name := range credentialHeaders {
 		h.Del(name)
+	}
+
+	// Re-encoding the query reorders it, so only touch it when there is
+	// something to remove.
+	q := req.URL.Query()
+	stripped := false
+	for _, name := range credentialParams {
+		if q.Has(name) {
+			q.Del(name)
+			stripped = true
+		}
+	}
+	if stripped {
+		req.URL.RawQuery = q.Encode()
 	}
 
 	switch p.Auth {

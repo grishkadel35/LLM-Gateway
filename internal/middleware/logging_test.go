@@ -134,3 +134,34 @@ func TestLoggingSupportsFlush(t *testing.T) {
 		t.Error("handler could not flush through the logging middleware")
 	}
 }
+
+// TestLoggingLogsAbortedRequests covers a client disconnecting mid-stream.
+// ReverseProxy then aborts with panic(http.ErrAbortHandler), and the request
+// must still be logged.
+func TestLoggingLogsAbortedRequests(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "data: chunk\n\n")
+		panic(http.ErrAbortHandler)
+	})
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	// net/http recovers this panic in a real server; here the test does.
+	func() {
+		defer func() {
+			if p := recover(); p != http.ErrAbortHandler {
+				t.Errorf("recovered %v, want the handler's own panic to propagate", p)
+			}
+		}()
+		Logging(logger)(inner).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	}()
+
+	var entry map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("no request log line after an aborted request (output %q): %v", logs.String(), err)
+	}
+	if got := entry["bytes"]; got != float64(len("data: chunk\n\n")) {
+		t.Errorf("logged bytes = %v, want the bytes written before the abort", got)
+	}
+}

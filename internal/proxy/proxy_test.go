@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -158,10 +160,10 @@ func TestProxyForwardsRequestAndResponse(t *testing.T) {
 	}
 }
 
-// TestProxySetsForwardedHeaders checks the X-Forwarded-* family, including the
-// subtle one: ReverseProxy sets X-Forwarded-For itself when a Director is used,
-// so it must appear exactly once.
-func TestProxySetsForwardedHeaders(t *testing.T) {
+// TestProxyDoesNotForwardClientIdentity checks no X-Forwarded-* header reaches
+// the provider, neither one the gateway would add nor one the client sent.
+// Providers are third parties with no use for our clients' addresses.
+func TestProxyDoesNotForwardClientIdentity(t *testing.T) {
 	var got http.Header
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -175,17 +177,98 @@ func TestProxySetsForwardedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Host = "gateway.local"
 	req.RemoteAddr = "203.0.113.7:54321"
+	req.Header.Set("X-Forwarded-For", "198.51.100.1")
 
 	p.ServeHTTP(httptest.NewRecorder(), req)
 
-	if xff := got.Get("X-Forwarded-For"); xff != "203.0.113.7" {
-		t.Errorf("X-Forwarded-For = %q, want %q (set once, by ReverseProxy)", xff, "203.0.113.7")
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"} {
+		if v := got.Get(h); v != "" {
+			t.Errorf("%s = %q, want it absent", h, v)
+		}
 	}
-	if got := got.Get("X-Forwarded-Host"); got != "gateway.local" {
-		t.Errorf("X-Forwarded-Host = %q, want %q", got, "gateway.local")
+}
+
+// TestProxyIgnoresConnectionHeaderNamingCredentials guards against a client
+// listing the gateway's own headers as hop-by-hop. "Connection: X-Api-Key"
+// tells a proxy to drop X-Api-Key; if that happened after the gateway set the
+// provider key, the upstream would receive no credential at all.
+func TestProxyIgnoresConnectionHeaderNamingCredentials(t *testing.T) {
+	var got http.Header
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProvider(t, upstream.URL)
+	p.Auth = provider.AuthAPIKey
+	p.Headers = map[string]string{"anthropic-version": "2023-06-01"}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("Connection", "X-Api-Key, Anthropic-Version")
+
+	New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+
+	if v := got.Get("X-Api-Key"); v != "sk-gateway-key" {
+		t.Errorf("X-Api-Key = %q, want %q", v, "sk-gateway-key")
 	}
-	if got := got.Get("X-Forwarded-Proto"); got != "http" {
-		t.Errorf("X-Forwarded-Proto = %q, want %q", got, "http")
+	if v := got.Get("Anthropic-Version"); v != "2023-06-01" {
+		t.Errorf("anthropic-version = %q, want %q", v, "2023-06-01")
+	}
+}
+
+// TestProxyStripsQueryCredential checks a key sent as ?key= (Gemini's URL
+// form) never reaches the upstream, while the rest of the query does.
+func TestProxyStripsQueryCredential(t *testing.T) {
+	var gotQuery string
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := testProvider(t, upstream.URL)
+	p.Auth = provider.AuthGoogleKey
+
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/x:streamGenerateContent?key=gw_CLIENT-LEAK&alt=sse", nil)
+	New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotQuery != "alt=sse" {
+		t.Errorf("upstream query = %q, want %q", gotQuery, "alt=sse")
+	}
+}
+
+// TestProxyDecompressesUpstreamResponse checks the body leaving the gateway is
+// plain bytes even when the client asked for gzip. Usage metering reads the
+// body, and can't parse a compressed one.
+func TestProxyDecompressesUpstreamResponse(t *testing.T) {
+	const wantBody = `{"usage":{"prompt_tokens":20}}`
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			_, _ = io.WriteString(w, wantBody)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		_, _ = io.WriteString(gz, wantBody)
+		_ = gz.Close()
+	}))
+	defer upstream.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	rec := httptest.NewRecorder()
+	newTestProxy(t, upstream.URL).ServeHTTP(rec, req)
+
+	if ce := rec.Header().Get("Content-Encoding"); ce != "" {
+		t.Errorf("Content-Encoding = %q, want none", ce)
+	}
+	if got := rec.Body.String(); got != wantBody {
+		t.Errorf("body = %q, want %q", got, wantBody)
 	}
 }
 
@@ -267,6 +350,60 @@ func TestProxyErrorHandlerOnUnreachableUpstream(t *testing.T) {
 	}
 	if len(body) == 0 {
 		t.Error("error response body is empty, want a JSON error object")
+	}
+}
+
+// TestProxyTimeoutReturns504 checks an upstream that never starts replying
+// produces a gateway timeout, not the 502 used for unreachable upstreams.
+func TestProxyTimeoutReturns504(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer upstream.Close()
+	// Unblock the handler before Close, which waits for it to return.
+	defer close(release)
+
+	p := testProvider(t, upstream.URL)
+	p.Timeout = 50 * time.Millisecond
+
+	rec := httptest.NewRecorder()
+	New(p, discardLogger()).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusGatewayTimeout)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_timeout") {
+		t.Errorf("body = %q, want an upstream_timeout error", rec.Body.String())
+	}
+}
+
+// TestProxyClientCancelIsNotAnUpstreamError checks a client that gives up
+// before the upstream replies is recorded as 499 and not logged as an error:
+// the provider did nothing wrong.
+func TestProxyClientCancelIsNotAnUpstreamError(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	var logs strings.Builder
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	rec := httptest.NewRecorder()
+	New(testProvider(t, upstream.URL), logger).ServeHTTP(rec, req)
+
+	if rec.Code != StatusClientClosedRequest {
+		t.Errorf("status = %d, want %d", rec.Code, StatusClientClosedRequest)
+	}
+	if strings.Contains(logs.String(), `"level":"ERROR"`) {
+		t.Errorf("client cancel was logged as an error: %s", logs.String())
 	}
 }
 

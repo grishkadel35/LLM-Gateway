@@ -3,14 +3,14 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
@@ -22,61 +22,56 @@ import (
 // package, which is the only thing that constructs a provider.Provider.
 func New(p provider.Provider, logger *slog.Logger) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
-		Director:       director(p),
+		Rewrite:        rewrite(p),
 		ModifyResponse: modifyResponse(p, logger),
 		ErrorHandler:   errorHandler(p, logger),
 		Transport:      transport(p.Timeout),
 	}
 }
 
-// director rewrites each outbound request so it points at the upstream instead
-// of at us. ReverseProxy calls it once per request, before sending.
+// rewrite points each outbound request at the upstream instead of at us.
+// ReverseProxy calls it once per request, before sending.
+//
+// It uses Rewrite rather than the older Director hook. With Director,
+// ReverseProxy strips hop-by-hop headers *after* the hook runs, including any
+// header the client names in "Connection:", so a client sending
+// "Connection: X-Api-Key" could delete the key the gateway just set. Rewrite
+// runs after that stripping, so what it sets is what goes out.
 //
 // Go note: this function *returns a function*. Functions are ordinary values in
-// Go, and the returned closure captures `target` and `logger` — the same idea as
-// a Python closure or functools.partial. It's how we inject dependencies into a
-// callback whose signature is fixed by the library.
-func director(p provider.Provider) func(*http.Request) {
-	target := p.URL
-
-	return func(req *http.Request) {
-		// Capture the host the client asked for before we overwrite it below.
-		originalHost := req.Host
-
-		// The client called us, so req.URL currently points at the gateway.
-		// Swap in the upstream's scheme and host, and prefix any base path the
-		// upstream URL carries (e.g. https://host/v1beta).
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path, req.URL.RawPath = joinURLPath(target, req.URL)
-
-		// req.Host overrides the Host header that goes on the wire. Providers
-		// route and TLS-verify on this, so it must be the upstream's host, not
-		// "localhost:8080".
-		req.Host = target.Host
+// Go, and the returned closure captures `p` — the same idea as a Python closure
+// or functools.partial. It's how we inject dependencies into a callback whose
+// signature is fixed by the library.
+func rewrite(p provider.Provider) func(*httputil.ProxyRequest) {
+	return func(pr *httputil.ProxyRequest) {
+		// SetURL swaps in the upstream's scheme and host, prefixes any base
+		// path the upstream URL carries (e.g. https://host/openai), and makes
+		// the Host header the upstream's. Providers route and TLS-verify on
+		// that, so it must not be "localhost:8080".
+		pr.SetURL(p.URL)
 
 		// Swap whatever credential the client sent for this provider's own key,
 		// in the header shape this provider expects. Apply strips every known
-		// credential header first, so a key meant for one provider can never
-		// reach another.
-		p.Apply(req.Header)
+		// credential header and query parameter first, so a key meant for one
+		// provider can never reach another.
+		p.Apply(pr.Out)
 
-		// X-Forwarded-* headers tell the upstream who originally made the call.
-		//
-		// Important Go detail: when you set Director (as opposed to the newer
-		// Rewrite field), ReverseProxy sets X-Forwarded-For *itself*, after the
-		// Director runs. It appends the client IP to whatever is already there.
-		// So if we called req.Header.Set("X-Forwarded-For", clientIP) here, the
-		// upstream would receive the IP twice ("1.2.3.4, 1.2.3.4"). We therefore
-		// let the standard library own X-Forwarded-For and add only the two
-		// headers it does *not* set in Director mode.
-		setIfEmpty(req.Header, "X-Forwarded-Host", originalHost)
-		setIfEmpty(req.Header, "X-Forwarded-Proto", schemeOf(req))
+		// Let the Transport negotiate compression itself. When the request
+		// carries no Accept-Encoding, Go's Transport asks for gzip and
+		// decompresses the reply transparently; when the client's header is
+		// passed through, the body arrives still compressed. Usage metering
+		// has to read the body, so it must be plain bytes.
+		pr.Out.Header.Del("Accept-Encoding")
+
+		// No X-Forwarded-* headers are sent. In Rewrite mode ReverseProxy
+		// removes any the client supplied and adds none unless we call
+		// pr.SetXForwarded(). Providers are third parties: they have no use
+		// for our clients' IP addresses.
 
 		// Identify ourselves if the client didn't send a User-Agent. Without
 		// this, Go's http client would send its own default, which makes
 		// provider-side logs confusing.
-		setIfEmpty(req.Header, "User-Agent", "llm-gateway")
+		setIfEmpty(pr.Out.Header, "User-Agent", "llm-gateway")
 	}
 }
 
@@ -115,52 +110,95 @@ func isEventStream(resp *http.Response) bool {
 	return err == nil && mediaType == "text/event-stream"
 }
 
-// errorHandler runs when we can't reach the upstream at all (DNS failure,
-// connection refused, timeout). Without it, ReverseProxy logs to stderr and
-// returns a bare 502 with an empty body; clients deserve JSON.
+// StatusClientClosedRequest is recorded when the client disconnects before the
+// upstream responds. There is no standard code for this; 499 is nginx's, and
+// it keeps these requests distinguishable from real upstream failures in logs.
+const StatusClientClosedRequest = 499
+
+// errorHandler runs when we get no usable response from the upstream (DNS
+// failure, connection refused, timeout, or the client giving up first).
+// Without it, ReverseProxy logs to stderr and returns a bare 502 with an empty
+// body; clients deserve JSON.
 func errorHandler(p provider.Provider, logger *slog.Logger) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// The client went away, so nobody will read a response. It isn't an
+		// upstream failure either, so it doesn't belong at ERROR level.
+		if errors.Is(err, context.Canceled) {
+			logger.Info("client closed request before upstream responded",
+				"provider", p.Name,
+				"method", r.Method,
+				"path", r.URL.Path,
+			)
+			w.WriteHeader(StatusClientClosedRequest)
+			return
+		}
+
+		status, errType, message := http.StatusBadGateway, "upstream_unavailable", "the gateway could not reach the upstream provider"
+		if isTimeout(err) {
+			status, errType, message = http.StatusGatewayTimeout, "upstream_timeout", "the upstream provider did not respond in time"
+		}
+
 		logger.Error("upstream request failed",
 			"provider", p.Name,
 			"method", r.Method,
 			"path", r.URL.Path,
+			"status", status,
 			"error", err,
 		)
 
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadGateway)
+		w.WriteHeader(status)
 
 		// Go note: we ignore the encode error with `_ =` because the client has
 		// likely gone away if this fails, and there's nothing useful left to do.
 		// Go makes you write that out — an ignored error is always visible.
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"error": map[string]string{
-				"type":     "upstream_unavailable",
+				"type":     errType,
 				"provider": p.Name,
-				"message":  "the gateway could not reach the upstream provider",
+				"message":  message,
 			},
 		})
 	}
 }
+
+// isTimeout reports whether err is a timeout: a dial, TLS handshake, or
+// response-header deadline.
+//
+// Go note: errors.As walks the chain of wrapped errors looking for one that
+// fits the target's type, here any error with a Timeout() method.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// Fixed bounds on connection setup. They are short and independent of the
+// provider's timeout: a provider that is reachable at all connects in well
+// under a second, even when its reply will take minutes.
+const (
+	dialTimeout         = 10 * time.Second
+	tlsHandshakeTimeout = 10 * time.Second
+)
 
 // transport controls how the outbound connection to the provider behaves.
 //
 // Note which timeout we use: ResponseHeaderTimeout, not a whole-request
 // timeout. Streaming completions hold the response body open for minutes, so
 // capping total request time would cut off long generations. What we actually
-// want to catch is an upstream that never starts replying.
+// want to catch is an upstream that never starts replying. For a non-streaming
+// request that is the whole generation, which is why the default is long.
 func transport(timeout time.Duration) http.RoundTripper {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   timeout,
+			Timeout:   dialTimeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   timeout,
+		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: timeout,
 	}
@@ -171,48 +209,4 @@ func setIfEmpty(h http.Header, key, value string) {
 	if value != "" && h.Get(key) == "" {
 		h.Set(key, value)
 	}
-}
-
-// schemeOf reports whether the *client* reached us over http or https.
-func schemeOf(req *http.Request) string {
-	if req.TLS != nil {
-		return "https"
-	}
-	return "http"
-}
-
-// joinURLPath joins the upstream's base path with the incoming request path,
-// taking care not to produce a double slash or to lose one.
-//
-// Go note: multiple return values are normal here — no tuple type needed. Go
-// also keeps an escaped copy of the path (RawPath) alongside the decoded one, so
-// a path like /v1/models/gpt%2F4 survives the round trip unchanged.
-func joinURLPath(target, req *url.URL) (path, rawPath string) {
-	if target.RawPath == "" && req.RawPath == "" {
-		return singleJoiningSlash(target.Path, req.Path), ""
-	}
-
-	targetPath, reqPath := target.EscapedPath(), req.EscapedPath()
-	targetSlash := strings.HasSuffix(targetPath, "/")
-	reqSlash := strings.HasPrefix(reqPath, "/")
-
-	switch {
-	case targetSlash && reqSlash:
-		return target.Path + req.Path[1:], targetPath + reqPath[1:]
-	case !targetSlash && !reqSlash:
-		return target.Path + "/" + req.Path, targetPath + "/" + reqPath
-	}
-	return target.Path + req.Path, targetPath + reqPath
-}
-
-func singleJoiningSlash(a, b string) string {
-	aSlash := strings.HasSuffix(a, "/")
-	bSlash := strings.HasPrefix(b, "/")
-	switch {
-	case aSlash && bSlash:
-		return a + b[1:]
-	case !aSlash && !bSlash:
-		return a + "/" + b
-	}
-	return a + b
 }

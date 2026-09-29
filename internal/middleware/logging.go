@@ -28,16 +28,23 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			// wrap it in a recorder that remembers.
 			rec := &responseRecorder{ResponseWriter: w}
 
-			next.ServeHTTP(rec, r)
+			// Logged in a defer so the line is written even when next panics.
+			// That is not hypothetical: when a client disconnects mid-stream,
+			// ReverseProxy aborts with panic(http.ErrAbortHandler), which
+			// net/http recovers silently. A plain call after ServeHTTP would
+			// never run, and aborted streams would leave no trace.
+			defer func() {
+				logger.Info("request",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", rec.status(),
+					"duration_ms", float64(time.Since(start).Microseconds())/1000.0,
+					"bytes", rec.bytes,
+					"remote_addr", r.RemoteAddr,
+				)
+			}()
 
-			logger.Info("request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", rec.status(),
-				"duration_ms", float64(time.Since(start).Microseconds())/1000.0,
-				"bytes", rec.bytes,
-				"remote_addr", r.RemoteAddr,
-			)
+			next.ServeHTTP(rec, r)
 		})
 	}
 }

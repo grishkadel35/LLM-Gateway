@@ -2,8 +2,17 @@ package provider
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
+
+// apply runs p.Apply on a bare request and returns the resulting headers.
+func apply(p Provider, h http.Header) http.Header {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header = h
+	p.Apply(req)
+	return req.Header
+}
 
 // TestApplySetsProviderCredential checks each auth style writes the right
 // header in the right format.
@@ -27,8 +36,7 @@ func TestApplySetsProviderCredential(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			p := Provider{Name: tc.name, Key: "sk-provider-key", Auth: tc.auth}
 
-			h := http.Header{}
-			p.Apply(h)
+			h := apply(p, http.Header{})
 
 			if got := h.Get(tc.wantHeader); got != tc.wantValue {
 				t.Errorf("%s = %q, want %q", tc.wantHeader, got, tc.wantValue)
@@ -58,7 +66,7 @@ func TestApplyStripsClientCredentials(t *testing.T) {
 			h.Set("X-Goog-Api-Key", "sk-CLIENT-LEAK")
 
 			p := Provider{Name: tc.name, Key: "sk-gateway-key", Auth: tc.auth}
-			p.Apply(h)
+			h = apply(p, h)
 
 			for _, header := range credentialHeaders {
 				if got := h.Get(header); got == "sk-CLIENT-LEAK" {
@@ -66,6 +74,20 @@ func TestApplyStripsClientCredentials(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestApplyStripsQueryCredential covers Gemini's ?key= parameter, the one
+// credential that travels in the URL rather than a header. Other parameters
+// must survive untouched.
+func TestApplyStripsQueryCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/x:streamGenerateContent?alt=sse&key=gw_CLIENT-LEAK", nil)
+
+	p := Provider{Name: "gemini", Key: "sk-gateway-key", Auth: AuthGoogleKey}
+	p.Apply(req)
+
+	if got := req.URL.RawQuery; got != "alt=sse" {
+		t.Errorf("query = %q, want %q", got, "alt=sse")
 	}
 }
 
@@ -78,8 +100,7 @@ func TestApplySetsStaticHeaders(t *testing.T) {
 		Headers: map[string]string{"anthropic-version": "2023-06-01"},
 	}
 
-	h := http.Header{}
-	p.Apply(h)
+	h := apply(p, http.Header{})
 
 	if got := h.Get("anthropic-version"); got != "2023-06-01" {
 		t.Errorf("anthropic-version = %q, want %q", got, "2023-06-01")
@@ -101,8 +122,7 @@ func TestApplyStaticHeadersCannotOverrideCredential(t *testing.T) {
 		Headers: map[string]string{"authorization": "Bearer sk-WRONG"},
 	}
 
-	h := http.Header{}
-	p.Apply(h)
+	h := apply(p, http.Header{})
 
 	if got := h.Get("Authorization"); got != "Bearer sk-real" {
 		t.Errorf("Authorization = %q, want the provider's own key %q", got, "Bearer sk-real")
