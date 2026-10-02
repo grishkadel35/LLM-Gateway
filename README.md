@@ -18,11 +18,15 @@ provider is a block of YAML, not code.
 
 **Last updated:** 2026-10-02
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
-routing. Week 2 in progress: the mock provider is done. No external service
-dependencies yet.
+routing. Week 2 in progress: the mock provider and the dev stack (Postgres,
+migrations, CI) are done. The gateway itself doesn't use the database yet.
 
 ### What changed
 
+- **Dev stack.** Postgres 18 runs locally via docker compose (`make db-up`),
+  and `make migrate` applies embedded goose migrations creating `tenants` and
+  `usage_logs`. CI runs `go vet` and `go test -race` against a Postgres service
+  container on every push. See [Database](#database).
 - **Mock provider covers Groq.** A live check showed Groq reports streaming
   usage differently from OpenAI despite the shared format (see
   [Without API keys](#without-api-keys)), so the mock now serves that shape at
@@ -75,8 +79,8 @@ logged — including streamed responses.
 
 - [x] `cmd/mockprovider` — fake OpenAI, Anthropic and Gemini upstreams, streaming
   and non-streaming, so nothing below costs money to test
-- [ ] Postgres (via docker-compose) with `goose` migrations: `tenants` and
-  `usage_logs` tables; CI running `go vet` and `go test`
+- [x] Postgres (via docker-compose) with `goose` migrations: `tenants` and
+  `usage_logs` tables; CI running `go vet` and `go test -race`
 - [ ] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
   indexed lookup
 - [ ] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
@@ -170,6 +174,30 @@ gets a 401, as it would from the real API.
 The handlers live in `internal/mockprovider`, so Go tests can run them
 in-process with `httptest.NewServer(mockprovider.Handler())`.
 
+### Database
+
+Postgres runs in Docker (any runtime works; on macOS, `brew install colima
+docker docker-compose` then `colima start` is enough):
+
+```sh
+make db-up      # Postgres 18 on 127.0.0.1:5432, waits until healthy
+make migrate    # apply pending migrations
+make db-down    # stop it; data survives in the llm-gateway_pgdata volume
+```
+
+Migrations live in `internal/db/migrations` and are embedded into the binary,
+so a build always carries the schema its code expects. `make migrate` targets
+the compose database; pass `DATABASE_URL=postgres://...` to use another.
+
+The Postgres tests only run when `DATABASE_URL` is set, and each creates and
+drops its own throwaway database, so they never touch dev data:
+
+```sh
+DATABASE_URL='postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable' go test -race ./...
+```
+
+Without it, `go test ./...` skips them and needs nothing running.
+
 ## Configuration
 
 `config.yaml`:
@@ -255,6 +283,9 @@ rotation even though it is working fine.
 | `make run`      | Build, then run                        |
 | `make mock`     | Run the mock provider on :9090         |
 | `make run-mock` | Run the gateway against the mock       |
+| `make db-up`    | Start local Postgres (docker compose)  |
+| `make db-down`  | Stop local Postgres                    |
+| `make migrate`  | Apply pending database migrations      |
 | `make test`     | Run all tests                          |
 | `make vet`      | Run `go vet` (catches suspicious code) |
 | `make fmt`      | Format all source files                |
@@ -271,8 +302,12 @@ internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy and its hooks
 internal/middleware/      request logging
 internal/health/          GET /health
-internal/mockprovider/    fake OpenAI/Anthropic/Gemini APIs for testing
+internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
 cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
+internal/db/              Postgres schema: embedded goose migrations
+cmd/migrate/main.go       applies migrations to DATABASE_URL
+deployments/              docker compose dev stack (Postgres)
+.github/workflows/ci.yml  vet + race-enabled tests against Postgres
 ```
 
 Routing costs no custom code: each provider is registered on `ServeMux` as
