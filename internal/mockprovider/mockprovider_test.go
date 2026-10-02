@@ -184,6 +184,65 @@ func TestOpenAIStreaming(t *testing.T) {
 	}
 }
 
+// TestGroqStreaming checks the Groq quirk: usage arrives on the finish chunk
+// even without include_usage, and with it a second time in OpenAI's extra
+// chunk.
+func TestGroqStreaming(t *testing.T) {
+	for _, includeUsage := range []bool{false, true} {
+		name := "without include_usage"
+		body := `{"model":"gpt-x","stream":true}`
+		wantUsageChunks := 1
+		if includeUsage {
+			name = "with include_usage"
+			body = `{"model":"gpt-x","stream":true,"stream_options":{"include_usage":true}}`
+			wantUsageChunks = 2
+		}
+
+		t.Run(name, func(t *testing.T) {
+			res, raw := post(t, "/openai/v1/chat/completions", openAIHeaders, body)
+			if ct := res.Header.Get("Content-Type"); ct != "text/event-stream" {
+				t.Errorf("Content-Type = %q, want text/event-stream", ct)
+			}
+
+			events := parseSSE(t, raw)
+			if last := events[len(events)-1].data; last != "[DONE]" {
+				t.Fatalf("last event = %q, want [DONE]", last)
+			}
+
+			usageChunks := 0
+			for _, e := range events[:len(events)-1] {
+				var c struct {
+					Choices []struct {
+						FinishReason *string `json:"finish_reason"`
+					} `json:"choices"`
+					Usage *openAIUsage `json:"usage"`
+					XGroq *struct {
+						Usage *openAIUsage `json:"usage"`
+					} `json:"x_groq"`
+				}
+				mustUnmarshal(t, e.data, &c)
+
+				finishing := len(c.Choices) == 1 && c.Choices[0].FinishReason != nil
+				if finishing {
+					checkOpenAIUsage(t, c.Usage)
+					if c.XGroq == nil {
+						t.Fatal("finish chunk has no x_groq")
+					}
+					checkOpenAIUsage(t, c.XGroq.Usage)
+				}
+				if c.Usage != nil {
+					checkOpenAIUsage(t, c.Usage)
+					usageChunks++
+				}
+			}
+
+			if usageChunks != wantUsageChunks {
+				t.Errorf("chunks carrying usage = %d, want %d", usageChunks, wantUsageChunks)
+			}
+		})
+	}
+}
+
 type anthropicUsage struct {
 	InputTokens          int `json:"input_tokens"`
 	CacheReadInputTokens int `json:"cache_read_input_tokens"`

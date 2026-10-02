@@ -13,7 +13,7 @@ build:
 run: build
 	./$(BINARY)
 
-# Fake OpenAI/Anthropic/Gemini on 127.0.0.1:9090. Pair with run-mock.
+# Fake OpenAI/Groq/Anthropic/Gemini on 127.0.0.1:9090. Pair with run-mock.
 mock:
 	go run ./cmd/mockprovider
 

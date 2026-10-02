@@ -1,4 +1,4 @@
-// Package mockprovider fakes the OpenAI, Anthropic and Gemini APIs, streaming
+// Package mockprovider fakes the OpenAI, Groq, Anthropic and Gemini APIs, streaming
 // and non-streaming, so the gateway can be tested without spending money.
 //
 // Every response is deterministic: the same reply text and the same usage
@@ -41,6 +41,9 @@ const (
 func Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", openAIChat)
+	// Groq's real base URL ends in /openai, so this path also exercises the
+	// gateway's base-path preservation.
+	mux.HandleFunc("POST /openai/v1/chat/completions", groqChat)
 	mux.HandleFunc("POST /v1/messages", anthropicMessages)
 	// Gemini puts the method after a colon in the last path segment:
 	// /v1beta/models/gemini-x:generateContent. ServeMux wildcards match whole

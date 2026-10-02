@@ -1,4 +1,4 @@
-// Command mockprovider serves fake OpenAI, Anthropic and Gemini APIs on one
+// Command mockprovider serves fake OpenAI, Groq, Anthropic and Gemini APIs on one
 // port, so the gateway can be exercised end to end without real API keys or
 // spend. The handlers live in internal/mockprovider, where tests can also run
 // them in-process.

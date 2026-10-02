@@ -4,6 +4,16 @@ import "net/http"
 
 // openAIChat serves POST /v1/chat/completions.
 func openAIChat(w http.ResponseWriter, r *http.Request) {
+	chatCompletions(w, r, false)
+}
+
+// groqChat serves Groq's OpenAI-compatible POST /openai/v1/chat/completions.
+// It differs from OpenAI only in where a stream reports usage.
+func groqChat(w http.ResponseWriter, r *http.Request) {
+	chatCompletions(w, r, true)
+}
+
+func chatCompletions(w http.ResponseWriter, r *http.Request, groq bool) {
 	if !requireHeader(w, r, "Authorization") {
 		return
 	}
@@ -57,7 +67,16 @@ func openAIChat(w http.ResponseWriter, r *http.Request) {
 	for _, word := range words() {
 		s.event("", chunk([]object{{"index": 0, "delta": object{"content": word}, "finish_reason": nil}}))
 	}
-	s.event("", chunk([]object{{"index": 0, "delta": object{}, "finish_reason": "stop"}}))
+	final := chunk([]object{{"index": 0, "delta": object{}, "finish_reason": "stop"}})
+	// Groq (checked live 2026-10-02) puts usage on the finish chunk whether or
+	// not the request opts in, at the top level and again under x_groq. With
+	// include_usage it also sends the extra chunk below, so the same usage
+	// arrives twice: a parser must keep the last value, not sum them.
+	if groq {
+		final["usage"] = usage
+		final["x_groq"] = object{"id": "req_mock", "usage": usage}
+	}
+	s.event("", final)
 
 	// OpenAI reports usage in a stream only when the request opts in, as one
 	// extra chunk with empty choices. Without it a stream carries no usage at

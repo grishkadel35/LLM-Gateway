@@ -133,7 +133,7 @@ client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key="unused")
 
 ### Without API keys
 
-`cmd/mockprovider` serves fake OpenAI, Anthropic and Gemini APIs on one port,
+`cmd/mockprovider` serves fake OpenAI, Groq, Anthropic and Gemini APIs on one port,
 and `config.mock.yaml` points the gateway's providers at it. Nothing leaves the
 machine and nothing costs money:
 
@@ -149,6 +149,9 @@ details a usage parser has to get right:
 
 - **OpenAI** streams report usage only when the request sets
   `stream_options.include_usage`.
+- **Groq** puts usage on the finish chunk (top-level `usage` and again in
+  `x_groq.usage`) even without `include_usage`; with it, OpenAI's extra chunk
+  repeats the same numbers. A parser must keep the last usage, not sum them.
 - **Anthropic** puts input usage in `message_start` with a placeholder output
   count; the real output count arrives in `message_delta`. `input_tokens`
   excludes cache reads (it reports 15, plus 5 in `cache_read_input_tokens`).
