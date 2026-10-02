@@ -16,13 +16,17 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-09-27
+**Last updated:** 2026-10-02
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
 routing. Week 2 in progress: the mock provider is done. No external service
 dependencies yet.
 
 ### What changed
 
+- **Mock provider covers Groq.** A live check showed Groq reports streaming
+  usage differently from OpenAI despite the shared format (see
+  [Without API keys](#without-api-keys)), so the mock now serves that shape at
+  Groq's `/openai` base path and `config.mock.yaml` routes `groq` to it.
 - **Multi-provider routing.** A single `upstream` became a map of providers,
   each served at its own `/<name>/` prefix. Ships with OpenAI, Anthropic, Gemini
   and Groq configured.
