@@ -1,9 +1,13 @@
 BINARY := bin/gateway
 PKG    := ./cmd/gateway
 
+# The compose database. Override to migrate somewhere else:
+#   make migrate DATABASE_URL=postgres://...
+DATABASE_URL ?= postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable
+
 # .PHONY tells make these targets are commands, not files to be produced.
 # Without it, a file named "test" in the repo would stop `make test` working.
-.PHONY: build run mock run-mock db-up db-down test vet fmt tidy clean all
+.PHONY: build run mock run-mock db-up db-down migrate test vet fmt tidy clean all
 
 all: fmt vet test build
 
@@ -28,6 +32,10 @@ db-up:
 
 db-down:
 	docker compose -f deployments/docker-compose.yml down
+
+# Apply pending migrations from internal/db/migrations.
+migrate:
+	DATABASE_URL='$(DATABASE_URL)' go run ./cmd/migrate
 
 test:
 	go test ./...
