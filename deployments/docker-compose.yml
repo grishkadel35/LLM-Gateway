@@ -1,0 +1,34 @@
+# Local dev stack. Week 2: Postgres only; later weeks add Redis, Prometheus,
+# Grafana and the gateway itself.
+#
+#   make db-up      # start Postgres and wait until it accepts connections
+#   make migrate    # apply schema migrations
+#   make db-down    # stop it (data survives in the pgdata volume)
+
+# Without a name, Compose would call the project "deployments", after this
+# file's directory.
+name: llm-gateway
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: gateway
+      # Dev-only default. The port below is bound to loopback, so nothing off
+      # this machine can reach the database.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gateway}
+      POSTGRES_DB: gateway
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Postgres 18 images keep data in a version-specific directory under
+      # /var/lib/postgresql, so the volume mounts the parent, not .../data.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "gateway", "-d", "gateway"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  pgdata:
