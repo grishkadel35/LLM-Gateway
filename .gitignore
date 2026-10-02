@@ -21,3 +21,6 @@ config.local.yaml
 *.swp
 claude.md
 llm-gateway-roadmap.md
+
+# graphify knowledge graph output (regenerate with /graphify)
+/graphify-out/
