@@ -21,9 +21,11 @@ type Usage struct {
 	Input int64
 	// CachedInput is input tokens read from the provider's prompt cache.
 	CachedInput int64
-	// CacheWrite5m and CacheWrite1h are input tokens written to Anthropic's
-	// prompt cache with a 5-minute or 1-hour TTL, which cost different amounts.
-	CacheWrite5m int64
+	// CacheWrite is input tokens written to the provider's prompt cache at
+	// its default TTL: Anthropic's 5-minute writes, and OpenAI's (one TTL,
+	// billed at its own rate from GPT-5.6 on). CacheWrite1h is Anthropic's
+	// 1-hour writes, which cost more.
+	CacheWrite   int64
 	CacheWrite1h int64
 	// Output is output tokens, reasoning and thinking included: they are
 	// billed as output.
@@ -67,7 +69,8 @@ type openAIChunk struct {
 		PromptTokens        int64 `json:"prompt_tokens"`
 		CompletionTokens    int64 `json:"completion_tokens"`
 		PromptTokensDetails struct {
-			CachedTokens int64 `json:"cached_tokens"`
+			CachedTokens     int64 `json:"cached_tokens"`
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
 		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
 }
@@ -82,9 +85,12 @@ func (p *openAIParser) event(data []byte) {
 		p.u.Model = c.Model
 	}
 	if c.Usage != nil {
-		cached := c.Usage.PromptTokensDetails.CachedTokens
-		p.u.Input = c.Usage.PromptTokens - cached
-		p.u.CachedInput = cached
+		// Both are parts of prompt_tokens (OpenAI's prompt caching guide:
+		// ordinary input = input - cached - cache writes).
+		d := c.Usage.PromptTokensDetails
+		p.u.Input = c.Usage.PromptTokens - d.CachedTokens - d.CacheWriteTokens
+		p.u.CachedInput = d.CachedTokens
+		p.u.CacheWrite = d.CacheWriteTokens
 		p.u.Output = c.Usage.CompletionTokens
 	}
 }
@@ -166,13 +172,13 @@ func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
 	}
 	switch {
 	case u.CacheCreation != nil:
-		p.u.CacheWrite5m = u.CacheCreation.Ephemeral5m
+		p.u.CacheWrite = u.CacheCreation.Ephemeral5m
 		p.u.CacheWrite1h = u.CacheCreation.Ephemeral1h
-	case u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens != p.u.CacheWrite5m+p.u.CacheWrite1h:
+	case u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens != p.u.CacheWrite+p.u.CacheWrite1h:
 		// A total with no TTL breakdown: all writes are the default 5-minute
 		// TTL. A total that matches what is already known keeps the
 		// breakdown message_start gave.
-		p.u.CacheWrite5m = *u.CacheCreationInputTokens
+		p.u.CacheWrite = *u.CacheCreationInputTokens
 		p.u.CacheWrite1h = 0
 	}
 	if withOutput && u.OutputTokens != nil {

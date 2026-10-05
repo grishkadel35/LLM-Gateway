@@ -289,7 +289,7 @@ func logUsage(logger *slog.Logger) usageFunc {
 			"status", r.Status,
 			"input_tokens", r.Input,
 			"cached_input_tokens", r.CachedInput,
-			"cache_write_tokens", r.CacheWrite5m+r.CacheWrite1h,
+			"cache_write_tokens", r.CacheWrite+r.CacheWrite1h,
 			"output_tokens", r.Output,
 			"streamed", r.Streamed,
 			"complete", r.Complete,

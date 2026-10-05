@@ -25,6 +25,15 @@ metering is next.
 
 ### What changed
 
+- **Pricing.** `internal/pricing` holds per-model prices for all four
+  providers in integer micro-dollars, copied from each provider's pricing
+  page on 2026-10-05 (source and date noted per block). It handles dated
+  snapshots (`gpt-4o-2024-08-06` → `gpt-4o`), long-context tiers (OpenAI above
+  272K, Gemini Pro above 200K input tokens), prices that change on a date
+  (Gemini 3.6–3.8 Flash double on 1 January 2027), Anthropic's 5-minute vs
+  1-hour cache writes, and OpenAI cache writes (1.25× input from GPT-5.6 on).
+  A model without a public price, such as Groq's Llama models ("contact
+  sales"), gets no cost rather than a guess.
 - **Usage metering, OpenAI format first.** Each provider response's body is
   wrapped as it passes through: bytes reach the client untouched and
   unbuffered while the gateway reads token usage from them (SSE event by event,
@@ -38,7 +47,7 @@ metering is next.
   google-genai SDKs against the mock. A
   client that disconnects mid-stream still gets what was seen recorded,
   marked `"complete": false`. `input_tokens` means tokens billed at the input
-  rate: cache reads are counted separately in `cached_input_tokens`.
+  rate: cache reads and writes are counted separately.
 - **One owner for the request body.** The gateway reads each body once (up to
   `max_request_bytes`, default 32 MiB; `413` beyond that), and forwards the
   client's exact bytes unless it has to rewrite something. For OpenAI-format

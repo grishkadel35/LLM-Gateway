@@ -103,7 +103,7 @@ func TestAnthropicBody(t *testing.T) {
 		         "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2},
 		         "output_tokens":10}}`)
 
-	want := Usage{Model: "claude-sonnet-4-20250514", Input: 15, CachedInput: 5, CacheWrite5m: 3, CacheWrite1h: 2, Output: 10}
+	want := Usage{Model: "claude-sonnet-4-20250514", Input: 15, CachedInput: 5, CacheWrite: 3, CacheWrite1h: 2, Output: 10}
 	if got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
@@ -114,8 +114,8 @@ func TestAnthropicCacheWritesWithoutBreakdown(t *testing.T) {
 	got := parseBody(t, provider.FormatAnthropic,
 		`{"type":"message","model":"claude-x","usage":{"input_tokens":15,"cache_creation_input_tokens":4,"output_tokens":10}}`)
 
-	if got.CacheWrite5m != 4 || got.CacheWrite1h != 0 {
-		t.Errorf("cache writes = %d (5m), %d (1h); want 4, 0", got.CacheWrite5m, got.CacheWrite1h)
+	if got.CacheWrite != 4 || got.CacheWrite1h != 0 {
+		t.Errorf("cache writes = %d (5m), %d (1h); want 4, 0", got.CacheWrite, got.CacheWrite1h)
 	}
 }
 
@@ -135,7 +135,7 @@ func TestAnthropicStream(t *testing.T) {
 		`{"type":"message_stop"}`,
 	)
 
-	want := Usage{Model: "claude-sonnet-4", Input: 15, CachedInput: 5, CacheWrite5m: 3, CacheWrite1h: 2, Output: 10}
+	want := Usage{Model: "claude-sonnet-4", Input: 15, CachedInput: 5, CacheWrite: 3, CacheWrite1h: 2, Output: 10}
 	if got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
@@ -159,7 +159,7 @@ func TestAnthropicDeltaRestatesInput(t *testing.T) {
 		`{"type":"message_delta","delta":{},"usage":{"input_tokens":18,"cache_read_input_tokens":5,"output_tokens":10}}`,
 	)
 
-	if got.Input != 18 || got.CachedInput != 5 || got.CacheWrite5m != 3 || got.Output != 10 {
+	if got.Input != 18 || got.CachedInput != 5 || got.CacheWrite != 3 || got.Output != 10 {
 		t.Errorf("usage = %+v, want input 18, cached 5, cache write 3 (unrestated), output 10", got)
 	}
 }
@@ -172,8 +172,8 @@ func TestAnthropicDeltaKeepsCacheWriteBreakdown(t *testing.T) {
 		`{"type":"message_delta","delta":{},"usage":{"cache_creation_input_tokens":5,"output_tokens":10}}`,
 	)
 
-	if got.CacheWrite5m != 3 || got.CacheWrite1h != 2 {
-		t.Errorf("cache writes = %d (5m), %d (1h); want the breakdown 3, 2 kept", got.CacheWrite5m, got.CacheWrite1h)
+	if got.CacheWrite != 3 || got.CacheWrite1h != 2 {
+		t.Errorf("cache writes = %d (5m), %d (1h); want the breakdown 3, 2 kept", got.CacheWrite, got.CacheWrite1h)
 	}
 }
 
@@ -239,5 +239,20 @@ func TestGeminiNoUsage(t *testing.T) {
 		if got := parseBody(t, provider.FormatGemini, body); got != (Usage{}) {
 			t.Errorf("body %q: usage = %+v, want zero", body, got)
 		}
+	}
+}
+
+// OpenAI's cached_tokens and cache_write_tokens are both parts of
+// prompt_tokens (OpenAI's prompt caching guide: ordinary input = input −
+// cached − cache writes). Cache writes are billed at their own rate from
+// GPT-5.6 on, so they are split out of Input.
+func TestOpenAICacheWrites(t *testing.T) {
+	got := parseBody(t, provider.FormatOpenAI, `{"model":"gpt-6-sol",
+		"usage":{"prompt_tokens":100,"completion_tokens":10,
+		         "prompt_tokens_details":{"cached_tokens":30,"cache_write_tokens":50}}}`)
+
+	want := Usage{Model: "gpt-6-sol", Input: 20, CachedInput: 30, CacheWrite: 50, Output: 10}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
 	}
 }
