@@ -231,3 +231,35 @@ func TestHealthBypassesProviders(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryResponseCarriesRequestID checks the wiring: the ID is on routed,
+// rejected and failed requests alike, since those are the ones clients quote.
+func TestEveryResponseCarriesRequestID(t *testing.T) {
+	r, ups := newTestRouter(t)
+	// A provider that is down, for the 502 path.
+	ups["gemini"].server.Close()
+
+	cases := []struct {
+		name, method, path string
+		wantStatus         int
+	}{
+		{"proxied", http.MethodPost, "/openai/v1/chat/completions", http.StatusOK},
+		{"unknown provider", http.MethodPost, "/nope/v1/chat/completions", http.StatusNotFound},
+		{"upstream down", http.MethodPost, "/gemini/v1beta/models/x:generateContent", http.StatusBadGateway},
+		{"health", http.MethodGet, "/health", http.StatusOK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if got := rec.Result().Header.Values("X-Request-ID"); len(got) != 1 || !strings.HasPrefix(got[0], "req_") {
+				t.Errorf("X-Request-ID = %q, want one req_ ID", got)
+			}
+		})
+	}
+}

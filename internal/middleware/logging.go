@@ -34,14 +34,22 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 			// net/http recovers silently. A plain call after ServeHTTP would
 			// never run, and aborted streams would leave no trace.
 			defer func() {
-				logger.Info("request",
+				attrs := []any{
+					"request_id", RequestIDFrom(r.Context()),
 					"method", r.Method,
 					"path", r.URL.Path,
 					"status", rec.status(),
-					"duration_ms", float64(time.Since(start).Microseconds())/1000.0,
+					"duration_ms", float64(time.Since(start).Microseconds()) / 1000.0,
 					"bytes", rec.bytes,
 					"remote_addr", r.RemoteAddr,
-				)
+				}
+				// The client's own ID, if it sent one, lets an operator match
+				// this line to the client's logs. It isn't the gateway's ID:
+				// nothing makes it unique.
+				if id := r.Header.Get(HeaderRequestID); id != "" {
+					attrs = append(attrs, "client_request_id", id)
+				}
+				logger.Info("request", attrs...)
 			}()
 
 			next.ServeHTTP(rec, r)

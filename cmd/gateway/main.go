@@ -46,8 +46,9 @@ func main() {
 	}
 }
 
-// router builds the gateway's route table: one reverse proxy per configured
-// provider, plus /health and a catch-all that rejects unknown prefixes.
+// router builds the gateway's handler: one reverse proxy per configured
+// provider, plus /health and a catch-all that rejects unknown prefixes, all
+// behind the request ID and logging middleware.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
@@ -76,7 +77,9 @@ func router(cfg *config.Config, logger *slog.Logger) (http.Handler, error) {
 	// — and spend — to the wrong provider.
 	mux.Handle("/", unknownProvider(cfg.ProviderNames()))
 
-	return mux, nil
+	// RequestID goes outermost, so the log line and every response, rejected
+	// or failed ones included, carry the ID.
+	return middleware.RequestID(middleware.Logging(logger)(mux)), nil
 }
 
 // unknownProvider returns the handler for paths that match no configured
@@ -103,12 +106,10 @@ func unknownProvider(names []string) http.Handler {
 // error normally. os.Exit skips deferred functions, so we want exactly one place
 // (main) that calls it.
 func run(cfg *config.Config, logger *slog.Logger) error {
-	mux, err := router(cfg, logger)
+	handler, err := router(cfg, logger)
 	if err != nil {
 		return err
 	}
-
-	handler := middleware.Logging(logger)(mux)
 
 	srv := &http.Server{
 		Addr:    cfg.Addr(),

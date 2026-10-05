@@ -19,11 +19,18 @@ provider is a block of YAML, not code.
 **Last updated:** 2026-10-05
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
 routing. Week 2 in progress: the mock provider, the dev stack (Postgres,
-migrations, CI), tenant key management and the auth middleware are done. The
-gateway itself doesn't use the database yet.
+migrations, CI), tenant key management, the auth middleware and request IDs
+are done. The gateway itself doesn't use the database yet.
 
 ### What changed
 
+- **Request IDs.** Every response, including 401s, 404s and proxy errors,
+  carries a gateway-generated `X-Request-ID`, which also goes in the request's
+  log line. A client-sent `X-Request-ID` is logged as `client_request_id` but
+  never reused: nothing makes it unique. OpenAI and Groq send an
+  `x-request-id` of their own; clients now see the gateway's in its place (the
+  OpenAI SDK's `_request_id` included), and the provider's will be stored as
+  `provider_request_id` once usage logging lands.
 - **Auth middleware.** `middleware.Auth` reads the gateway key from whichever
   header the client's SDK sends (`Authorization: Bearer`, `X-Api-Key`,
   `X-Goog-Api-Key`), looks it up, and puts the tenant and key on the request
@@ -106,8 +113,9 @@ logged — including streamed responses.
 - [x] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header, rejects revoked keys, and attaches the tenant to the
   request context (wired into the gateway together with the admin routes)
-- [ ] Request IDs — an `X-Request-ID` per request, returned to the client and
-  stored with its usage row alongside the provider's own request ID
+- [x] Request IDs — an `X-Request-ID` per request, returned to the client and
+  logged (stored with its usage row, next to the provider's own ID, once usage
+  logging lands)
 - [ ] A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
   usage parser for each
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
@@ -325,7 +333,7 @@ cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy and its hooks
-internal/middleware/      request logging, tenant key auth
+internal/middleware/      request IDs, request logging, tenant key auth
 internal/health/          GET /health
 internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
 cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
@@ -362,8 +370,11 @@ provider.
 Each request produces one JSON line on stdout:
 
 ```json
-{"time":"2026-09-20T18:20:00Z","level":"INFO","msg":"request","method":"POST","path":"/openai/v1/chat/completions","status":200,"duration_ms":842.11,"bytes":1204,"remote_addr":"127.0.0.1:52233"}
+{"time":"2026-09-20T18:20:00Z","level":"INFO","msg":"request","request_id":"req_2d10cec6dc4299d10f08dbf141ebffb9","method":"POST","path":"/openai/v1/chat/completions","status":200,"duration_ms":842.11,"bytes":1204,"remote_addr":"127.0.0.1:52233"}
 ```
+
+`request_id` is the `X-Request-ID` returned to the client. When the client
+sent its own `X-Request-ID`, it is logged as `client_request_id`.
 
 Plus one line per upstream response, recording which provider answered, the
 status, content length, and whether the response was streamed.
