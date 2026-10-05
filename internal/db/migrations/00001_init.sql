@@ -32,9 +32,9 @@ CREATE TABLE usage_logs (
     model               TEXT NOT NULL,
     endpoint            TEXT NOT NULL,          -- path after the provider prefix, e.g. /v1/chat/completions
     status              INT NOT NULL,           -- HTTP status returned to the client
-    input_tokens        INT NOT NULL,
-    cached_input_tokens INT NOT NULL DEFAULT 0,
-    cache_write_tokens  INT NOT NULL DEFAULT 0, -- Anthropic cache writes, billed above the input rate
+    input_tokens        INT NOT NULL,           -- billed at the base input rate: excludes cache reads and writes, for every provider
+    cached_input_tokens INT NOT NULL DEFAULT 0, -- cache reads
+    cache_write_tokens  INT NOT NULL DEFAULT 0, -- cache writes (Anthropic 5 m + 1 h, OpenAI), billed above the input rate
     output_tokens       INT NOT NULL,           -- includes reasoning tokens, which are billed as output
     cost_micros         BIGINT,                 -- NULL when the model isn't priced
     cached              BOOLEAN NOT NULL DEFAULT FALSE,

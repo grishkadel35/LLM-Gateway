@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -589,9 +590,9 @@ type meteredCall struct {
 	result   usage.Result
 }
 
-// newMockRouter builds the gateway in front of the real mock provider, with
-// every format configured, and records each usage callback.
-func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
+// mockConfig returns a config with every format pointed at the real mock
+// provider.
+func mockConfig(t *testing.T) *config.Config {
 	t.Helper()
 
 	mock := httptest.NewServer(mockprovider.Handler())
@@ -631,7 +632,15 @@ providers:
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
+	return cfg
+}
 
+// newMockRouter builds the gateway in front of the real mock provider and
+// records each usage callback.
+func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
+	t.Helper()
+
+	cfg := mockConfig(t)
 	var mu sync.Mutex
 	var calls []meteredCall
 	onUsage := func(_ context.Context, provider string, r usage.Result) {
@@ -752,5 +761,86 @@ func TestGeminiUsageThroughMock(t *testing.T) {
 				t.Errorf("result = %+v, want streamed %v, complete", got.result, tc.streamed)
 			}
 		})
+	}
+}
+
+// TestUsageRowsThroughGateway is the Week 2 checkpoint in one test: requests
+// through the gateway, against Postgres, each leave exactly one usage_logs
+// row carrying the X-Request-ID the client got, the tenant and key, the
+// tokens and the cost.
+func TestUsageRowsThroughGateway(t *testing.T) {
+	conn := dbtest.New(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	store := tenant.NewStore(conn)
+	tn, key, err := store.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	writer := usage.NewWriter(conn, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, logger), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	send := func(path, body string) string {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+key.Plaintext)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d; body %s", path, rec.Code, rec.Body)
+		}
+		return rec.Header().Get("X-Request-ID")
+	}
+	geminiID := send("/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", `{}`)
+	// Groq's Llama has no public price.
+	groqID := send("/groq/v1/chat/completions", `{"model":"llama-3.3-70b-versatile","messages":[]}`)
+
+	if err := writer.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := conn.QueryRow(`SELECT count(*) FROM usage_logs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("usage_logs has %d rows, want 2", n)
+	}
+
+	var (
+		tenantID, provider, model, endpoint string
+		keyID                               int64
+		input, cached, output, status       int
+		cost                                sql.NullInt64
+		streamed                            bool
+	)
+	err = conn.QueryRow(`
+		SELECT tenant_id, api_key_id, provider, model, endpoint, status,
+		       input_tokens, cached_input_tokens, output_tokens, cost_micros, streamed
+		FROM usage_logs WHERE request_id = $1`, geminiID,
+	).Scan(&tenantID, &keyID, &provider, &model, &endpoint, &status, &input, &cached, &output, &cost, &streamed)
+	if err != nil {
+		t.Fatalf("no row with the request ID the client got (%s): %v", geminiID, err)
+	}
+	if tenantID != tn.ID || keyID != key.ID || provider != "gemini" || model != "gemini-3.8-flash" ||
+		endpoint != "/v1beta/models/gemini-3.8-flash:streamGenerateContent" || status != 200 || !streamed {
+		t.Errorf("row = %s %d %s %s %s %d streamed=%v", tenantID, keyID, provider, model, endpoint, status, streamed)
+	}
+	// 15 + 5 cached + 17 out at $0.75 / $0.075 / $3.75: 75.375 → 75.
+	if input != 15 || cached != 5 || output != 17 || !cost.Valid || cost.Int64 != 75 {
+		t.Errorf("tokens %d/%d/%d, cost %v; want 15/5/17 and 75", input, cached, output, cost)
+	}
+
+	if err := conn.QueryRow(`SELECT cost_micros FROM usage_logs WHERE request_id = $1`, groqID).Scan(&cost); err != nil {
+		t.Fatal(err)
+	}
+	if cost.Valid {
+		t.Errorf("unpriced model: cost = %d, want NULL", cost.Int64)
 	}
 }

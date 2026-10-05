@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
 )
@@ -195,5 +196,19 @@ func TestReadBodyExposesModelAndStream(t *testing.T) {
 				t.Errorf("Model, Stream = %q, %v; want %q, %v", got.req.Model, got.req.Stream, tc.model, tc.stream)
 			}
 		})
+	}
+}
+
+// TestReadBodyRecordsPathAndTime: the usage row's endpoint is the path after
+// the provider prefix, and its latency and created_at count from arrival.
+func TestReadBodyRecordsPathAndTime(t *testing.T) {
+	before := time.Now()
+	_, got := serveBody(t, provider.FormatOpenAI, limit, "/v1/chat/completions", `{"model":"gpt-4o"}`)
+
+	if got.req.Path != "/v1/chat/completions" {
+		t.Errorf("Path = %q, want /v1/chat/completions", got.req.Path)
+	}
+	if got.req.Received.Before(before) || got.req.Received.After(time.Now()) {
+		t.Errorf("Received = %v, want the time ReadBody ran", got.req.Received)
 	}
 }

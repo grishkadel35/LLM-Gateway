@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
 )
@@ -21,6 +22,12 @@ type Request struct {
 	Model string
 	// Stream reports whether the client asked for a streamed response.
 	Stream bool
+	// Path is the request path after the provider prefix, such as
+	// /v1/chat/completions: the usage row's endpoint.
+	Path string
+	// Received is when ReadBody started on the request, which latency and
+	// the usage row's time count from.
+	Received time.Time
 }
 
 type requestKey struct{}
@@ -47,6 +54,7 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			received := time.Now()
 			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBytes))
 			if err != nil {
 				var tooLarge *http.MaxBytesError
@@ -59,7 +67,7 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 				return
 			}
 
-			req := &Request{}
+			req := &Request{Path: r.URL.Path, Received: received}
 			var fields map[string]json.RawMessage
 			if json.Unmarshal(body, &fields) == nil {
 				req.Model, req.Stream = modelAndStream(format, r.URL.Path, fields)

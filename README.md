@@ -25,6 +25,14 @@ metering is next.
 
 ### What changed
 
+- **Usage is recorded in Postgres.** Every request that reaches a provider
+  now leaves one `usage_logs` row: the `X-Request-ID` the client got, the
+  provider's own request ID, tenant, key, provider, model, endpoint, status,
+  tokens, cost in micro-dollars (NULL for an unpriced model, with a warning),
+  whether it streamed, and latency. Rows are queued and batch-inserted every
+  100 rows or second, off the response path: a full queue drops a row (logged
+  and counted) rather than slow a response down, and shutdown drains the
+  queue. This replaces the interim `usage` log line.
 - **Pricing.** `internal/pricing` holds per-model prices for all four
   providers in integer micro-dollars, copied from each provider's pricing
   page on 2026-10-05 (source and date noted per block). It handles dated

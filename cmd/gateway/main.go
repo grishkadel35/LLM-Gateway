@@ -26,6 +26,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
+	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
@@ -159,7 +160,21 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
-	handler, err := router(cfg, tenant.NewStore(conn), adminKey, logUsage(logger), logger)
+	writer := usage.NewWriter(conn, logger)
+	// Deferred after conn.Close, so it runs first: by the time run returns,
+	// Shutdown has drained every request, so every usage row is queued.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := writer.Close(ctx); err != nil {
+			logger.Error("usage writer did not drain", "error", err)
+		}
+		if n := writer.Dropped(); n > 0 {
+			logger.Error("usage rows were dropped", "count", n)
+		}
+	}()
+
+	handler, err := router(cfg, tenant.NewStore(conn), adminKey, recordUsage(writer, logger), logger)
 	if err != nil {
 		return err
 	}
@@ -274,25 +289,50 @@ func openDB(dsn string) (*sql.DB, error) {
 	return conn, nil
 }
 
-// logUsage returns a usageFunc that writes one "usage" log line per provider
-// response. It stands in until usage rows are written to Postgres.
-func logUsage(logger *slog.Logger) usageFunc {
+// recordUsage returns a usageFunc that turns each provider response into a
+// usage_logs row, priced, and queues it on w. It never blocks: w drops rather
+// than wait.
+func recordUsage(w *usage.Writer, logger *slog.Logger) usageFunc {
 	return func(ctx context.Context, provider string, r usage.Result) {
-		t, key, _ := middleware.TenantFrom(ctx)
-		logger.Info("usage",
-			"request_id", middleware.RequestIDFrom(ctx),
-			"provider_request_id", r.ProviderRequestID,
-			"tenant_id", t.ID,
-			"api_key_id", key.ID,
-			"provider", provider,
-			"model", r.Model,
-			"status", r.Status,
-			"input_tokens", r.Input,
-			"cached_input_tokens", r.CachedInput,
-			"cache_write_tokens", r.CacheWrite+r.CacheWrite1h,
-			"output_tokens", r.Output,
-			"streamed", r.Streamed,
-			"complete", r.Complete,
-		)
+		t, key, ok := middleware.TenantFrom(ctx)
+		if !ok {
+			// Auth runs before every provider route, so this is a wiring bug.
+			logger.Error("usage with no tenant; row not written", "request_id", middleware.RequestIDFrom(ctx), "provider", provider)
+			return
+		}
+		req, ok := usage.RequestFrom(ctx)
+		if !ok {
+			req = &usage.Request{Received: time.Now()}
+		}
+
+		row := usage.Row{
+			RequestID:         middleware.RequestIDFrom(ctx),
+			ProviderRequestID: r.ProviderRequestID,
+			TenantID:          t.ID,
+			APIKeyID:          key.ID,
+			Provider:          provider,
+			Model:             r.Model,
+			Endpoint:          req.Path,
+			Status:            r.Status,
+			Usage:             r.Usage,
+			Streamed:          r.Streamed,
+			LatencyMS:         time.Since(req.Received).Milliseconds(),
+			CreatedAt:         req.Received,
+		}
+
+		// No tokens cost nothing, priced or not: upstream errors report none.
+		var cost int64
+		priced := true
+		if hasTokens := r.Usage != (usage.Usage{Model: r.Model}); hasTokens {
+			cost, priced = pricing.Cost(provider, r.Usage, req.Model, req.Received)
+		}
+		if priced {
+			row.CostMicros = &cost
+		} else {
+			logger.Warn("model not priced; usage logged without cost",
+				"request_id", row.RequestID, "provider", provider, "model", r.Model)
+		}
+
+		w.Write(row)
 	}
 }
