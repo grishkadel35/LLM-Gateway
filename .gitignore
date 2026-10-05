@@ -21,6 +21,8 @@ config.local.yaml
 *.swp
 claude.md
 llm-gateway-roadmap.md
+# Local plan and task list (/plan, /build)
+/tasks/
 
 # graphify knowledge graph output (regenerate with /graphify)
 /graphify-out/
