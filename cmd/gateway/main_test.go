@@ -50,9 +50,11 @@ func (fakeStore) RevokeKey(context.Context, int64) error { return tenant.ErrNotF
 
 // fakeUpstream records what a provider actually received.
 type fakeUpstream struct {
-	server *httptest.Server
-	path   string
-	header http.Header
+	server        *httptest.Server
+	path          string
+	header        http.Header
+	body          string
+	contentLength int64
 }
 
 func newFakeUpstream(t *testing.T) *fakeUpstream {
@@ -62,6 +64,9 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.path = r.URL.Path
 		f.header = r.Header.Clone()
+		b, _ := io.ReadAll(r.Body)
+		f.body = string(b)
+		f.contentLength = r.ContentLength
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
@@ -531,5 +536,46 @@ func TestUnmeteredEndpointsAreRefused(t *testing.T) {
 	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/openai/v1/embeddings", nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("unauthenticated unmetered request: status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestStreamingOpenAIRequestAsksForUsage checks the body rewrite end to end:
+// the provider receives include_usage, with a Content-Length that matches
+// the rewritten body.
+func TestStreamingOpenAIRequestAsksForUsage(t *testing.T) {
+	for _, name := range []string{"openai", "groq"} {
+		t.Run(name, func(t *testing.T) {
+			r, ups := newTestRouter(t)
+			req := httptest.NewRequest(http.MethodPost, "/"+name+"/v1/chat/completions",
+				strings.NewReader(`{"model":"gpt-4o","stream":true,"messages":[]}`))
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
+			r.ServeHTTP(httptest.NewRecorder(), req)
+
+			up := ups[name]
+			if !strings.Contains(up.body, `"stream_options":{"include_usage":true}`) {
+				t.Errorf("upstream body = %s, want stream_options.include_usage true", up.body)
+			}
+			if up.contentLength != int64(len(up.body)) {
+				t.Errorf("upstream Content-Length = %d, body is %d bytes", up.contentLength, len(up.body))
+			}
+		})
+	}
+}
+
+// TestOversizedBodyIsRefused: the body limit applies before anything is
+// forwarded.
+func TestOversizedBodyIsRefused(t *testing.T) {
+	r, ups := newTestRouter(t)
+	big := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + strings.Repeat("a", config.DefaultMaxRequestBytes) + `"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(big))
+	req.Header.Set("Authorization", "Bearer "+testTenantKey)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+	if ups["openai"].path != "" {
+		t.Error("oversized request reached the provider")
 	}
 }

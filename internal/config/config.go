@@ -36,6 +36,10 @@ const (
 	// this machine (no TLS, no rate limits yet) is a decision the operator has
 	// to make explicitly.
 	DefaultHost = "127.0.0.1"
+	// DefaultMaxRequestBytes caps a request body at 32 MiB, Anthropic's own
+	// request limit: room for base64 images and PDFs, while a runaway client
+	// can't make the gateway buffer gigabytes.
+	DefaultMaxRequestBytes = 32 << 20
 )
 
 // validName is what a provider name may contain. The name becomes a URL path
@@ -60,9 +64,12 @@ var reservedNames = map[string]bool{
 // metadata that libraries read at runtime via reflection. The YAML parser uses
 // them to map file keys onto fields.
 type Config struct {
-	Port      int                       `yaml:"port"`
-	Host      string                    `yaml:"host"`
-	Providers map[string]ProviderConfig `yaml:"providers"`
+	Port int    `yaml:"port"`
+	Host string `yaml:"host"`
+	// MaxRequestBytes is the largest request body the gateway reads; larger
+	// ones get 413. The gateway buffers each body to meter and rewrite it.
+	MaxRequestBytes int64                     `yaml:"max_request_bytes"`
+	Providers       map[string]ProviderConfig `yaml:"providers"`
 }
 
 // ProviderConfig is one entry under `providers:` in the YAML file.
@@ -95,9 +102,10 @@ func (pc ProviderConfig) Timeout() time.Duration {
 // Default returns a Config with the built-in defaults and no providers.
 func Default() *Config {
 	return &Config{
-		Port:      DefaultPort,
-		Host:      DefaultHost,
-		Providers: map[string]ProviderConfig{},
+		Port:            DefaultPort,
+		Host:            DefaultHost,
+		MaxRequestBytes: DefaultMaxRequestBytes,
+		Providers:       map[string]ProviderConfig{},
 	}
 }
 
@@ -198,6 +206,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Host == "" {
 		return fmt.Errorf("host must not be empty")
+	}
+	if c.MaxRequestBytes <= 0 {
+		return fmt.Errorf("max_request_bytes must be greater than 0, got %d", c.MaxRequestBytes)
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("at least one provider must be configured")

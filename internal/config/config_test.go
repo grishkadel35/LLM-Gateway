@@ -49,6 +49,7 @@ func TestLoadReadsAllFields(t *testing.T) {
 	path := writeConfig(t, `
 port: 9090
 host: 0.0.0.0
+max_request_bytes: 1048576
 providers:
   anthropic:
     url: https://api.anthropic.com
@@ -67,6 +68,9 @@ providers:
 
 	if cfg.Port != 9090 {
 		t.Errorf("Port = %d, want 9090", cfg.Port)
+	}
+	if cfg.MaxRequestBytes != 1048576 {
+		t.Errorf("MaxRequestBytes = %d, want 1048576", cfg.MaxRequestBytes)
 	}
 	if cfg.Host != "0.0.0.0" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "0.0.0.0")
@@ -105,6 +109,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 	if cfg.Host != DefaultHost {
 		t.Errorf("Host = %q, want the default %q", cfg.Host, DefaultHost)
+	}
+	if cfg.MaxRequestBytes != DefaultMaxRequestBytes {
+		t.Errorf("MaxRequestBytes = %d, want the default %d", cfg.MaxRequestBytes, DefaultMaxRequestBytes)
 	}
 	if got := cfg.Providers["openai"].TimeoutSeconds; got != DefaultTimeoutSeconds {
 		t.Errorf("TimeoutSeconds = %d, want the default %d", got, DefaultTimeoutSeconds)
@@ -245,6 +252,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"port zero", "port: 0\n" + minimalProvider},
 		{"port too large", "port: 70000\n" + minimalProvider},
 		{"empty host", "host: \"\"\n" + minimalProvider},
+		{"zero max_request_bytes", "max_request_bytes: 0\n" + minimalProvider},
 		{"empty provider url", "providers:\n  openai:\n    url: \"\"\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
 		{"url without scheme", "providers:\n  openai:\n    url: api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
 		{"url with bad scheme", "providers:\n  openai:\n    url: ftp://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},

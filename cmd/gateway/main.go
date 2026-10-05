@@ -98,8 +98,10 @@ func router(cfg *config.Config, store tenantStore, adminKey string, logger *slog
 		// the proxy, so it can't spend the provider's key.
 		prefix := "/" + p.Name
 		// RequireMetered then refuses endpoints the gateway can't read usage
-		// from; it runs after StripPrefix so it sees the provider-relative path.
-		metered := usage.RequireMetered(p.Format)(proxy.New(p, logger))
+		// from, and ReadBody takes ownership of the body. Both run after
+		// StripPrefix, so they see the provider-relative path.
+		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(proxy.New(p, logger))
+		metered := usage.RequireMetered(p.Format)(body)
 		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, metered)))
 	}
 

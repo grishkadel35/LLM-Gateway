@@ -25,6 +25,14 @@ metering is next.
 
 ### What changed
 
+- **One owner for the request body.** The gateway reads each body once (up to
+  `max_request_bytes`, default 32 MiB; `413` beyond that), and forwards the
+  client's exact bytes unless it has to rewrite something. For OpenAI-format
+  streams (OpenAI, Groq) it now always sets `stream_options.include_usage`,
+  since that is the only way the stream reports token usage. **Clients see one
+  extra chunk** at the end of every OpenAI-format stream: `choices` is empty and
+  `usage` is set. The OpenAI SDKs handle it; a hand-written client that reads
+  `choices[0]` on every chunk must skip it.
 - **Only metered endpoints are forwarded.** Tenants can reach exactly the
   endpoints whose token usage the gateway can read: OpenAI-format
   `POST /v1/chat/completions`, Anthropic `POST /v1/messages`, and Gemini
@@ -301,7 +309,8 @@ providers:
       anthropic-version: "2023-06-01"
 ```
 
-`port`, `host` and each provider's `timeout` are optional. `url`, `key`,
+`port`, `host`, `max_request_bytes` (default 32 MiB) and each provider's
+`timeout` are optional. `url`, `key`,
 `auth` and `format` are required per provider.
 
 `format` is the shape of the provider's API, which decides how the gateway
