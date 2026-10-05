@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,11 +10,43 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/grishkadel/llm-gateway/internal/config"
+	"github.com/grishkadel/llm-gateway/internal/db"
+	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
+	"github.com/grishkadel/llm-gateway/internal/tenant"
 )
+
+// testTenantKey is the one gateway key fakeStore accepts; testAdminKey is the
+// admin key newTestRouter configures.
+const (
+	testTenantKey = "gw_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	testAdminKey  = "admin-test-key-0123456789abcdef0123456789"
+)
+
+// fakeStore stands in for tenant.Store so routing tests need no Postgres. It
+// knows one tenant with one key.
+type fakeStore struct{}
+
+func (fakeStore) Lookup(_ context.Context, key string) (tenant.Tenant, tenant.APIKey, error) {
+	if key != testTenantKey {
+		return tenant.Tenant{}, tenant.APIKey{}, tenant.ErrNotFound
+	}
+	return tenant.Tenant{ID: "tn_test"}, tenant.APIKey{ID: 1, TenantID: "tn_test"}, nil
+}
+
+func (fakeStore) Create(_ context.Context, name string) (tenant.Tenant, tenant.NewKey, error) {
+	return tenant.Tenant{ID: "tn_new", Name: name}, tenant.NewKey{APIKey: tenant.APIKey{ID: 2, TenantID: "tn_new"}}, nil
+}
+
+func (fakeStore) IssueKey(context.Context, string) (tenant.NewKey, error) {
+	return tenant.NewKey{}, tenant.ErrNotFound
+}
+
+func (fakeStore) RevokeKey(context.Context, int64) error { return tenant.ErrNotFound }
 
 // fakeUpstream records what a provider actually received.
 type fakeUpstream struct {
@@ -39,8 +72,13 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 }
 
 // newTestRouter wires four fake upstreams into a real config and builds the
-// gateway's route table from it, exactly as main() would.
+// gateway's route table from it, exactly as main() would, over fakeStore.
 func newTestRouter(t *testing.T) (http.Handler, map[string]*fakeUpstream) {
+	t.Helper()
+	return newTestRouterWith(t, fakeStore{})
+}
+
+func newTestRouterWith(t *testing.T, store tenantStore) (http.Handler, map[string]*fakeUpstream) {
 	t.Helper()
 
 	ups := map[string]*fakeUpstream{
@@ -90,7 +128,7 @@ providers:
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
 
-	r, err := router(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, store, testAdminKey, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -99,7 +137,7 @@ providers:
 
 // TestRoutingReachesTheRightProvider is the core of the multi-provider change:
 // each prefix must land on its own upstream, with the prefix stripped and that
-// provider's own credential applied.
+// provider's own credential applied in place of the client's gateway key.
 func TestRoutingReachesTheRightProvider(t *testing.T) {
 	cases := []struct {
 		provider   string
@@ -120,7 +158,7 @@ func TestRoutingReachesTheRightProvider(t *testing.T) {
 			r, ups := newTestRouter(t)
 
 			req := httptest.NewRequest(http.MethodPost, tc.request, strings.NewReader(`{"model":"x"}`))
-			req.Header.Set("Authorization", "Bearer sk-CLIENT-LEAK")
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
 
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
@@ -152,15 +190,21 @@ func TestRoutingReachesTheRightProvider(t *testing.T) {
 func TestClientCredentialNeverReachesUpstream(t *testing.T) {
 	r, ups := newTestRouter(t)
 
+	// The gateway key in every credential header the gateway reads: it
+	// authenticates, and then none of the three copies may go upstream.
 	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
-	req.Header.Set("Authorization", "Bearer sk-CLIENT-LEAK")
-	req.Header.Set("X-Api-Key", "sk-CLIENT-LEAK")
-	req.Header.Set("X-Goog-Api-Key", "sk-CLIENT-LEAK")
+	req.Header.Set("Authorization", "Bearer "+testTenantKey)
+	req.Header.Set("X-Api-Key", testTenantKey)
+	req.Header.Set("X-Goog-Api-Key", testTenantKey)
 
-	r.ServeHTTP(httptest.NewRecorder(), req)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+	}
 
 	for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"} {
-		if got := ups["anthropic"].header.Get(h); strings.Contains(got, "CLIENT-LEAK") {
+		if got := ups["anthropic"].header.Get(h); strings.Contains(got, testTenantKey) {
 			t.Errorf("%s = %q leaked the client's credential upstream", h, got)
 		}
 	}
@@ -246,13 +290,16 @@ func TestEveryResponseCarriesRequestID(t *testing.T) {
 		{"proxied", http.MethodPost, "/openai/v1/chat/completions", http.StatusOK},
 		{"unknown provider", http.MethodPost, "/nope/v1/chat/completions", http.StatusNotFound},
 		{"upstream down", http.MethodPost, "/gemini/v1beta/models/x:generateContent", http.StatusBadGateway},
+		{"rejected by auth", http.MethodPost, "/admin/tenants", http.StatusUnauthorized},
 		{"health", http.MethodGet, "/health", http.StatusOK},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
 			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+			r.ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatus {
 				t.Errorf("status = %d, want %d", rec.Code, tc.wantStatus)
@@ -261,5 +308,179 @@ func TestEveryResponseCarriesRequestID(t *testing.T) {
 				t.Errorf("X-Request-ID = %q, want one req_ ID", got)
 			}
 		})
+	}
+}
+
+// TestProviderRoutesRequireTenantKey: without a valid gateway key, no
+// provider is contacted, so nobody can spend the gateway's provider keys.
+func TestProviderRoutesRequireTenantKey(t *testing.T) {
+	cases := []struct{ name, header, value string }{
+		{"no key", "", ""},
+		{"unknown gateway key", "Authorization", "Bearer gw_ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+		{"provider key", "Authorization", "Bearer sk-proj-abc"},
+		{"admin key", "Authorization", "Bearer " + testAdminKey},
+	}
+	paths := []string{
+		"/openai/v1/chat/completions",
+		"/anthropic/v1/messages",
+		"/gemini/v1beta/models/x:generateContent",
+		"/groq/v1/chat/completions",
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ups := newTestRouter(t)
+			for _, path := range paths {
+				req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"x"}`))
+				if tc.header != "" {
+					req.Header.Set(tc.header, tc.value)
+				}
+				rec := httptest.NewRecorder()
+				r.ServeHTTP(rec, req)
+
+				if rec.Code != http.StatusUnauthorized {
+					t.Errorf("%s: status = %d, want %d", path, rec.Code, http.StatusUnauthorized)
+				}
+			}
+			for name, up := range ups {
+				if up.path != "" {
+					t.Errorf("rejected request reached provider %q", name)
+				}
+			}
+		})
+	}
+}
+
+// TestAdminRoutesRequireAdminKey: the admin API answers only the admin key.
+// Unauthenticated requests get 401 whatever the path or method, so they
+// learn nothing about which admin routes exist.
+func TestAdminRoutesRequireAdminKey(t *testing.T) {
+	r, _ := newTestRouter(t)
+
+	rejected := []struct{ name, method, path, authorization string }{
+		{"no key", http.MethodPost, "/admin/tenants", ""},
+		{"tenant key", http.MethodPost, "/admin/tenants", "Bearer " + testTenantKey},
+		{"wrong method, no key", http.MethodGet, "/admin/tenants", ""},
+		{"unknown path, no key", http.MethodGet, "/admin/nope", ""},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"name":"acme"}`))
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+			}
+		})
+	}
+
+	t.Run("admin key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/admin/tenants", strings.NewReader(`{"name":"acme"}`))
+		req.Header.Set("Authorization", "Bearer "+testAdminKey)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Errorf("status = %d, want %d; body %s", rec.Code, http.StatusCreated, rec.Body)
+		}
+	})
+}
+
+// TestHealthNeedsNoKey: liveness probes carry no credentials.
+func TestHealthNeedsNoKey(t *testing.T) {
+	r, _ := newTestRouter(t)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+}
+
+// TestKeyLifecycleThroughGateway runs the whole flow against Postgres: the
+// admin API creates a tenant, its key works on a provider route, the admin
+// API revokes it, and the same key is then refused.
+func TestKeyLifecycleThroughGateway(t *testing.T) {
+	conn := dbtest.New(t)
+	if _, err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	r, ups := newTestRouterWith(t, tenant.NewStore(conn))
+
+	call := func(method, path, authorization, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", authorization)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+
+	rec := call(http.MethodPost, "/admin/tenants", "Bearer "+testAdminKey, `{"name":"acme"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create tenant: status = %d; body %s", rec.Code, rec.Body)
+	}
+	var created struct {
+		Key struct {
+			ID        int64  `json:"id"`
+			Plaintext string `json:"plaintext"`
+		} `json:"key"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := call(http.MethodPost, "/openai/v1/chat/completions", "Bearer "+created.Key.Plaintext, `{}`); rec.Code != http.StatusOK {
+		t.Fatalf("new key: status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	if rec := call(http.MethodDelete, "/admin/keys/"+strconv.FormatInt(created.Key.ID, 10), "Bearer "+testAdminKey, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("revoke: status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+
+	ups["openai"].path = ""
+	if rec := call(http.MethodPost, "/openai/v1/chat/completions", "Bearer "+created.Key.Plaintext, `{}`); rec.Code != http.StatusUnauthorized {
+		t.Errorf("revoked key: status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+	if ups["openai"].path != "" {
+		t.Error("revoked key's request reached the provider")
+	}
+}
+
+func TestValidateAdminKey(t *testing.T) {
+	cases := []struct {
+		name, key string
+		ok        bool
+	}{
+		{"good", testAdminKey, true},
+		{"unset", "", false},
+		{"too short", "admin-0123456789abcdef", false},
+		// A tenant key as admin key would make that tenant an admin.
+		{"tenant key", testTenantKey, false},
+		// From an env file with a trailing newline: it could never be
+		// presented exactly, so admin would be locked out with no error.
+		{"trailing newline", testAdminKey + "\n", false},
+		{"leading space", " " + testAdminKey, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateAdminKey(tc.key)
+			if (err == nil) != tc.ok {
+				t.Errorf("validateAdminKey() = %v, want ok = %v", err, tc.ok)
+			}
+		})
+	}
+}
+
+// TestOpenDBFailsFast: a missing or unreachable database stops startup with
+// an error, rather than surfacing as 503s on the first requests.
+func TestOpenDBFailsFast(t *testing.T) {
+	if _, err := openDB(""); err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Errorf("openDB(\"\") = %v, want an error naming DATABASE_URL", err)
+	}
+	// Port 1 on loopback: nothing listens there, so the ping fails at once.
+	if conn, err := openDB("postgres://gateway:gateway@127.0.0.1:1/gateway?sslmode=disable&connect_timeout=2"); err == nil {
+		conn.Close()
+		t.Error("openDB() on an unreachable database returned no error")
 	}
 }

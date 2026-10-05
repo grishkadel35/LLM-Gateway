@@ -10,8 +10,8 @@
 port: 8080
 
 # Address to bind to. Loopback by default and on purpose: the gateway holds
-# real provider keys but has no tenant authentication yet, so anything that can
-# reach this port can spend them. Change this only once auth exists.
+# real provider keys. Tenant keys guard them, but there is no TLS or rate
+# limiting yet, so binding wider is a deliberate choice, not a default.
 host: 127.0.0.1
 
 # Each provider is reachable at /<name>/... — point your client's base URL at

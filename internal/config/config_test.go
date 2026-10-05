@@ -110,8 +110,8 @@ func TestLoadAppliesDefaults(t *testing.T) {
 }
 
 // TestDefaultHostIsLoopback pins a security decision rather than a preference:
-// the gateway holds real provider keys and has no tenant auth yet, so it must
-// not bind to every interface by default.
+// the gateway holds real provider keys, so exposing it beyond this machine
+// must be an explicit choice, never the default.
 func TestDefaultHostIsLoopback(t *testing.T) {
 	if DefaultHost != "127.0.0.1" {
 		t.Errorf("DefaultHost = %q, want 127.0.0.1 — the gateway holds API keys and has no auth yet", DefaultHost)

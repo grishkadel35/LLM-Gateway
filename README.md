@@ -9,21 +9,32 @@ Providers speak their own native APIs — the gateway never translates request o
 response bodies, so new provider features work the day they ship. Adding a
 provider is a block of YAML, not code.
 
-> **⚠️ Not safe to expose yet.** The gateway holds real provider API keys but has
-> no tenant authentication (that arrives in Week 2). Anything that can reach the
-> port can spend those keys, so it binds to `127.0.0.1` by default. Don't change
-> that until auth exists.
+> **⚠️ Keep it on loopback for now.** Every provider route requires a tenant
+> key, but there is no TLS, rate limiting or budget enforcement yet, so the
+> gateway binds to `127.0.0.1` by default. Binding wider is your call to make
+> deliberately.
 
 ## Project status
 
 **Last updated:** 2026-10-05
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
 routing. Week 2 in progress: the mock provider, the dev stack (Postgres,
-migrations, CI), tenant key management, the auth middleware and request IDs
-are done. The gateway itself doesn't use the database yet.
+migrations, CI), tenant keys, request IDs and the admin API are done, and the
+gateway now authenticates every provider request against Postgres. Usage
+metering is next.
 
 ### What changed
 
+- **Tenant auth is live.** Every provider route needs a gateway key (`gw_…`),
+  sent where the client's SDK sends its API key; anything else gets a 401 and
+  never reaches the provider. The gateway now needs Postgres and an admin key
+  to start: `DATABASE_URL` and `GATEWAY_ADMIN_KEY` (32+ characters, not a
+  `gw_` key, no stray whitespace). Both are checked at startup.
+- **Admin API.** `POST /admin/tenants` creates a tenant and returns its first
+  key, `POST /admin/tenants/{id}/keys` issues another (for rotation), and
+  `DELETE /admin/keys/{id}` revokes one. The admin key goes in
+  `Authorization: Bearer`, compared in constant time; a key's plaintext appears
+  once, in the response that issues it. See [Endpoints](#endpoints).
 - **Request IDs.** Every response, including 401s, 404s and proxy errors,
   carries a gateway-generated `X-Request-ID`, which also goes in the request's
   log line. A client-sent `X-Request-ID` is logged as `client_request_id` but
@@ -34,11 +45,8 @@ are done. The gateway itself doesn't use the database yet.
 - **Auth middleware.** `middleware.Auth` reads the gateway key from whichever
   header the client's SDK sends (`Authorization: Bearer`, `X-Api-Key`,
   `X-Goog-Api-Key`), looks it up, and puts the tenant and key on the request
-  context; anything else gets a 401 and never reaches the provider. A failed
-  lookup (database down) is a 503, not a 401. Gemini's `?key=` is not
-  accepted: a key in a URL ends up in proxy logs. It isn't wired into the
-  gateway yet: that lands with the admin routes, so there is never a gateway
-  that demands keys with no way to issue one.
+  context. A failed lookup (database down) is a 503, not a 401. Gemini's
+  `?key=` is not accepted: a key in a URL ends up in proxy logs.
 - **Tenant keys.** `internal/tenant` creates tenants and issues, revokes and
   looks up their `gw_` keys. Only a SHA-256 hash of each key is stored; the
   plaintext is returned once, at issue.
@@ -112,7 +120,7 @@ logged — including streamed responses.
   indexed lookup; several per tenant, so keys rotate without downtime
 - [x] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header, rejects revoked keys, and attaches the tenant to the
-  request context (wired into the gateway together with the admin routes)
+  request context
 - [x] Request IDs — an `X-Request-ID` per request, returned to the client and
   logged (stored with its usage row, next to the provider's own ID, once usage
   logging lands)
@@ -121,8 +129,9 @@ logged — including streamed responses.
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars
-- [ ] Admin routes behind a separate admin key: `POST /admin/tenants`,
-  issuing and revoking keys, `GET /admin/tenants/{id}/usage`
+- [x] Admin routes behind a separate admin key: `POST /admin/tenants`,
+  issuing and revoking keys (`GET /admin/tenants/{id}/usage` comes with usage
+  logging)
 
 This is the first week the gateway stops being dependency-free: it adds
 Postgres and the `pgx` driver. Auth middleware runs *before* the proxy, so a
@@ -132,42 +141,60 @@ metered too; otherwise `stream: true` would bypass every future limit.
 
 ## Quick start
 
-Export a key for each provider in `config.yaml`, then run:
+Start Postgres and create the schema (see [Database](#database)):
+
+```sh
+make db-up migrate
+```
+
+Export a key for each provider in `config.yaml`, plus an admin key of your
+own, then run:
 
 ```sh
 export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export GEMINI_API_KEY=...
 export GROQ_API_KEY=gsk_...
+export GATEWAY_ADMIN_KEY=$(openssl rand -hex 32)
 
 make run
 ```
 
-A key that isn't set is a startup error, not a surprise 401 on the first
-request. To run with fewer providers, delete the ones you don't need from
-`config.yaml`.
+A provider key that isn't set, a missing or weak admin key, or an unreachable
+database is a startup error, not a surprise on the first request. To run with
+fewer providers, delete the ones you don't need from `config.yaml`.
 
-Then point your client at `/<provider>` and use that provider's own API. You
-send **no API key** — the gateway attaches its own:
+Create a tenant with the admin key. The response holds the tenant's first
+gateway key (`key.plaintext`); it is shown once, so keep it:
+
+```sh
+curl -X POST http://127.0.0.1:8080/admin/tenants \
+  -H "Authorization: Bearer $GATEWAY_ADMIN_KEY" \
+  -d '{"name":"my-app"}'
+```
+
+Then point your client at `/<provider>` and use that provider's own API, with
+the **gateway key** in place of the provider's. The gateway checks it, strips
+it, and attaches the provider key it holds:
 
 ```sh
 curl http://127.0.0.1:8080/openai/v1/chat/completions \
+  -H "Authorization: Bearer gw_..." \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
 
 curl http://127.0.0.1:8080/anthropic/v1/messages \
+  -H "X-Api-Key: gw_..." \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-sonnet-4","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-With an SDK, override the base URL:
+With an SDK, override the base URL and pass the gateway key as the API key:
 
 ```python
 from openai import OpenAI
 
-# The api_key argument is required by the SDK but ignored by the gateway,
-# which strips it and substitutes its own.
-client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key="unused")
+client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key="gw_...")
 ```
 
 ### Without API keys
@@ -177,8 +204,18 @@ and `config.mock.yaml` points the gateway's providers at it. Nothing leaves the
 machine and nothing costs money:
 
 ```sh
-make mock       # terminal 1: mock provider on 127.0.0.1:9090
-make run-mock   # terminal 2: gateway on 127.0.0.1:8080
+make db-up migrate   # once: tenant keys live in Postgres
+make mock            # terminal 1: mock provider on 127.0.0.1:9090
+make run-mock        # terminal 2: gateway on 127.0.0.1:8080
+```
+
+`run-mock` sets a fixed admin key, `mock-admin-key-for-local-testing-only`, so
+creating a tenant needs no setup:
+
+```sh
+curl -X POST http://127.0.0.1:8080/admin/tenants \
+  -H "Authorization: Bearer mock-admin-key-for-local-testing-only" \
+  -d '{"name":"dev"}'
 ```
 
 Client base URLs are the same as against the real providers. Every reply is the
@@ -237,7 +274,7 @@ Without it, `go test ./...` skips them and needs nothing running.
 
 ```yaml
 port: 8080          # port the gateway listens on
-host: 127.0.0.1     # bind address — loopback until tenant auth exists
+host: 127.0.0.1     # bind address — loopback by default; see the note at the top
 
 providers:
   openai:
@@ -293,11 +330,18 @@ SigV4, Vertex AI's OAuth — can't be expressed this way and would need code.
 
 ## Endpoints
 
-| Path              | Behavior                                                        |
-| ----------------- | --------------------------------------------------------------- |
-| `/health`         | Returns `{"status":"ok"}`. Handled locally.                     |
-| `/<provider>/...` | Prefix stripped, forwarded to that provider with its own key.   |
-| anything else     | `404` with a JSON body listing the configured providers.        |
+| Path                              | Behavior                                                                                  |
+| --------------------------------- | ----------------------------------------------------------------------------------------- |
+| `GET /health`                     | Returns `{"status":"ok"}`. Handled locally, no key needed.                                |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise). Prefix stripped, forwarded with the provider's key. |
+| `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
+| `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
+| `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
+| anything else                     | `404` with a JSON body listing the configured providers.                                  |
+
+Every response carries an `X-Request-ID`. Key plaintext appears only in the
+`201` that issues it, with `Cache-Control: no-store`. Any `/admin/` request
+without the admin key gets `401`, whatever the path or method.
 
 There is deliberately **no default provider**. A request must name one, so a
 typo in a base URL can never silently send traffic — and spend — somewhere
@@ -340,6 +384,7 @@ cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
+internal/admin/           admin API: create tenants, issue and revoke keys
 cmd/migrate/main.go       applies migrations to DATABASE_URL
 deployments/              docker compose dev stack (Postgres)
 .github/workflows/ci.yml  vet + race-enabled tests against Postgres

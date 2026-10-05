@@ -32,9 +32,9 @@ const (
 	// default: the gateway should never give up before the client would.
 	DefaultTimeoutSeconds = 600
 	// DefaultHost is deliberately loopback-only. The gateway holds real
-	// provider API keys but has no tenant authentication yet, so anything that
-	// can reach the port can spend them. Binding to 0.0.0.0 is a decision the
-	// operator has to make explicitly.
+	// provider API keys; tenant keys guard them, but exposing the port beyond
+	// this machine (no TLS, no rate limits yet) is a decision the operator has
+	// to make explicitly.
 	DefaultHost = "127.0.0.1"
 )
 

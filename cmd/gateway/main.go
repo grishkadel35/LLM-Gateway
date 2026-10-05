@@ -7,19 +7,27 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	// Registers the "pgx" driver with database/sql.
+	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/grishkadel/llm-gateway/internal/admin"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
+	"github.com/grishkadel/llm-gateway/internal/tenant"
 )
 
 func main() {
@@ -41,18 +49,27 @@ func main() {
 	}
 
 	if err := run(cfg, logger); err != nil {
-		logger.Error("server stopped with error", "error", err)
+		logger.Error("gateway exited with error", "error", err)
 		os.Exit(1)
 	}
 }
 
+// tenantStore is what the routes need from tenant storage: key lookup for
+// tenant auth, and tenant and key management for the admin API.
+// *tenant.Store satisfies it; routing tests substitute a fake.
+type tenantStore interface {
+	middleware.KeyLookup
+	admin.Store
+}
+
 // router builds the gateway's handler: one reverse proxy per configured
-// provider, plus /health and a catch-all that rejects unknown prefixes, all
-// behind the request ID and logging middleware.
+// provider behind tenant auth, the admin API behind the admin key, /health,
+// and a catch-all that rejects unknown prefixes, all behind the request ID and
+// logging middleware.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -63,13 +80,23 @@ func router(cfg *config.Config, logger *slog.Logger) (http.Handler, error) {
 	mux := http.NewServeMux()
 	mux.Handle("/health", health.Handler())
 
+	// One subtree behind AdminAuth, not a pattern per admin route: with
+	// per-route patterns, ServeMux would answer an unauthenticated request for
+	// the wrong method with 405 and an Allow header, before any auth ran.
+	mux.Handle("/admin/", middleware.AdminAuth(adminKey)(admin.Handler(store, logger)))
+
+	tenantAuth := middleware.Auth(store, logger)
+
 	for _, p := range providers {
 		// A trailing slash makes this a subtree pattern: "/openai/" matches
 		// "/openai/v1/chat/completions". StripPrefix then removes "/openai"
 		// before the proxy's Rewrite joins what's left onto the provider's
 		// base URL — so routing and path rewriting need no custom code.
+		//
+		// Auth runs first: a request without a valid gateway key never reaches
+		// the proxy, so it can't spend the provider's key.
 		prefix := "/" + p.Name
-		mux.Handle(prefix+"/", http.StripPrefix(prefix, proxy.New(p, logger)))
+		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, proxy.New(p, logger))))
 	}
 
 	// Anything that names no provider is rejected. There is deliberately no
@@ -106,7 +133,18 @@ func unknownProvider(names []string) http.Handler {
 // error normally. os.Exit skips deferred functions, so we want exactly one place
 // (main) that calls it.
 func run(cfg *config.Config, logger *slog.Logger) error {
-	handler, err := router(cfg, logger)
+	adminKey := os.Getenv("GATEWAY_ADMIN_KEY")
+	if err := validateAdminKey(adminKey); err != nil {
+		return fmt.Errorf("GATEWAY_ADMIN_KEY %w", err)
+	}
+
+	conn, err := openDB(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	handler, err := router(cfg, tenant.NewStore(conn), adminKey, logger)
 	if err != nil {
 		return err
 	}
@@ -136,12 +174,6 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		logger.Info("gateway listening",
 			"addr", srv.Addr,
 			"providers", cfg.ProviderNames(),
-		)
-		// The gateway now holds real provider API keys but has no tenant
-		// authentication yet (that arrives with middleware/auth.go). Until
-		// then, anything that can reach this address can spend those keys.
-		logger.Warn("no tenant authentication configured: any client that can reach this address can spend the configured provider keys",
-			"addr", srv.Addr,
 		)
 		serverErr <- srv.ListenAndServe()
 	}()
@@ -180,4 +212,49 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		logger.Info("gateway stopped")
 		return nil
 	}
+}
+
+// minAdminKeyLen is the shortest admin key accepted: 32 characters, so a
+// random key carries at least 128 bits even in hex.
+const minAdminKeyLen = 32
+
+// validateAdminKey rejects admin keys that are missing, short, or would
+// never match. The returned error reads after the variable name.
+func validateAdminKey(key string) error {
+	switch {
+	case key == "":
+		return errors.New("is not set; the admin API needs it (generate one with: openssl rand -hex 32)")
+	case strings.TrimSpace(key) != key:
+		// Usually a trailing newline from an env file. A client would never
+		// present it, so admin would be locked out with no error anywhere.
+		return errors.New("has leading or trailing whitespace")
+	case strings.HasPrefix(key, tenant.KeyPrefix):
+		// That tenant's key would then pass the admin check too.
+		return fmt.Errorf("must not be a tenant key (%s...)", tenant.KeyPrefix)
+	case len(key) < minAdminKeyLen:
+		return fmt.Errorf("must be at least %d characters, got %d", minAdminKeyLen, len(key))
+	}
+	return nil
+}
+
+// openDB connects to Postgres and pings it, so a missing or unreachable
+// database stops startup instead of turning every request into a 503.
+func openDB(dsn string) (*sql.DB, error) {
+	if dsn == "" {
+		return nil, errors.New("DATABASE_URL is not set, e.g. postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable")
+	}
+
+	// sql.Open only validates its arguments; the ping is what connects.
+	conn, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening the database: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.PingContext(ctx); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("connecting to the database: %w", err)
+	}
+	return conn, nil
 }
