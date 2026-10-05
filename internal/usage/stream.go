@@ -17,7 +17,9 @@ type Result struct {
 	// Status is the HTTP status the provider returned, which the client
 	// receives unchanged.
 	Status int
-	// Streamed reports whether the response was a server-sent event stream.
+	// Streamed reports whether the response was streamed: a server-sent
+	// event stream, or a stream the client asked for in another shape (such
+	// as Gemini's default JSON array).
 	Streamed bool
 	// Complete is false when the body was closed before EOF, typically
 	// because the client disconnected mid-stream: Usage then holds only what
@@ -44,20 +46,32 @@ const maxBufferedBody = 32 << 20
 // A text/event-stream body is parsed event by event. Anything else is parsed
 // once complete, which also covers JSON streamed without SSE, such as
 // Gemini's default JSON-array stream.
+//
+// When the response doesn't name its model (error responses rarely do), the
+// model the request asked for is reported instead.
 func Meter(resp *http.Response, format provider.Format, done Callback) {
 	providerID := resp.Header.Get("X-Request-Id") // OpenAI, Groq
 	if providerID == "" {
 		providerID = resp.Header.Get("Request-Id") // Anthropic
 	}
 
+	ctx := resp.Request.Context()
+	sse := isEventStream(resp)
+	req, _ := RequestFrom(ctx)
+	if req == nil {
+		req = &Request{}
+	}
+
 	resp.Body = &meteredBody{
 		body:   resp.Body,
 		parser: newParser(format),
 		done:   done,
-		ctx:    resp.Request.Context(),
+		ctx:    ctx,
+		sse:    sse,
+		req:    req,
 		result: Result{
 			Status:            resp.StatusCode,
-			Streamed:          isEventStream(resp),
+			Streamed:          sse || req.Stream,
 			ProviderRequestID: providerID,
 		},
 	}
@@ -68,6 +82,8 @@ type meteredBody struct {
 	parser parser // nil: the format has no parser, report no usage
 	done   Callback
 	ctx    context.Context
+	sse    bool     // parse event by event, rather than the whole body at EOF
+	req    *Request // what ReadBody saw of the request
 	result Result
 
 	// buf holds an unfinished SSE line, or the whole body so far for
@@ -106,7 +122,7 @@ func (m *meteredBody) feed(b []byte) {
 		return
 	}
 	m.buf = append(m.buf, b...)
-	if !m.result.Streamed {
+	if !m.sse {
 		return
 	}
 
@@ -150,7 +166,7 @@ func (m *meteredBody) dispatch() {
 func (m *meteredBody) finish(complete bool) {
 	m.once.Do(func() {
 		if m.parser != nil && !m.overflow {
-			if m.result.Streamed {
+			if m.sse {
 				// A last event the stream didn't terminate with a blank line.
 				if len(m.buf) > 0 {
 					m.line(m.buf)
@@ -160,6 +176,9 @@ func (m *meteredBody) finish(complete bool) {
 				m.parser.body(m.buf)
 			}
 			m.result.Usage = m.parser.usage()
+		}
+		if m.result.Model == "" {
+			m.result.Model = m.req.Model
 		}
 		m.buf, m.data = nil, nil
 		m.result.Complete = complete

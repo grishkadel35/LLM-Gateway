@@ -279,18 +279,13 @@ func openDB(dsn string) (*sql.DB, error) {
 func logUsage(logger *slog.Logger) usageFunc {
 	return func(ctx context.Context, provider string, r usage.Result) {
 		t, key, _ := middleware.TenantFrom(ctx)
-		model := r.Model
-		if req, ok := usage.RequestFrom(ctx); ok && model == "" {
-			// Error responses usually don't name a model.
-			model = req.Model
-		}
 		logger.Info("usage",
 			"request_id", middleware.RequestIDFrom(ctx),
 			"provider_request_id", r.ProviderRequestID,
 			"tenant_id", t.ID,
 			"api_key_id", key.ID,
 			"provider", provider,
-			"model", model,
+			"model", r.Model,
 			"status", r.Status,
 			"input_tokens", r.Input,
 			"cached_input_tokens", r.CachedInput,

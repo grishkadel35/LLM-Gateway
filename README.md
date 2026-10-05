@@ -32,8 +32,10 @@ metering is next.
   produce a `usage` log line with tenant, key, provider, model, token counts,
   the provider's own request ID, and whether the stream completed. Anthropic
   is metered too, cache writes split by TTL (5-minute and 1-hour writes cost
-  different amounts). The Gemini parser is next; until then its lines show
-  zero tokens. A
+  different amounts). Gemini is metered in all three response shapes (JSON,
+  SSE, and the default JSON-array stream), with thinking tokens counted as
+  output, as they are billed. Verified through the openai, anthropic and
+  google-genai SDKs against the mock. A
   client that disconnects mid-stream still gets what was seen recorded,
   marked `"complete": false`. `input_tokens` means tokens billed at the input
   rate: cache reads are counted separately in `cached_input_tokens`.
@@ -153,7 +155,7 @@ logged — including streamed responses.
   logged (stored with its usage row, next to the provider's own ID, once usage
   logging lands)
 - [x] A `format` field per provider (`openai`, `anthropic`, `gemini`)
-- [ ] A usage parser for each format (OpenAI/Groq and Anthropic done; Gemini next)
+- [x] A usage parser for each format (OpenAI/Groq, Anthropic, Gemini)
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars

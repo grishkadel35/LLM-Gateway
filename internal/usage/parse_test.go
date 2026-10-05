@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
@@ -173,5 +174,70 @@ func TestAnthropicDeltaKeepsCacheWriteBreakdown(t *testing.T) {
 
 	if got.CacheWrite5m != 3 || got.CacheWrite1h != 2 {
 		t.Errorf("cache writes = %d (5m), %d (1h); want the breakdown 3, 2 kept", got.CacheWrite5m, got.CacheWrite1h)
+	}
+}
+
+// Gemini's promptTokenCount includes cache reads, like OpenAI's. Thinking is
+// billed as output but reported outside candidatesTokenCount (verified live
+// on gemini-3.8-flash: 14 candidates, 179 thoughts), so output is the sum.
+func TestGeminiBody(t *testing.T) {
+	got := parseBody(t, provider.FormatGemini, `{
+		"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":20,"cachedContentTokenCount":5,"candidatesTokenCount":10,
+		                 "thoughtsTokenCount":7,"totalTokenCount":37},
+		"modelVersion":"gemini-3.8-flash"}`)
+
+	want := Usage{Model: "gemini-3.8-flash", Input: 15, CachedInput: 5, Output: 17}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+func TestGeminiWithoutThoughts(t *testing.T) {
+	got := parseBody(t, provider.FormatGemini,
+		`{"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":10,"totalTokenCount":30}}`)
+
+	if got.Input != 20 || got.CachedInput != 0 || got.Output != 10 {
+		t.Errorf("usage = %+v, want input 20, cached 0, output 10", got)
+	}
+}
+
+// geminiStreamChunk is one streamed response with candidates so far.
+func geminiStreamChunk(candidates int) string {
+	return `{"candidates":[{"content":{"parts":[{"text":"w"}]}}],"usageMetadata":{"promptTokenCount":20,` +
+		`"cachedContentTokenCount":5,"candidatesTokenCount":` + strconv.Itoa(candidates) +
+		`,"thoughtsTokenCount":7},"modelVersion":"gemini-3.8-flash"}`
+}
+
+// Every streamed chunk carries usageMetadata as a running total: the last
+// one wins, never a sum.
+func TestGeminiSSEStream(t *testing.T) {
+	got := parseEvents(t, provider.FormatGemini, geminiStreamChunk(1), geminiStreamChunk(2), geminiStreamChunk(10))
+
+	want := Usage{Model: "gemini-3.8-flash", Input: 15, CachedInput: 5, Output: 17}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+// Without ?alt=sse, Gemini streams one JSON array of the same chunks.
+func TestGeminiJSONArrayStream(t *testing.T) {
+	got := parseBody(t, provider.FormatGemini, "["+geminiStreamChunk(1)+",\n"+geminiStreamChunk(2)+",\n"+geminiStreamChunk(10)+"]\n")
+
+	want := Usage{Model: "gemini-3.8-flash", Input: 15, CachedInput: 5, Output: 17}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+func TestGeminiNoUsage(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":404,"message":"models/x is not found","status":"NOT_FOUND"}}`,
+		`[{"error":{"code":429}}]`,
+		`[`,
+	} {
+		if got := parseBody(t, provider.FormatGemini, body); got != (Usage{}) {
+			t.Errorf("body %q: usage = %+v, want zero", body, got)
+		}
 	}
 }

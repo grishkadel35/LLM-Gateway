@@ -135,3 +135,30 @@ func TestMeterAnthropicRequestID(t *testing.T) {
 		t.Errorf("ProviderRequestID = %q, want req_anthropic_1", got)
 	}
 }
+
+// TestMeterFallsBackToRequestedModel: error responses rarely name a model,
+// and Gemini keeps it in the URL; the requested model fills the gap.
+func TestMeterFallsBackToRequestedModel(t *testing.T) {
+	resp := response(http.StatusBadRequest, "application/json", strings.NewReader(`{"error":{"message":"bad"}}`))
+	resp.Request = resp.Request.WithContext(context.WithValue(context.Background(), requestKey{}, &Request{Model: "gpt-4o"}))
+	calls := meter(resp, provider.FormatOpenAI)
+	_, _ = io.ReadAll(resp.Body)
+
+	if got := (*calls)[0].Model; got != "gpt-4o" {
+		t.Errorf("Model = %q, want the requested gpt-4o", got)
+	}
+}
+
+// TestMeterReportsJSONStreamAsStreamed: Gemini's default stream is a JSON
+// array sent as application/json. It is parsed as one body, but it was still
+// a streamed response.
+func TestMeterReportsJSONStreamAsStreamed(t *testing.T) {
+	resp := response(http.StatusOK, "application/json", strings.NewReader(`[{"usageMetadata":{"promptTokenCount":3}}]`))
+	resp.Request = resp.Request.WithContext(context.WithValue(context.Background(), requestKey{}, &Request{Stream: true}))
+	calls := meter(resp, provider.FormatGemini)
+	_, _ = io.ReadAll(resp.Body)
+
+	if res := (*calls)[0]; !res.Streamed || res.Input != 3 {
+		t.Errorf("result = %+v, want streamed with input 3", res)
+	}
+}

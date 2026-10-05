@@ -723,3 +723,34 @@ func TestAnthropicUsageThroughMock(t *testing.T) {
 		})
 	}
 }
+
+// TestGeminiUsageThroughMock covers all three Gemini response shapes: plain
+// JSON, SSE, and the default JSON-array stream. Output includes thinking.
+func TestGeminiUsageThroughMock(t *testing.T) {
+	want := usage.Usage{
+		Model:       "gemini-3.8-flash",
+		Input:       mockprovider.PromptTokens - mockprovider.CachedPromptTokens,
+		CachedInput: mockprovider.CachedPromptTokens,
+		Output:      mockprovider.OutputTokens + mockprovider.ThoughtsTokens,
+	}
+	cases := []struct {
+		name, path string
+		streamed   bool
+	}{
+		{"generateContent", "/gemini/v1beta/models/gemini-3.8-flash:generateContent", false},
+		{"sse stream", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", true},
+		{"json array stream", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := meterThroughMock(t, tc.path, `{"contents":[{"parts":[{"text":"hi"}]}]}`)
+
+			if got.result.Usage != want {
+				t.Errorf("usage = %+v, want %+v", got.result.Usage, want)
+			}
+			if got.result.Streamed != tc.streamed || !got.result.Complete {
+				t.Errorf("result = %+v, want streamed %v, complete", got.result, tc.streamed)
+			}
+		})
+	}
+}

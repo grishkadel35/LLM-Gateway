@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bytes"
 	"encoding/json"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
@@ -46,6 +47,8 @@ func newParser(format provider.Format) parser {
 		return &openAIParser{}
 	case provider.FormatAnthropic:
 		return &anthropicParser{}
+	case provider.FormatGemini:
+		return &geminiParser{}
 	}
 	return nil
 }
@@ -178,3 +181,58 @@ func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
 }
 
 func (p *anthropicParser) usage() Usage { return p.u }
+
+// geminiParser reads Gemini's generateContent shape. promptTokenCount
+// includes cache reads, so they are subtracted for Input. Thinking is billed
+// as output but reported in thoughtsTokenCount, outside candidatesTokenCount,
+// so Output is their sum.
+//
+// Every streamed chunk carries usageMetadata as a running total, so the last
+// one wins. Without ?alt=sse the stream is one JSON array of chunks.
+type geminiParser struct {
+	u Usage
+}
+
+type geminiChunk struct {
+	ModelVersion  string `json:"modelVersion"`
+	UsageMetadata *struct {
+		PromptTokenCount        int64 `json:"promptTokenCount"`
+		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
+		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
+	} `json:"usageMetadata"`
+}
+
+func (p *geminiParser) event(data []byte) {
+	var c geminiChunk
+	if json.Unmarshal(data, &c) == nil {
+		p.chunk(c)
+	}
+}
+
+func (p *geminiParser) body(b []byte) {
+	if t := bytes.TrimSpace(b); len(t) > 0 && t[0] == '[' {
+		var chunks []geminiChunk
+		if json.Unmarshal(t, &chunks) != nil {
+			return
+		}
+		for _, c := range chunks {
+			p.chunk(c)
+		}
+		return
+	}
+	p.event(b)
+}
+
+func (p *geminiParser) chunk(c geminiChunk) {
+	if c.ModelVersion != "" {
+		p.u.Model = c.ModelVersion
+	}
+	if m := c.UsageMetadata; m != nil {
+		p.u.Input = m.PromptTokenCount - m.CachedContentTokenCount
+		p.u.CachedInput = m.CachedContentTokenCount
+		p.u.Output = m.CandidatesTokenCount + m.ThoughtsTokenCount
+	}
+}
+
+func (p *geminiParser) usage() Usage { return p.u }
