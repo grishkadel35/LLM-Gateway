@@ -101,20 +101,24 @@ providers:
     url: %s
     key: ${TEST_OPENAI_KEY}
     auth: bearer
+    format: openai
   anthropic:
     url: %s
     key: ${TEST_ANTHROPIC_KEY}
     auth: x-api-key
+    format: anthropic
     headers:
       anthropic-version: "2023-06-01"
   gemini:
     url: %s
     key: ${TEST_GEMINI_KEY}
     auth: x-goog-api-key
+    format: gemini
   groq:
     url: %s/openai
     key: ${TEST_GROQ_KEY}
     auth: bearer
+    format: openai
 `, ups["openai"].server.URL, ups["anthropic"].server.URL,
 		ups["gemini"].server.URL, ups["groq"].server.URL)
 

@@ -124,8 +124,8 @@ logged — including streamed responses.
 - [x] Request IDs — an `X-Request-ID` per request, returned to the client and
   logged (stored with its usage row, next to the provider's own ID, once usage
   logging lands)
-- [ ] A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
-  usage parser for each
+- [x] A `format` field per provider (`openai`, `anthropic`, `gemini`)
+- [ ] A usage parser for each format
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars
@@ -282,17 +282,23 @@ providers:
     timeout: 600                 # seconds to wait for response headers
     key: ${OPENAI_API_KEY}       # environment reference, never a literal
     auth: bearer                 # bearer | x-api-key | x-goog-api-key
+    format: openai               # openai | anthropic | gemini
 
   anthropic:
     url: https://api.anthropic.com
     key: ${ANTHROPIC_API_KEY}
     auth: x-api-key
+    format: anthropic
     headers:                     # static headers this provider requires
       anthropic-version: "2023-06-01"
 ```
 
-`port`, `host` and each provider's `timeout` are optional. `url`, `key` and
-`auth` are required per provider.
+`port`, `host` and each provider's `timeout` are optional. `url`, `key`,
+`auth` and `format` are required per provider.
+
+`format` is the shape of the provider's API, which decides how the gateway
+reads token usage from its responses. It names a wire shape, not a company:
+Groq and other OpenAI-compatible providers are `openai`.
 
 **Keys are always environment references.** `config.yaml` is committed to git;
 a literal key there would be published, so `key` must be exactly one `${VAR}`
@@ -316,13 +322,14 @@ unreachable provider returns `502`.
 ### Adding a provider
 
 Anything OpenAI-compatible is pure config. Groq is in the default file as proof
-— same `auth: bearer` as OpenAI, different base URL:
+— same `auth: bearer` and `format: openai` as OpenAI, different base URL:
 
 ```yaml
   groq:
     url: https://api.groq.com/openai   # base path is preserved
     key: ${GROQ_API_KEY}
     auth: bearer
+    format: openai
 ```
 
 Providers needing request signing rather than a static header — AWS Bedrock's

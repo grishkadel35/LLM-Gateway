@@ -33,6 +33,7 @@ providers:
     url: https://api.openai.com
     key: ${TEST_KEY}
     auth: bearer
+    format: openai
 `
 
 // setTestKey sets the TEST_KEY variable that minimalProvider and the other
@@ -54,6 +55,7 @@ providers:
     timeout: 45
     key: ${TEST_ANTHROPIC_KEY}
     auth: x-api-key
+    format: anthropic
     headers:
       anthropic-version: "2023-06-01"
 `)
@@ -129,6 +131,7 @@ providers:
     url: https://api.openai.com
     key: ${TEST_OPENAI_KEY}
     auth: bearer
+    format: openai
 `))
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
@@ -150,6 +153,7 @@ providers:
     url: https://api.openai.com
     key: ${TEST_MISSING_KEY}
     auth: bearer
+    format: openai
 `))
 	if err == nil {
 		t.Fatal("Load() with an unset key env var = nil error, want an error")
@@ -196,7 +200,7 @@ func TestLoadOnRepoConfig(t *testing.T) {
 // key doesn't repeat it: it may be a real secret, and startup errors end up in
 // logs.
 func TestLoadLiteralKeyErrorHidesKey(t *testing.T) {
-	_, err := Load(writeConfig(t, "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-REAL-SECRET\n    auth: bearer\n"))
+	_, err := Load(writeConfig(t, "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-REAL-SECRET\n    auth: bearer\n    format: openai\n"))
 	if err == nil {
 		t.Fatal("Load() with a literal key = nil error, want an error")
 	}
@@ -241,28 +245,30 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"port zero", "port: 0\n" + minimalProvider},
 		{"port too large", "port: 70000\n" + minimalProvider},
 		{"empty host", "host: \"\"\n" + minimalProvider},
-		{"empty provider url", "providers:\n  openai:\n    url: \"\"\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"url without scheme", "providers:\n  openai:\n    url: api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"url with bad scheme", "providers:\n  openai:\n    url: ftp://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"unknown auth style", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: basic\n"},
-		{"missing auth style", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n"},
-		{"negative timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    timeout: -5\n"},
-		{"empty key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: \"\"\n    auth: bearer\n"},
-		{"reserved name health", "providers:\n  health:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"reserved name admin", "providers:\n  admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"reserved name metrics", "providers:\n  metrics:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"reserved name in another case", "providers:\n  Admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"reserved name ready", "providers:\n  ready:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"name containing a slash", "providers:\n  open/ai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"empty provider url", "providers:\n  openai:\n    url: \"\"\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"url without scheme", "providers:\n  openai:\n    url: api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"url with bad scheme", "providers:\n  openai:\n    url: ftp://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"unknown auth style", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: basic\n    format: openai\n"},
+		{"missing format", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"unknown format", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: groq\n"},
+		{"missing auth style", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    format: openai\n"},
+		{"negative timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    timeout: -5\n"},
+		{"empty key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: \"\"\n    auth: bearer\n    format: openai\n"},
+		{"reserved name health", "providers:\n  health:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"reserved name admin", "providers:\n  admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"reserved name metrics", "providers:\n  metrics:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"reserved name in another case", "providers:\n  Admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"reserved name ready", "providers:\n  ready:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"name containing a slash", "providers:\n  open/ai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
 		// A space or brace would change the ServeMux pattern and panic.
-		{"name containing a space", "providers:\n  \"open ai\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"name containing a brace", "providers:\n  \"{openai}\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"empty name", "providers:\n  \"\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
-		{"literal key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-literal\n    auth: bearer\n"},
-		{"key with text around the reference", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}-suffix\n    auth: bearer\n"},
-		{"key as bare $VAR", "providers:\n  openai:\n    url: https://api.openai.com\n    key: $TEST_KEY\n    auth: bearer\n"},
+		{"name containing a space", "providers:\n  \"open ai\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"name containing a brace", "providers:\n  \"{openai}\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"empty name", "providers:\n  \"\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
+		{"literal key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-literal\n    auth: bearer\n    format: openai\n"},
+		{"key with text around the reference", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}-suffix\n    auth: bearer\n    format: openai\n"},
+		{"key as bare $VAR", "providers:\n  openai:\n    url: https://api.openai.com\n    key: $TEST_KEY\n    auth: bearer\n    format: openai\n"},
 		// Unknown keys are typos; ignoring them would apply a default silently.
-		{"misspelled provider field", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    timout: 60\n"},
+		{"misspelled provider field", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    timout: 60\n"},
 		{"misspelled top-level field", "prot: 9090\n" + minimalProvider},
 	}
 
@@ -287,10 +293,12 @@ providers:
     url: https://api.groq.com/openai
     key: ${TEST_GROQ_KEY}
     auth: bearer
+    format: openai
   anthropic:
     url: https://api.anthropic.com
     key: ${TEST_ANT_KEY}
     auth: x-api-key
+    format: anthropic
     headers:
       anthropic-version: "2023-06-01"
 `))
@@ -310,6 +318,14 @@ providers:
 	ant := providers[0]
 	if ant.Name != "anthropic" {
 		t.Fatalf("providers[0].Name = %q, want %q", ant.Name, "anthropic")
+	}
+	if ant.Format != provider.FormatAnthropic {
+		t.Errorf("anthropic Format = %q, want %q", ant.Format, provider.FormatAnthropic)
+	}
+	// Groq speaks the OpenAI format; the format names a wire shape, not a
+	// company.
+	if got := providers[1].Format; got != provider.FormatOpenAI {
+		t.Errorf("groq Format = %q, want %q", got, provider.FormatOpenAI)
 	}
 	if ant.Auth != provider.AuthAPIKey {
 		t.Errorf("anthropic Auth = %q, want %q", ant.Auth, provider.AuthAPIKey)

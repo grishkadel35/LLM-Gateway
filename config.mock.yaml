@@ -16,6 +16,7 @@ providers:
     url: http://127.0.0.1:9090
     key: ${MOCK_API_KEY}
     auth: bearer
+    format: openai
 
   # The /openai base path mirrors Groq's real URL; the mock serves Groq's
   # usage quirk there.
@@ -23,11 +24,13 @@ providers:
     url: http://127.0.0.1:9090/openai
     key: ${MOCK_API_KEY}
     auth: bearer
+    format: openai
 
   anthropic:
     url: http://127.0.0.1:9090
     key: ${MOCK_API_KEY}
     auth: x-api-key
+    format: anthropic
     headers:
       anthropic-version: "2023-06-01"
 
@@ -35,3 +38,4 @@ providers:
     url: http://127.0.0.1:9090
     key: ${MOCK_API_KEY}
     auth: x-goog-api-key
+    format: gemini

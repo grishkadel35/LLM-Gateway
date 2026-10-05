@@ -45,6 +45,34 @@ func (a AuthStyle) Valid() bool {
 	return false
 }
 
+// Format names the wire shape of a provider's API: which request and
+// response bodies it speaks, and so which usage parser reads it. It names a
+// shape, not a company: Groq is FormatOpenAI.
+type Format string
+
+const (
+	// FormatOpenAI is OpenAI's Chat Completions shape, also served by Groq and
+	// most OpenAI-compatible providers.
+	FormatOpenAI Format = "openai"
+	// FormatAnthropic is Anthropic's Messages shape.
+	FormatAnthropic Format = "anthropic"
+	// FormatGemini is Google Gemini's generateContent shape.
+	FormatGemini Format = "gemini"
+)
+
+// Formats lists every supported format, for validation and error messages.
+var Formats = []Format{FormatOpenAI, FormatAnthropic, FormatGemini}
+
+// Valid reports whether f is a format the gateway can meter.
+func (f Format) Valid() bool {
+	for _, known := range Formats {
+		if f == known {
+			return true
+		}
+	}
+	return false
+}
+
 // credentialHeaders is every header the gateway treats as carrying a secret.
 //
 // All of them are removed from an outbound request before the target
@@ -77,6 +105,8 @@ type Provider struct {
 	Key string
 	// Auth is how Key is presented to this provider.
 	Auth AuthStyle
+	// Format is the API shape this provider speaks.
+	Format Format
 	// Headers are static headers this provider requires, such as Anthropic's
 	// "anthropic-version".
 	Headers map[string]string

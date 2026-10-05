@@ -76,8 +76,11 @@ type ProviderConfig struct {
 	// Key is written as an environment reference such as ${OPENAI_API_KEY}.
 	// Load expands it. config.yaml is committed to git, so a literal key must
 	// never be written here.
-	Key     string            `yaml:"key"`
-	Auth    string            `yaml:"auth"`
+	Key  string `yaml:"key"`
+	Auth string `yaml:"auth"`
+	// Format is the provider's API shape (openai, anthropic, gemini). It is
+	// required: it decides how usage is read, and a guess would mis-meter.
+	Format  string            `yaml:"format"`
 	Headers map[string]string `yaml:"headers"`
 }
 
@@ -235,6 +238,10 @@ func (pc ProviderConfig) validate(name string) error {
 		return fmt.Errorf("provider %q: auth must be one of %v, got %q", name, provider.AuthStyles, pc.Auth)
 	}
 
+	if !provider.Format(pc.Format).Valid() {
+		return fmt.Errorf("provider %q: format must be one of %v, got %q (Groq and other OpenAI-compatible APIs are openai)", name, provider.Formats, pc.Format)
+	}
+
 	if pc.TimeoutSeconds <= 0 {
 		return fmt.Errorf("provider %q: timeout must be greater than 0, got %d", name, pc.TimeoutSeconds)
 	}
@@ -276,6 +283,7 @@ func (c *Config) BuildProviders() ([]provider.Provider, error) {
 			Timeout: pc.Timeout(),
 			Key:     pc.Key,
 			Auth:    provider.AuthStyle(pc.Auth),
+			Format:  provider.Format(pc.Format),
 			Headers: pc.Headers,
 		})
 	}
