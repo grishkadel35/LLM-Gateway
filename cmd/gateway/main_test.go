@@ -701,3 +701,25 @@ func TestOpenAIFormatUsageThroughMock(t *testing.T) {
 		}
 	}
 }
+
+func TestAnthropicUsageThroughMock(t *testing.T) {
+	want := usage.Usage{
+		Model:       "claude-sonnet-4",
+		Input:       mockprovider.PromptTokens - mockprovider.CachedPromptTokens,
+		CachedInput: mockprovider.CachedPromptTokens,
+		Output:      mockprovider.OutputTokens,
+	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			got := meterThroughMock(t, "/anthropic/v1/messages",
+				fmt.Sprintf(`{"model":"claude-sonnet-4","max_tokens":64,"stream":%v,"messages":[{"role":"user","content":"hi"}]}`, stream))
+
+			if got.result.Usage != want {
+				t.Errorf("usage = %+v, want %+v", got.result.Usage, want)
+			}
+			if got.result.Streamed != stream || !got.result.Complete {
+				t.Errorf("result = %+v, want streamed %v, complete", got.result, stream)
+			}
+		})
+	}
+}

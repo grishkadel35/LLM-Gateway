@@ -44,6 +44,8 @@ func newParser(format provider.Format) parser {
 	switch format {
 	case provider.FormatOpenAI:
 		return &openAIParser{}
+	case provider.FormatAnthropic:
+		return &anthropicParser{}
 	}
 	return nil
 }
@@ -88,3 +90,91 @@ func (p *openAIParser) event(data []byte) {
 func (p *openAIParser) body(b []byte) { p.event(b) }
 
 func (p *openAIParser) usage() Usage { return p.u }
+
+// anthropicParser reads Anthropic's Messages shape. input_tokens already
+// excludes cache reads and writes, so it is Input as is.
+//
+// Streams carry input usage in message_start, whose output_tokens is only a
+// placeholder, and the final, cumulative usage in message_delta. The delta's
+// fields win when present; a stream cut before it reports no output.
+type anthropicParser struct {
+	u Usage
+}
+
+// anthropicUsage uses pointers to tell a field that is absent from one that
+// is zero: message_delta restates only some fields.
+type anthropicUsage struct {
+	InputTokens              *int64 `json:"input_tokens"`
+	CacheReadInputTokens     *int64 `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens *int64 `json:"cache_creation_input_tokens"`
+	CacheCreation            *struct {
+		Ephemeral5m int64 `json:"ephemeral_5m_input_tokens"`
+		Ephemeral1h int64 `json:"ephemeral_1h_input_tokens"`
+	} `json:"cache_creation"`
+	OutputTokens *int64 `json:"output_tokens"`
+}
+
+func (p *anthropicParser) event(data []byte) {
+	var e struct {
+		Type    string `json:"type"`
+		Message struct {
+			Model string          `json:"model"`
+			Usage *anthropicUsage `json:"usage"`
+		} `json:"message"`
+		Usage *anthropicUsage `json:"usage"`
+	}
+	if json.Unmarshal(data, &e) != nil {
+		return
+	}
+	switch e.Type {
+	case "message_start":
+		if e.Message.Model != "" {
+			p.u.Model = e.Message.Model
+		}
+		p.apply(e.Message.Usage, false)
+	case "message_delta":
+		p.apply(e.Usage, true)
+	}
+}
+
+func (p *anthropicParser) body(b []byte) {
+	var m struct {
+		Model string          `json:"model"`
+		Usage *anthropicUsage `json:"usage"`
+	}
+	if json.Unmarshal(b, &m) != nil {
+		return
+	}
+	p.u.Model = m.Model
+	p.apply(m.Usage, true)
+}
+
+// apply copies the fields u states. withOutput is false for message_start,
+// whose output count is a placeholder.
+func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
+	if u == nil {
+		return
+	}
+	if u.InputTokens != nil {
+		p.u.Input = *u.InputTokens
+	}
+	if u.CacheReadInputTokens != nil {
+		p.u.CachedInput = *u.CacheReadInputTokens
+	}
+	switch {
+	case u.CacheCreation != nil:
+		p.u.CacheWrite5m = u.CacheCreation.Ephemeral5m
+		p.u.CacheWrite1h = u.CacheCreation.Ephemeral1h
+	case u.CacheCreationInputTokens != nil && *u.CacheCreationInputTokens != p.u.CacheWrite5m+p.u.CacheWrite1h:
+		// A total with no TTL breakdown: all writes are the default 5-minute
+		// TTL. A total that matches what is already known keeps the
+		// breakdown message_start gave.
+		p.u.CacheWrite5m = *u.CacheCreationInputTokens
+		p.u.CacheWrite1h = 0
+	}
+	if withOutput && u.OutputTokens != nil {
+		p.u.Output = *u.OutputTokens
+	}
+}
+
+func (p *anthropicParser) usage() Usage { return p.u }

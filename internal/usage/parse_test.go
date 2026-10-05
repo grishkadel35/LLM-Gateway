@@ -90,3 +90,88 @@ func TestOpenAINoUsage(t *testing.T) {
 		}
 	}
 }
+
+// Anthropic's input_tokens already excludes cache reads and writes, so it
+// maps to Input unchanged. Cache writes are split by TTL, which pricing needs:
+// the two TTLs cost different amounts.
+func TestAnthropicBody(t *testing.T) {
+	got := parseBody(t, provider.FormatAnthropic, `{
+		"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-20250514",
+		"content":[{"type":"text","text":"hi"}],
+		"usage":{"input_tokens":15,"cache_read_input_tokens":5,"cache_creation_input_tokens":5,
+		         "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2},
+		         "output_tokens":10}}`)
+
+	want := Usage{Model: "claude-sonnet-4-20250514", Input: 15, CachedInput: 5, CacheWrite5m: 3, CacheWrite1h: 2, Output: 10}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+// Without the TTL breakdown, cache writes are the default 5-minute TTL.
+func TestAnthropicCacheWritesWithoutBreakdown(t *testing.T) {
+	got := parseBody(t, provider.FormatAnthropic,
+		`{"type":"message","model":"claude-x","usage":{"input_tokens":15,"cache_creation_input_tokens":4,"output_tokens":10}}`)
+
+	if got.CacheWrite5m != 4 || got.CacheWrite1h != 0 {
+		t.Errorf("cache writes = %d (5m), %d (1h); want 4, 0", got.CacheWrite5m, got.CacheWrite1h)
+	}
+}
+
+const anthropicStart = `{"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4","content":[],
+	"usage":{"input_tokens":15,"cache_read_input_tokens":5,"cache_creation_input_tokens":5,
+	         "cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2},"output_tokens":1}}}`
+
+// Streams put input usage in message_start, where output_tokens is only a
+// placeholder, and the real output count in the final message_delta.
+func TestAnthropicStream(t *testing.T) {
+	got := parseEvents(t, provider.FormatAnthropic,
+		anthropicStart,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		`{"type":"content_block_stop","index":0}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}`,
+		`{"type":"message_stop"}`,
+	)
+
+	want := Usage{Model: "claude-sonnet-4", Input: 15, CachedInput: 5, CacheWrite5m: 3, CacheWrite1h: 2, Output: 10}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+// A stream cut before message_delta has its input usage but no real output
+// count; message_start's placeholder is not reported as output.
+func TestAnthropicStreamCutAfterStart(t *testing.T) {
+	got := parseEvents(t, provider.FormatAnthropic, anthropicStart)
+
+	if got.Input != 15 || got.CachedInput != 5 || got.Output != 0 {
+		t.Errorf("usage = %+v, want input 15, cached 5, output 0", got)
+	}
+}
+
+// message_delta's usage is cumulative and may restate input counts; when it
+// does, its numbers win.
+func TestAnthropicDeltaRestatesInput(t *testing.T) {
+	got := parseEvents(t, provider.FormatAnthropic,
+		anthropicStart,
+		`{"type":"message_delta","delta":{},"usage":{"input_tokens":18,"cache_read_input_tokens":5,"output_tokens":10}}`,
+	)
+
+	if got.Input != 18 || got.CachedInput != 5 || got.CacheWrite5m != 3 || got.Output != 10 {
+		t.Errorf("usage = %+v, want input 18, cached 5, cache write 3 (unrestated), output 10", got)
+	}
+}
+
+// A delta that restates the cache-write total without its TTL breakdown must
+// not erase the breakdown message_start gave: 1-hour writes cost more.
+func TestAnthropicDeltaKeepsCacheWriteBreakdown(t *testing.T) {
+	got := parseEvents(t, provider.FormatAnthropic,
+		anthropicStart,
+		`{"type":"message_delta","delta":{},"usage":{"cache_creation_input_tokens":5,"output_tokens":10}}`,
+	)
+
+	if got.CacheWrite5m != 3 || got.CacheWrite1h != 2 {
+		t.Errorf("cache writes = %d (5m), %d (1h); want the breakdown 3, 2 kept", got.CacheWrite5m, got.CacheWrite1h)
+	}
+}
