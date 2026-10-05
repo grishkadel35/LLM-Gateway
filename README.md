@@ -17,11 +17,11 @@ provider is a block of YAML, not code.
 ## Project status
 
 **Last updated:** 2026-10-05
-**Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
-routing. Week 2 in progress: the mock provider, the dev stack (Postgres,
-migrations, CI), tenant keys, request IDs and the admin API are done, and the
-gateway now authenticates every provider request against Postgres. Usage
-metering is next.
+**Stage:** Weeks 1 and 2 of 8 complete, checkpoints closed. Every provider
+request is authenticated with a tenant key, and every request that reaches a
+provider, streamed or not, is recorded in Postgres with its tokens and cost,
+verified live against Groq and Gemini. Week 3 (token-aware rate limiting) is
+next.
 
 ### What changed
 
@@ -159,7 +159,7 @@ OpenAI and Anthropic have not been tried with live keys. OpenAI uses the same
 `bearer` path that Groq exercised; Anthropic's `x-api-key` style is covered by
 tests only.
 
-### In progress: Week 2 — API keys and per-tenant tracking
+### Week 2 deliverables — API keys and per-tenant tracking ✅
 
 Goal: every request is authenticated, and its token usage and dollar cost are
 logged — including streamed responses.
@@ -173,14 +173,13 @@ logged — including streamed responses.
 - [x] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header, rejects revoked keys, and attaches the tenant to the
   request context
-- [x] Request IDs — an `X-Request-ID` per request, returned to the client and
-  logged (stored with its usage row, next to the provider's own ID, once usage
-  logging lands)
+- [x] Request IDs — an `X-Request-ID` per request, returned to the client,
+  logged, and stored with its usage row next to the provider's own ID
 - [x] A `format` field per provider (`openai`, `anthropic`, `gemini`)
 - [x] A usage parser for each format (OpenAI/Groq, Anthropic, Gemini)
-- [ ] `internal/usage` — reads token counts from the response as it streams past,
+- [x] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
-- [ ] `internal/pricing` — per-model prices in integer micro-dollars
+- [x] `internal/pricing` — per-model prices in integer micro-dollars
 - [x] Admin routes behind a separate admin key: `POST /admin/tenants`,
   issuing and revoking keys, `GET /admin/tenants/{id}/usage`
 

@@ -21,6 +21,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
+	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -837,9 +838,11 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 		endpoint != "/v1beta/models/gemini-3.8-flash:streamGenerateContent" || status != 200 || !streamed {
 		t.Errorf("row = %s %d %s %s %s %d streamed=%v", tenantID, keyID, provider, model, endpoint, status, streamed)
 	}
-	// 15 + 5 cached + 17 out at $0.75 / $0.075 / $3.75: 75.375 → 75.
-	if input != 15 || cached != 5 || output != 17 || !cost.Valid || cost.Int64 != 75 {
-		t.Errorf("tokens %d/%d/%d, cost %v; want 15/5/17 and 75", input, cached, output, cost)
+	// The price in force today: Gemini 3.8 Flash's changes on 1 January
+	// 2027, and pricing's own tests pin both values.
+	wantCost, _ := pricing.Cost("gemini", usage.Usage{Model: "gemini-3.8-flash", Input: 15, CachedInput: 5, Output: 17}, "", time.Now())
+	if input != 15 || cached != 5 || output != 17 || !cost.Valid || cost.Int64 != wantCost {
+		t.Errorf("tokens %d/%d/%d, cost %v; want 15/5/17 and %d", input, cached, output, cost, wantCost)
 	}
 
 	if err := conn.QueryRow(`SELECT cost_micros FROM usage_logs WHERE request_id = $1`, groqID).Scan(&cost); err != nil {
@@ -863,7 +866,109 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
 		t.Fatal(err)
 	}
-	if report.Total.Requests != 2 || report.Total.CostMicros != 75 || report.Total.UnpricedRequests != 1 {
-		t.Errorf("report total = %+v, want 2 requests, 75 micro-$, 1 unpriced", report.Total)
+	if report.Total.Requests != 2 || report.Total.CostMicros != wantCost || report.Total.UnpricedRequests != 1 {
+		t.Errorf("report total = %+v, want 2 requests, %d micro-$, 1 unpriced", report.Total, wantCost)
+	}
+}
+
+// TestEveryFormatLandsAPricedRow is the roadmap's Week 2 test matrix: every
+// format, streamed or not, through the gateway to the mock, against
+// Postgres, leaves one usage_logs row with the mock's tokens, the cost at
+// today's price, and the X-Request-ID the client received.
+func TestEveryFormatLandsAPricedRow(t *testing.T) {
+	in, cached := int64(mockprovider.PromptTokens-mockprovider.CachedPromptTokens), int64(mockprovider.CachedPromptTokens)
+	out := int64(mockprovider.OutputTokens)
+
+	cases := []struct {
+		name, provider, model, path, body string
+		streamed                          bool
+		output                            int64
+	}{
+		{"openai", "openai", "gpt-4o", "/openai/v1/chat/completions", `{"model":"gpt-4o","messages":[]}`, false, out},
+		{"openai stream", "openai", "gpt-4o", "/openai/v1/chat/completions", `{"model":"gpt-4o","stream":true,"messages":[]}`, true, out},
+		{"groq", "groq", "openai/gpt-oss-120b", "/groq/v1/chat/completions", `{"model":"openai/gpt-oss-120b","messages":[]}`, false, out},
+		{"groq stream", "groq", "openai/gpt-oss-120b", "/groq/v1/chat/completions", `{"model":"openai/gpt-oss-120b","stream":true,"messages":[]}`, true, out},
+		{"anthropic", "anthropic", "claude-sonnet-4", "/anthropic/v1/messages", `{"model":"claude-sonnet-4","max_tokens":64,"messages":[]}`, false, out},
+		{"anthropic stream", "anthropic", "claude-sonnet-4", "/anthropic/v1/messages", `{"model":"claude-sonnet-4","max_tokens":64,"stream":true,"messages":[]}`, true, out},
+		// Gemini's output includes its thinking tokens.
+		{"gemini", "gemini", "gemini-3.8-flash", "/gemini/v1beta/models/gemini-3.8-flash:generateContent", `{}`, false, out + mockprovider.ThoughtsTokens},
+		{"gemini sse", "gemini", "gemini-3.8-flash", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", `{}`, true, out + mockprovider.ThoughtsTokens},
+		{"gemini json stream", "gemini", "gemini-3.8-flash", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent", `{}`, true, out + mockprovider.ThoughtsTokens},
+	}
+
+	conn := dbtest.New(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
+	tn, key, err := store.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	writer := usage.NewWriter(conn, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, logger), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := make([]string, len(cases))
+	for i, tc := range cases {
+		req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+key.Plaintext)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d; body %s", tc.name, rec.Code, rec.Body)
+		}
+		ids[i] = rec.Header().Get("X-Request-ID")
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := conn.QueryRow(`SELECT count(*) FROM usage_logs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != len(cases) {
+		t.Errorf("usage_logs has %d rows, want one per request (%d)", n, len(cases))
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				tenantID, provider, model string
+				keyID                     int64
+				gotIn, gotCached, gotOut  int64
+				cost                      sql.NullInt64
+				streamed                  bool
+			)
+			err := conn.QueryRow(`
+				SELECT tenant_id, api_key_id, provider, model, input_tokens, cached_input_tokens,
+				       output_tokens, cost_micros, streamed
+				FROM usage_logs WHERE request_id = $1`, ids[i],
+			).Scan(&tenantID, &keyID, &provider, &model, &gotIn, &gotCached, &gotOut, &cost, &streamed)
+			if err != nil {
+				t.Fatalf("no row for the X-Request-ID the client got (%s): %v", ids[i], err)
+			}
+
+			if tenantID != tn.ID || keyID != key.ID || provider != tc.provider || model != tc.model || streamed != tc.streamed {
+				t.Errorf("row = %s key %d %s/%s streamed=%v; want %s key %d %s/%s streamed=%v",
+					tenantID, keyID, provider, model, streamed, tn.ID, key.ID, tc.provider, tc.model, tc.streamed)
+			}
+			if gotIn != in || gotCached != cached || gotOut != tc.output {
+				t.Errorf("tokens = %d/%d/%d, want %d/%d/%d", gotIn, gotCached, gotOut, in, cached, tc.output)
+			}
+
+			wantCost, ok := pricing.Cost(tc.provider, usage.Usage{Model: tc.model, Input: in, CachedInput: cached, Output: tc.output}, "", time.Now())
+			if !ok || wantCost <= 0 {
+				t.Fatalf("%s/%s should be priced", tc.provider, tc.model)
+			}
+			if !cost.Valid || cost.Int64 != wantCost {
+				t.Errorf("cost = %v, want %d", cost, wantCost)
+			}
+		})
 	}
 }
