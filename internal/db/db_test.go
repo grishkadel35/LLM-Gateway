@@ -2,66 +2,11 @@ package db
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
-	"net/url"
-	"os"
 	"testing"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 )
-
-// testDB returns a connection to a fresh, empty database that is dropped when
-// the test ends. Migrations run down as well as up here, so they must never
-// touch the database DATABASE_URL names, which may hold real dev data.
-//
-// Tests that need Postgres skip when DATABASE_URL is unset, so a plain
-// `go test ./...` still works without a database.
-func testDB(t *testing.T) *sql.DB {
-	t.Helper()
-
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DATABASE_URL not set; skipping Postgres tests")
-	}
-
-	admin, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { admin.Close() })
-
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	name := "gateway_test_" + hex.EncodeToString(b)
-
-	// Identifiers can't be query parameters; name is generated above, so
-	// splicing it in is safe.
-	if _, err := admin.Exec("CREATE DATABASE " + name); err != nil {
-		t.Fatalf("creating test database: %v", err)
-	}
-	t.Cleanup(func() {
-		if _, err := admin.Exec("DROP DATABASE " + name + " WITH (FORCE)"); err != nil {
-			t.Errorf("dropping test database: %v", err)
-		}
-	})
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	u.Path = "/" + name
-
-	conn, err := sql.Open("pgx", u.String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Registered after the DROP cleanup, so it runs first: cleanups run in
-	// reverse order.
-	t.Cleanup(func() { conn.Close() })
-	return conn
-}
 
 func tableExists(t *testing.T, conn *sql.DB, table string) bool {
 	t.Helper()
@@ -108,7 +53,7 @@ func columns(t *testing.T, conn *sql.DB, table string) map[string]bool {
 // a broken Down usually goes unnoticed until the day it's needed.
 func TestMigrateUpDownUp(t *testing.T) {
 	ctx := context.Background()
-	conn := testDB(t)
+	conn := dbtest.New(t)
 
 	applied, err := Migrate(ctx, conn)
 	if err != nil {

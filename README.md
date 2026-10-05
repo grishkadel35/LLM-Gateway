@@ -18,11 +18,16 @@ provider is a block of YAML, not code.
 
 **Last updated:** 2026-10-04
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
-routing. Week 2 in progress: the mock provider and the dev stack (Postgres,
-migrations, CI) are done. The gateway itself doesn't use the database yet.
+routing. Week 2 in progress: the mock provider, the dev stack (Postgres,
+migrations, CI) and tenant key management are done. The gateway itself
+doesn't use the database yet.
 
 ### What changed
 
+- **Tenant keys.** `internal/tenant` creates tenants and issues, revokes and
+  looks up their `gw_` keys. Only a SHA-256 hash of each key is stored; the
+  plaintext is returned once, at issue. Nothing calls it yet: the auth
+  middleware is next.
 - **Schema reworked before any code uses it.** API keys moved out of `tenants`
   into their own `api_keys` table, so a tenant can hold several keys and rotate
   or revoke one without downtime. `usage_logs` gained `request_id`,
@@ -89,7 +94,7 @@ logged — including streamed responses.
   and non-streaming, so nothing below costs money to test
 - [x] Postgres (via docker-compose) with `goose` migrations: `tenants`,
   `api_keys` and `usage_logs` tables; CI running `go vet` and `go test -race`
-- [ ] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
+- [x] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
   indexed lookup; several per tenant, so keys rotate without downtime
 - [ ] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header, rejects revoked keys, and attaches the tenant to the
@@ -318,6 +323,8 @@ internal/health/          GET /health
 internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
 cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 internal/db/              Postgres schema: embedded goose migrations
+internal/db/dbtest/       throwaway Postgres database for tests
+internal/tenant/          tenants and API keys: issue, revoke, look up
 cmd/migrate/main.go       applies migrations to DATABASE_URL
 deployments/              docker compose dev stack (Postgres)
 .github/workflows/ci.yml  vet + race-enabled tests against Postgres
