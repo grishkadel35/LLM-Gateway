@@ -35,13 +35,18 @@ func gemini(w http.ResponseWriter, r *http.Request) {
 		if finished {
 			candidate["finishReason"] = "STOP"
 		}
+		// Thinking finishes before the reply starts, so thoughtsTokenCount is
+		// already final on the first chunk. It is not part of
+		// candidatesTokenCount, but totalTokenCount includes it, as it does in
+		// the real API (verified live 2026-10-04).
 		return object{
 			"candidates": []object{candidate},
 			"usageMetadata": object{
 				"promptTokenCount":        PromptTokens,
 				"cachedContentTokenCount": CachedPromptTokens,
 				"candidatesTokenCount":    outputSoFar,
-				"totalTokenCount":         PromptTokens + outputSoFar,
+				"thoughtsTokenCount":      ThoughtsTokens,
+				"totalTokenCount":         PromptTokens + outputSoFar + ThoughtsTokens,
 			},
 			"modelVersion": model,
 			"responseId":   "mock",

@@ -28,12 +28,17 @@ const Reply = "This is a deterministic reply from the llm-gateway mock provider.
 //     input_tokens is PromptTokens - CachedPromptTokens.
 //
 // Either way, a correct parser arrives at the same totals for all three.
+//
+// Gemini also reports thinking separately: ThoughtsTokens in
+// thoughtsTokenCount, outside candidatesTokenCount, though it is billed as
+// output. Its output total is therefore OutputTokens + ThoughtsTokens.
 const (
 	PromptTokens       = 20
 	CachedPromptTokens = 5
 	// OutputTokens is one token per word of Reply; streams send one word per
 	// chunk.
-	OutputTokens = 10
+	OutputTokens   = 10
+	ThoughtsTokens = 7
 )
 
 // Handler serves all three providers' APIs from one server. Their paths don't

@@ -338,6 +338,8 @@ type geminiChunk struct {
 		PromptTokenCount        int `json:"promptTokenCount"`
 		CachedContentTokenCount int `json:"cachedContentTokenCount"`
 		CandidatesTokenCount    int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+		TotalTokenCount         int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 	ModelVersion string `json:"modelVersion"`
 }
@@ -371,8 +373,13 @@ func checkGeminiChunks(t *testing.T, chunks []geminiChunk) {
 		t.Errorf("last finishReason = %q, want STOP", last.Candidates[0].FinishReason)
 	}
 	u := last.UsageMetadata
-	if u.PromptTokenCount != PromptTokens || u.CachedContentTokenCount != CachedPromptTokens || u.CandidatesTokenCount != OutputTokens {
-		t.Errorf("final usage = %+v, want prompt %d, cached %d, candidates %d", u, PromptTokens, CachedPromptTokens, OutputTokens)
+	if u.PromptTokenCount != PromptTokens || u.CachedContentTokenCount != CachedPromptTokens || u.CandidatesTokenCount != OutputTokens || u.ThoughtsTokenCount != ThoughtsTokens {
+		t.Errorf("final usage = %+v, want prompt %d, cached %d, candidates %d, thoughts %d", u, PromptTokens, CachedPromptTokens, OutputTokens, ThoughtsTokens)
+	}
+	// Thinking is billed but sits outside candidatesTokenCount; only the total
+	// shows it. A parser reading candidates alone undercounts output.
+	if want := PromptTokens + OutputTokens + ThoughtsTokens; u.TotalTokenCount != want {
+		t.Errorf("totalTokenCount = %d, want %d (prompt + candidates + thoughts)", u.TotalTokenCount, want)
 	}
 }
 

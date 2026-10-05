@@ -16,16 +16,24 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-02
+**Last updated:** 2026-10-04
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
 routing. Week 2 in progress: the mock provider and the dev stack (Postgres,
 migrations, CI) are done. The gateway itself doesn't use the database yet.
 
 ### What changed
 
+- **Schema reworked before any code uses it.** API keys moved out of `tenants`
+  into their own `api_keys` table, so a tenant can hold several keys and rotate
+  or revoke one without downtime. `usage_logs` gained `request_id`,
+  `provider_request_id`, `api_key_id` and `cache_write_tokens` (Anthropic
+  cache writes cost more than plain input).
+- **Gemini thinking tokens.** A live check showed Gemini reports thinking in
+  `thoughtsTokenCount`, outside `candidatesTokenCount`, though it is billed as
+  output; the mock now reproduces it (see [Without API keys](#without-api-keys)).
 - **Dev stack.** Postgres 18 runs locally via docker compose (`make db-up`),
-  and `make migrate` applies embedded goose migrations creating `tenants` and
-  `usage_logs`. CI runs `go vet` and `go test -race` against a Postgres service
+  and `make migrate` applies embedded goose migrations creating `tenants`,
+  `api_keys` and `usage_logs`. CI runs `go vet` and `go test -race` against a Postgres service
   container on every push. See [Database](#database).
 - **Mock provider covers Groq.** A live check showed Groq reports streaming
   usage differently from OpenAI despite the shared format (see
@@ -79,19 +87,22 @@ logged — including streamed responses.
 
 - [x] `cmd/mockprovider` — fake OpenAI, Anthropic and Gemini upstreams, streaming
   and non-streaming, so nothing below costs money to test
-- [x] Postgres (via docker-compose) with `goose` migrations: `tenants` and
-  `usage_logs` tables; CI running `go vet` and `go test -race`
+- [x] Postgres (via docker-compose) with `goose` migrations: `tenants`,
+  `api_keys` and `usage_logs` tables; CI running `go vet` and `go test -race`
 - [ ] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
-  indexed lookup
+  indexed lookup; several per tenant, so keys rotate without downtime
 - [ ] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
-  native credential header and attaches the tenant to the request context
+  native credential header, rejects revoked keys, and attaches the tenant to the
+  request context
+- [ ] Request IDs — an `X-Request-ID` per request, returned to the client and
+  stored with its usage row alongside the provider's own request ID
 - [ ] A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
   usage parser for each
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars
 - [ ] Admin routes behind a separate admin key: `POST /admin/tenants`,
-  `GET /admin/tenants/{id}/usage`
+  issuing and revoking keys, `GET /admin/tenants/{id}/usage`
 
 This is the first week the gateway stops being dependency-free: it adds
 Postgres and the `pgx` driver. Auth middleware runs *before* the proxy, so a
@@ -165,7 +176,9 @@ details a usage parser has to get right:
   excludes cache reads (it reports 15, plus 5 in `cache_read_input_tokens`).
 - **Gemini** sends `usageMetadata` on every chunk as a running total, not a
   delta. It streams as SSE with `?alt=sse` (what the SDKs use) and as one JSON
-  array without it.
+  array without it. Thinking is reported in `thoughtsTokenCount` (7), outside
+  `candidatesTokenCount` but billed as output, so Gemini's output total is
+  10 + 7 = 17. A parser that reads only `candidatesTokenCount` undercounts.
 
 It also checks each provider's credential header is present (and Anthropic's
 `anthropic-version`), so a provider configured with the wrong `auth` style

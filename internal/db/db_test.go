@@ -118,15 +118,21 @@ func TestMigrateUpDownUp(t *testing.T) {
 		t.Fatal("no migrations applied to an empty database")
 	}
 
-	for _, table := range []string{"tenants", "usage_logs"} {
+	for _, table := range []string{"tenants", "api_keys", "usage_logs"} {
 		if !tableExists(t, conn, table) {
 			t.Fatalf("table %s missing after migrating up", table)
 		}
 	}
 	cols := columns(t, conn, "usage_logs")
-	for _, c := range []string{"tenant_id", "provider", "model", "endpoint", "status", "cost_micros"} {
+	for _, c := range []string{"request_id", "tenant_id", "api_key_id", "provider", "model", "endpoint", "status", "cache_write_tokens", "cost_micros"} {
 		if !cols[c] {
 			t.Errorf("usage_logs has no %s column", c)
+		}
+	}
+	cols = columns(t, conn, "api_keys")
+	for _, c := range []string{"tenant_id", "key_hash", "key_prefix", "revoked_at"} {
+		if !cols[c] {
+			t.Errorf("api_keys has no %s column", c)
 		}
 	}
 
@@ -145,7 +151,7 @@ func TestMigrateUpDownUp(t *testing.T) {
 	if _, err := p.DownTo(ctx, 0); err != nil {
 		t.Fatalf("migrating down: %v", err)
 	}
-	for _, table := range []string{"tenants", "usage_logs"} {
+	for _, table := range []string{"tenants", "api_keys", "usage_logs"} {
 		if tableExists(t, conn, table) {
 			t.Errorf("table %s still exists after migrating down", table)
 		}
