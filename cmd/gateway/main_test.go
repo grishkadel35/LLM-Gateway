@@ -12,12 +12,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
+	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // testTenantKey is the one gateway key fakeStore accepts; testAdminKey is the
@@ -137,7 +140,7 @@ providers:
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
 
-	r, err := router(cfg, store, testAdminKey, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, store, testAdminKey, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -577,5 +580,124 @@ func TestOversizedBodyIsRefused(t *testing.T) {
 	}
 	if ups["openai"].path != "" {
 		t.Error("oversized request reached the provider")
+	}
+}
+
+// meteredCall is one usage callback the gateway made.
+type meteredCall struct {
+	provider string
+	result   usage.Result
+}
+
+// newMockRouter builds the gateway in front of the real mock provider, with
+// every format configured, and records each usage callback.
+func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
+	t.Helper()
+
+	mock := httptest.NewServer(mockprovider.Handler())
+	t.Cleanup(mock.Close)
+	t.Setenv("TEST_MOCK_KEY", "mock")
+
+	yaml := fmt.Sprintf(`
+providers:
+  openai:
+    url: %[1]s
+    key: ${TEST_MOCK_KEY}
+    auth: bearer
+    format: openai
+  groq:
+    url: %[1]s/openai
+    key: ${TEST_MOCK_KEY}
+    auth: bearer
+    format: openai
+  anthropic:
+    url: %[1]s
+    key: ${TEST_MOCK_KEY}
+    auth: x-api-key
+    format: anthropic
+    headers:
+      anthropic-version: "2023-06-01"
+  gemini:
+    url: %[1]s
+    key: ${TEST_MOCK_KEY}
+    auth: x-goog-api-key
+    format: gemini
+`, mock.URL)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load() returned error: %v", err)
+	}
+
+	var mu sync.Mutex
+	var calls []meteredCall
+	onUsage := func(_ context.Context, provider string, r usage.Result) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, meteredCall{provider, r})
+	}
+
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	return r, func() []meteredCall {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]meteredCall(nil), calls...)
+	}
+}
+
+// meterThroughMock sends one request through the gateway to the mock and
+// returns the single usage callback it produced.
+func meterThroughMock(t *testing.T, path, body string) meteredCall {
+	t.Helper()
+
+	r, calls := newMockRouter(t)
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testTenantKey)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	got := calls()
+	if len(got) != 1 {
+		t.Fatalf("usage callback ran %d times, want once", len(got))
+	}
+	return got[0]
+}
+
+// TestOpenAIFormatUsageThroughMock: OpenAI and Groq, streamed or not, report
+// the mock's exact numbers, in the gateway's convention (input excludes the
+// cached tokens).
+func TestOpenAIFormatUsageThroughMock(t *testing.T) {
+	want := usage.Usage{
+		Model:       "gpt-4o",
+		Input:       mockprovider.PromptTokens - mockprovider.CachedPromptTokens,
+		CachedInput: mockprovider.CachedPromptTokens,
+		Output:      mockprovider.OutputTokens,
+	}
+	for _, name := range []string{"openai", "groq"} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s stream=%v", name, stream), func(t *testing.T) {
+				got := meterThroughMock(t, "/"+name+"/v1/chat/completions",
+					fmt.Sprintf(`{"model":"gpt-4o","stream":%v,"messages":[{"role":"user","content":"hi"}]}`, stream))
+
+				if got.provider != name {
+					t.Errorf("provider = %q, want %q", got.provider, name)
+				}
+				if got.result.Usage != want {
+					t.Errorf("usage = %+v, want %+v", got.result.Usage, want)
+				}
+				if got.result.Streamed != stream || !got.result.Complete || got.result.Status != http.StatusOK {
+					t.Errorf("result = %+v, want streamed %v, complete, status 200", got.result, stream)
+				}
+			})
+		}
 	}
 }

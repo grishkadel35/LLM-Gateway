@@ -14,16 +14,19 @@ import (
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // New returns a reverse proxy that forwards everything it receives to p.
+// onUsage, if not nil, receives each response's token usage once its body has
+// been read (see usage.Meter).
 //
 // It takes no error return: p.URL is already parsed and validated by the config
 // package, which is the only thing that constructs a provider.Provider.
-func New(p provider.Provider, logger *slog.Logger) *httputil.ReverseProxy {
+func New(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite:        rewrite(p),
-		ModifyResponse: modifyResponse(p, logger),
+		ModifyResponse: modifyResponse(p, logger, onUsage),
 		ErrorHandler:   errorHandler(p, logger),
 		Transport:      transport(p.Timeout),
 	}
@@ -78,13 +81,13 @@ func rewrite(p provider.Provider) func(*httputil.ProxyRequest) {
 // modifyResponse runs after the upstream responds and before we copy the
 // response back to the client.
 //
-// This is the hook where rate limiting, response caching, and token/usage
-// accounting will plug in later. For now it just logs.
+// It logs the response and wraps its body so usage is read as the bytes pass
+// through to the client. Response caching will plug in here too.
 //
 // Go note: returning a non-nil error here makes ReverseProxy call ErrorHandler
 // instead of forwarding the response — that's how you'd reject or rewrite an
 // upstream response later on.
-func modifyResponse(p provider.Provider, logger *slog.Logger) func(*http.Response) error {
+func modifyResponse(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) func(*http.Response) error {
 	return func(resp *http.Response) error {
 		logger.Info("upstream response",
 			"provider", p.Name,
@@ -96,6 +99,9 @@ func modifyResponse(p provider.Provider, logger *slog.Logger) func(*http.Respons
 			"content_type", resp.Header.Get("Content-Type"),
 			"streaming", isEventStream(resp),
 		)
+		if onUsage != nil {
+			usage.Meter(resp, p.Format, onUsage)
+		}
 		return nil
 	}
 }

@@ -55,6 +55,10 @@ func main() {
 	}
 }
 
+// usageFunc receives each provider response's usage, with the name of the
+// provider that served it.
+type usageFunc func(ctx context.Context, provider string, r usage.Result)
+
 // tenantStore is what the routes need from tenant storage: key lookup for
 // tenant auth, and tenant and key management for the admin API.
 // *tenant.Store satisfies it; routing tests substitute a fake.
@@ -70,7 +74,7 @@ type tenantStore interface {
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -100,7 +104,12 @@ func router(cfg *config.Config, store tenantStore, adminKey string, logger *slog
 		// RequireMetered then refuses endpoints the gateway can't read usage
 		// from, and ReadBody takes ownership of the body. Both run after
 		// StripPrefix, so they see the provider-relative path.
-		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(proxy.New(p, logger))
+		var meter usage.Callback
+		if onUsage != nil {
+			name := p.Name
+			meter = func(ctx context.Context, r usage.Result) { onUsage(ctx, name, r) }
+		}
+		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(proxy.New(p, logger, meter))
 		metered := usage.RequireMetered(p.Format)(body)
 		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, metered)))
 	}
@@ -150,7 +159,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
-	handler, err := router(cfg, tenant.NewStore(conn), adminKey, logger)
+	handler, err := router(cfg, tenant.NewStore(conn), adminKey, logUsage(logger), logger)
 	if err != nil {
 		return err
 	}
@@ -263,4 +272,32 @@ func openDB(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("connecting to the database: %w", err)
 	}
 	return conn, nil
+}
+
+// logUsage returns a usageFunc that writes one "usage" log line per provider
+// response. It stands in until usage rows are written to Postgres.
+func logUsage(logger *slog.Logger) usageFunc {
+	return func(ctx context.Context, provider string, r usage.Result) {
+		t, key, _ := middleware.TenantFrom(ctx)
+		model := r.Model
+		if req, ok := usage.RequestFrom(ctx); ok && model == "" {
+			// Error responses usually don't name a model.
+			model = req.Model
+		}
+		logger.Info("usage",
+			"request_id", middleware.RequestIDFrom(ctx),
+			"provider_request_id", r.ProviderRequestID,
+			"tenant_id", t.ID,
+			"api_key_id", key.ID,
+			"provider", provider,
+			"model", model,
+			"status", r.Status,
+			"input_tokens", r.Input,
+			"cached_input_tokens", r.CachedInput,
+			"cache_write_tokens", r.CacheWrite5m+r.CacheWrite1h,
+			"output_tokens", r.Output,
+			"streamed", r.Streamed,
+			"complete", r.Complete,
+		)
+	}
 }

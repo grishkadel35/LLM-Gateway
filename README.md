@@ -25,6 +25,16 @@ metering is next.
 
 ### What changed
 
+- **Usage metering, OpenAI format first.** Each provider response's body is
+  wrapped as it passes through: bytes reach the client untouched and
+  unbuffered while the gateway reads token usage from them (SSE event by event,
+  or the JSON body at its end). OpenAI and Groq responses, streamed or not, now
+  produce a `usage` log line with tenant, key, provider, model, token counts,
+  the provider's own request ID, and whether the stream completed. Anthropic
+  and Gemini parsers are next; until then their lines show zero tokens. A
+  client that disconnects mid-stream still gets what was seen recorded,
+  marked `"complete": false`. `input_tokens` means tokens billed at the input
+  rate: cache reads are counted separately in `cached_input_tokens`.
 - **One owner for the request body.** The gateway reads each body once (up to
   `max_request_bytes`, default 32 MiB; `413` beyond that), and forwards the
   client's exact bytes unless it has to rewrite something. For OpenAI-format
@@ -141,7 +151,7 @@ logged — including streamed responses.
   logged (stored with its usage row, next to the provider's own ID, once usage
   logging lands)
 - [x] A `format` field per provider (`openai`, `anthropic`, `gemini`)
-- [ ] A usage parser for each format
+- [ ] A usage parser for each format (OpenAI/Groq done; Anthropic, Gemini next)
 - [ ] `internal/usage` — reads token counts from the response as it streams past,
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars

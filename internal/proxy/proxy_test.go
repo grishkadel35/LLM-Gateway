@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // discardLogger returns a logger that throws its output away, so test runs stay
@@ -60,7 +62,7 @@ func testProvider(t *testing.T, upstreamURL string) provider.Provider {
 func newTestProxy(t *testing.T, upstreamURL string) http.Handler {
 	t.Helper()
 
-	return New(testProvider(t, upstreamURL), discardLogger())
+	return New(testProvider(t, upstreamURL), discardLogger(), nil)
 }
 
 // TestProxyForwardsRequestAndResponse is the core end-to-end test: stand up a
@@ -208,7 +210,7 @@ func TestProxyIgnoresConnectionHeaderNamingCredentials(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	req.Header.Set("Connection", "X-Api-Key, Anthropic-Version")
 
-	New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+	New(p, discardLogger(), nil).ServeHTTP(httptest.NewRecorder(), req)
 
 	if v := got.Get("X-Api-Key"); v != "sk-gateway-key" {
 		t.Errorf("X-Api-Key = %q, want %q", v, "sk-gateway-key")
@@ -233,7 +235,7 @@ func TestProxyStripsQueryCredential(t *testing.T) {
 	p.Auth = provider.AuthGoogleKey
 
 	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/x:streamGenerateContent?key=gw_CLIENT-LEAK&alt=sse", nil)
-	New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+	New(p, discardLogger(), nil).ServeHTTP(httptest.NewRecorder(), req)
 
 	if gotQuery != "alt=sse" {
 		t.Errorf("upstream query = %q, want %q", gotQuery, "alt=sse")
@@ -368,7 +370,7 @@ func TestProxyTimeoutReturns504(t *testing.T) {
 	p.Timeout = 50 * time.Millisecond
 
 	rec := httptest.NewRecorder()
-	New(p, discardLogger()).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	New(p, discardLogger(), nil).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
 
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusGatewayTimeout)
@@ -397,7 +399,7 @@ func TestProxyClientCancelIsNotAnUpstreamError(t *testing.T) {
 	time.AfterFunc(50*time.Millisecond, cancel)
 
 	rec := httptest.NewRecorder()
-	New(testProvider(t, upstream.URL), logger).ServeHTTP(rec, req)
+	New(testProvider(t, upstream.URL), logger, nil).ServeHTTP(rec, req)
 
 	if rec.Code != StatusClientClosedRequest {
 		t.Errorf("status = %d, want %d", rec.Code, StatusClientClosedRequest)
@@ -462,7 +464,7 @@ func TestProxyAppliesProviderAuth(t *testing.T) {
 			// The client sends its own key, which must not survive.
 			req.Header.Set("Authorization", "Bearer sk-CLIENT-LEAK")
 
-			New(p, discardLogger()).ServeHTTP(httptest.NewRecorder(), req)
+			New(p, discardLogger(), nil).ServeHTTP(httptest.NewRecorder(), req)
 
 			if v := got.Get(tc.wantHeader); v != tc.wantValue {
 				t.Errorf("%s = %q, want %q", tc.wantHeader, v, tc.wantValue)
@@ -513,7 +515,7 @@ func TestProxyLogsStreamingFromContentType(t *testing.T) {
 
 			var logs strings.Builder
 			logger := slog.New(slog.NewJSONHandler(&logs, nil))
-			p := New(testProvider(t, upstream.URL), logger)
+			p := New(testProvider(t, upstream.URL), logger, nil)
 
 			rec := httptest.NewRecorder()
 			p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
@@ -528,5 +530,65 @@ func TestProxyLogsStreamingFromContentType(t *testing.T) {
 				t.Errorf("streaming = %v, want %v (log: %s)", line.Streaming, tt.want, logs.String())
 			}
 		})
+	}
+}
+
+// TestMeteredStreamIsNotBuffered: with usage metering on, each event must
+// still reach the client as the provider sends it. The upstream here holds
+// the stream open until the client has received the first event; if metering
+// buffered the body, the test would time out.
+func TestMeteredStreamIsNotBuffered(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	p := testProvider(t, upstream.URL)
+	p.Format = provider.FormatOpenAI
+	results := make(chan usage.Result, 1)
+	gateway := httptest.NewServer(New(p, discardLogger(), func(_ context.Context, r usage.Result) { results <- r }))
+	defer gateway.Close()
+
+	res, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		unblock()
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	// Deferred last so it runs first: on a failure the upstream must be
+	// released before the servers close, or closing them waits forever.
+	defer unblock()
+
+	first := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 256)
+		n, _ := res.Body.Read(buf)
+		first <- string(buf[:n])
+	}()
+	select {
+	case got := <-first:
+		if !strings.Contains(got, `"hi"`) {
+			t.Errorf("first read = %q, want the first event", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first event never arrived: the metered stream is buffered")
+	}
+
+	unblock()
+	_, _ = io.ReadAll(res.Body)
+	select {
+	case r := <-results:
+		if r.Input != 3 || r.Output != 1 || !r.Streamed {
+			t.Errorf("result = %+v, want input 3, output 1, streamed", r)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("usage callback never ran")
 	}
 }
