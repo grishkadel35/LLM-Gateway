@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
@@ -51,6 +52,10 @@ func (fakeStore) IssueKey(context.Context, string) (tenant.NewKey, error) {
 }
 
 func (fakeStore) RevokeKey(context.Context, int64) error { return tenant.ErrNotFound }
+
+func (fakeStore) TenantUsage(context.Context, string, time.Time, time.Time) (usage.Summary, error) {
+	return usage.Summary{}, tenant.ErrNotFound
+}
 
 // fakeUpstream records what a provider actually received.
 type fakeUpstream struct {
@@ -419,7 +424,7 @@ func TestKeyLifecycleThroughGateway(t *testing.T) {
 	if _, err := db.Migrate(context.Background(), conn); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
-	r, ups := newTestRouterWith(t, tenant.NewStore(conn))
+	r, ups := newTestRouterWith(t, stores{tenant.NewStore(conn), usage.NewReports(conn)})
 
 	call := func(method, path, authorization, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -774,7 +779,7 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 	if _, err := db.Migrate(ctx, conn); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
-	store := tenant.NewStore(conn)
+	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
 	tn, key, err := store.Create(ctx, "acme")
 	if err != nil {
 		t.Fatal(err)
@@ -842,5 +847,23 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 	}
 	if cost.Valid {
 		t.Errorf("unpriced model: cost = %d, want NULL", cost.Int64)
+	}
+
+	// The admin usage report reads the same rows back.
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/"+tn.ID+"/usage", nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminKey)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("usage report: status = %d; body %s", rec.Code, rec.Body)
+	}
+	var report struct {
+		Total usage.Totals `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Total.Requests != 2 || report.Total.CostMicros != 75 || report.Total.UnpricedRequests != 1 {
+		t.Errorf("report total = %+v, want 2 requests, 75 micro-$, 1 unpriced", report.Total)
 	}
 }

@@ -60,12 +60,18 @@ func main() {
 // provider that served it.
 type usageFunc func(ctx context.Context, provider string, r usage.Result)
 
-// tenantStore is what the routes need from tenant storage: key lookup for
-// tenant auth, and tenant and key management for the admin API.
-// *tenant.Store satisfies it; routing tests substitute a fake.
+// tenantStore is what the routes need from storage: key lookup for tenant
+// auth, and tenant, key and usage reporting for the admin API. stores
+// satisfies it; routing tests substitute a fake.
 type tenantStore interface {
 	middleware.KeyLookup
 	admin.Store
+}
+
+// stores combines the two Postgres-backed stores into one tenantStore.
+type stores struct {
+	*tenant.Store
+	*usage.Reports
 }
 
 // router builds the gateway's handler: one reverse proxy per configured
@@ -174,7 +180,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
-	handler, err := router(cfg, tenant.NewStore(conn), adminKey, recordUsage(writer, logger), logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, logger), logger)
 	if err != nil {
 		return err
 	}

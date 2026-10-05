@@ -1,5 +1,5 @@
-// Package admin serves the gateway's admin API: creating tenants, and issuing
-// and revoking their keys.
+// Package admin serves the gateway's admin API: creating tenants, issuing
+// and revoking their keys, and reporting their usage.
 //
 // It does no authentication of its own. The gateway mounts it behind
 // middleware.AdminAuth, so a request that reaches these handlers already
@@ -17,14 +17,16 @@ import (
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
-// Store is what the admin API needs from tenant storage. *tenant.Store
-// satisfies it.
+// Store is what the admin API needs: tenant and key management, which
+// *tenant.Store provides, and usage reports, which *usage.Reports provides.
 type Store interface {
 	Create(ctx context.Context, name string) (tenant.Tenant, tenant.NewKey, error)
 	IssueKey(ctx context.Context, tenantID string) (tenant.NewKey, error)
 	RevokeKey(ctx context.Context, keyID int64) error
+	TenantUsage(ctx context.Context, tenantID string, from, to time.Time) (usage.Summary, error)
 }
 
 // Handler returns the admin routes, at their full /admin/... paths.
@@ -35,6 +37,7 @@ func Handler(store Store, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /admin/tenants", a.createTenant)
 	mux.HandleFunc("POST /admin/tenants/{id}/keys", a.issueKey)
 	mux.HandleFunc("DELETE /admin/keys/{id}", a.revokeKey)
+	mux.HandleFunc("GET /admin/tenants/{id}/usage", a.tenantUsage)
 	// Everything else under /admin/, wrong methods included, gets a JSON 404
 	// rather than ServeMux's plain-text 404 or 405.
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +158,51 @@ func (a *api) revokeKey(w http.ResponseWriter, r *http.Request) {
 
 	a.logger.Info("key revoked", "key_id", keyID)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// tenantUsage reports a tenant's usage over [from, to): RFC 3339 query
+// parameters, each defaulting to the current calendar month in UTC, the
+// period a monthly budget covers.
+func (a *api) tenantUsage(w http.ResponseWriter, r *http.Request) {
+	now := time.Now().UTC()
+	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	to := from.AddDate(0, 1, 0)
+
+	for name, t := range map[string]*time.Time{"from": &from, "to": &to} {
+		v := r.URL.Query().Get(name)
+		if v == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", name+" must be an RFC 3339 time, such as 2026-10-01T00:00:00Z")
+			return
+		}
+		*t = parsed.UTC()
+	}
+	if !from.Before(to) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "from must be before to")
+		return
+	}
+
+	tenantID := r.PathValue("id")
+	summary, err := a.store.TenantUsage(r.Context(), tenantID, from, to)
+	if errors.Is(err, tenant.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", "no tenant with that ID")
+		return
+	}
+	if err != nil {
+		a.internalError(w, "reading usage", err)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tenant_id": tenantID,
+		"from":      from,
+		"to":        to,
+		"total":     summary.Total,
+		"by_model":  summary.ByModel,
+	})
 }
 
 // internalError logs err and returns a 500 without its text, which may name

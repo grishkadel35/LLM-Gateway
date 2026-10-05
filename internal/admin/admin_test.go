@@ -11,21 +11,29 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
-// newStore returns a tenant store over a fresh, migrated database.
-func newStore(t *testing.T) *tenant.Store {
+// stores is what the gateway gives the admin API: tenants and usage.
+type stores struct {
+	*tenant.Store
+	*usage.Reports
+}
+
+// newStore returns the admin stores over a fresh, migrated database.
+func newStore(t *testing.T) stores {
 	t.Helper()
 
 	conn := dbtest.New(t)
 	if _, err := db.Migrate(context.Background(), conn); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
-	return tenant.NewStore(conn)
+	return stores{tenant.NewStore(conn), usage.NewReports(conn)}
 }
 
 func serve(t *testing.T, store Store, method, path, body string) *httptest.ResponseRecorder {
@@ -214,6 +222,9 @@ func (failingStore) IssueKey(context.Context, string) (tenant.NewKey, error) {
 	return tenant.NewKey{}, errDown
 }
 func (failingStore) RevokeKey(context.Context, int64) error { return errDown }
+func (failingStore) TenantUsage(context.Context, string, time.Time, time.Time) (usage.Summary, error) {
+	return usage.Summary{}, errDown
+}
 
 // TestStoreFailureIs500: a database error is the gateway's fault, and its
 // text (which may name hosts or SQL) stays in the log, not the response.
@@ -222,6 +233,7 @@ func TestStoreFailureIs500(t *testing.T) {
 		{http.MethodPost, "/admin/tenants", `{"name":"acme"}`},
 		{http.MethodPost, "/admin/tenants/tn_x/keys", ""},
 		{http.MethodDelete, "/admin/keys/1", ""},
+		{http.MethodGet, "/admin/tenants/tn_x/usage", ""},
 	}
 	for _, r := range requests {
 		rec := serve(t, failingStore{}, r.method, r.path, r.body)
@@ -251,5 +263,96 @@ func TestUnknownAdminRouteIsJSON(t *testing.T) {
 		if body.Error.Type != "not_found" {
 			t.Errorf("%s %s: error type = %q, want not_found", r.method, r.path, body.Error.Type)
 		}
+	}
+}
+
+// usageStore records the period it was asked for.
+type usageStore struct {
+	failingStore
+	tenantID string
+	from, to time.Time
+}
+
+func (u *usageStore) TenantUsage(_ context.Context, tenantID string, from, to time.Time) (usage.Summary, error) {
+	if tenantID == "tn_missing" {
+		return usage.Summary{}, tenant.ErrNotFound
+	}
+	u.tenantID, u.from, u.to = tenantID, from, to
+	return usage.Summary{
+		Total:   usage.Totals{Requests: 2, CostMicros: 150},
+		ByModel: []usage.ModelTotals{{Provider: "openai", Model: "gpt-4o", Totals: usage.Totals{Requests: 2, CostMicros: 150}}},
+	}, nil
+}
+
+func TestTenantUsageExplicitPeriod(t *testing.T) {
+	store := &usageStore{}
+	rec := serve(t, store, http.MethodGet, "/admin/tenants/tn_a/usage?from=2026-09-01T00:00:00Z&to=2026-09-15T12:00:00%2B02:00", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body %s", rec.Code, rec.Body)
+	}
+
+	if store.tenantID != "tn_a" ||
+		!store.from.Equal(time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)) ||
+		!store.to.Equal(time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("asked for %s %v..%v", store.tenantID, store.from, store.to)
+	}
+
+	var body struct {
+		TenantID string    `json:"tenant_id"`
+		From     time.Time `json:"from"`
+		To       time.Time `json:"to"`
+		Total    struct {
+			Requests   int64 `json:"requests"`
+			CostMicros int64 `json:"cost_micros"`
+		} `json:"total"`
+		ByModel []struct {
+			Model string `json:"model"`
+		} `json:"by_model"`
+	}
+	decode(t, rec, &body)
+	if body.TenantID != "tn_a" || body.Total.Requests != 2 || body.Total.CostMicros != 150 || len(body.ByModel) != 1 {
+		t.Errorf("body = %+v", body)
+	}
+	if !body.From.Equal(store.from) || !body.To.Equal(store.to) {
+		t.Errorf("body period %v..%v, want the period queried", body.From, body.To)
+	}
+}
+
+// TestTenantUsageDefaultsToCurrentMonth: with no period given, the current
+// calendar month in UTC, the period a monthly budget covers.
+func TestTenantUsageDefaultsToCurrentMonth(t *testing.T) {
+	store := &usageStore{}
+	before := time.Now().UTC()
+	rec := serve(t, store, http.MethodGet, "/admin/tenants/tn_a/usage", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; body %s", rec.Code, rec.Body)
+	}
+
+	start := time.Date(before.Year(), before.Month(), 1, 0, 0, 0, 0, time.UTC)
+	if !store.from.Equal(start) || !store.to.Equal(start.AddDate(0, 1, 0)) {
+		t.Errorf("period = %v..%v, want %v..%v", store.from, store.to, start, start.AddDate(0, 1, 0))
+	}
+}
+
+func TestTenantUsageRejectsBadInput(t *testing.T) {
+	cases := []struct {
+		query string
+		want  int
+	}{
+		{"?from=yesterday", http.StatusBadRequest},
+		{"?to=2026-13-01T00:00:00Z", http.StatusBadRequest},
+		{"?from=2026-10-01T00:00:00Z&to=2026-10-01T00:00:00Z", http.StatusBadRequest},
+		{"?from=2026-11-01T00:00:00Z&to=2026-10-01T00:00:00Z", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		rec := serve(t, &usageStore{}, http.MethodGet, "/admin/tenants/tn_a/usage"+tc.query, "")
+		if rec.Code != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.query, rec.Code, tc.want)
+		}
+	}
+
+	rec := serve(t, &usageStore{}, http.MethodGet, "/admin/tenants/tn_missing/usage", "")
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("unknown tenant: status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }

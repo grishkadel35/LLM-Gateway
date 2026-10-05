@@ -25,6 +25,11 @@ metering is next.
 
 ### What changed
 
+- **Usage reports.** `GET /admin/tenants/{id}/usage?from=&to=` sums a
+  tenant's usage over a period (RFC 3339, default: the current UTC month):
+  totals plus a breakdown by provider and model, with `unpriced_requests`
+  counting rows that had no cost, so a partial total isn't mistaken for a
+  complete one.
 - **Usage is recorded in Postgres.** Every request that reaches a provider
   now leaves one `usage_logs` row: the `X-Request-ID` the client got, the
   provider's own request ID, tenant, key, provider, model, endpoint, status,
@@ -177,8 +182,7 @@ logged — including streamed responses.
   without buffering it, and writes `usage_logs` rows in async batches
 - [ ] `internal/pricing` — per-model prices in integer micro-dollars
 - [x] Admin routes behind a separate admin key: `POST /admin/tenants`,
-  issuing and revoking keys (`GET /admin/tenants/{id}/usage` comes with usage
-  logging)
+  issuing and revoking keys, `GET /admin/tenants/{id}/usage`
 
 This is the first week the gateway stops being dependency-free: it adds
 Postgres and the `pgx` driver. Auth middleware runs *before* the proxy, so a
@@ -392,6 +396,7 @@ SigV4, Vertex AI's OAuth — can't be expressed this way and would need code.
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
+| `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage.  |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
 
 Metered endpoints, the only ones forwarded:
