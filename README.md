@@ -16,18 +16,25 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-04
+**Last updated:** 2026-10-05
 **Stage:** Week 1 of 8 complete and checkpoint closed, plus multi-provider
 routing. Week 2 in progress: the mock provider, the dev stack (Postgres,
-migrations, CI) and tenant key management are done. The gateway itself
-doesn't use the database yet.
+migrations, CI), tenant key management and the auth middleware are done. The
+gateway itself doesn't use the database yet.
 
 ### What changed
 
+- **Auth middleware.** `middleware.Auth` reads the gateway key from whichever
+  header the client's SDK sends (`Authorization: Bearer`, `X-Api-Key`,
+  `X-Goog-Api-Key`), looks it up, and puts the tenant and key on the request
+  context; anything else gets a 401 and never reaches the provider. A failed
+  lookup (database down) is a 503, not a 401. Gemini's `?key=` is not
+  accepted: a key in a URL ends up in proxy logs. It isn't wired into the
+  gateway yet: that lands with the admin routes, so there is never a gateway
+  that demands keys with no way to issue one.
 - **Tenant keys.** `internal/tenant` creates tenants and issues, revokes and
   looks up their `gw_` keys. Only a SHA-256 hash of each key is stored; the
-  plaintext is returned once, at issue. Nothing calls it yet: the auth
-  middleware is next.
+  plaintext is returned once, at issue.
 - **Schema reworked before any code uses it.** API keys moved out of `tenants`
   into their own `api_keys` table, so a tenant can hold several keys and rotate
   or revoke one without downtime. `usage_logs` gained `request_id`,
@@ -96,9 +103,9 @@ logged — including streamed responses.
   `api_keys` and `usage_logs` tables; CI running `go vet` and `go test -race`
 - [x] `internal/tenant` — `gw_`-prefixed random keys, stored as SHA-256 for an
   indexed lookup; several per tenant, so keys rotate without downtime
-- [ ] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
+- [x] `internal/middleware/auth.go` — reads the gateway key from the client SDK's
   native credential header, rejects revoked keys, and attaches the tenant to the
-  request context
+  request context (wired into the gateway together with the admin routes)
 - [ ] Request IDs — an `X-Request-ID` per request, returned to the client and
   stored with its usage row alongside the provider's own request ID
 - [ ] A `format` field per provider (`openai`, `anthropic`, `gemini`), with a
@@ -318,7 +325,7 @@ cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy and its hooks
-internal/middleware/      request logging
+internal/middleware/      request logging, tenant key auth
 internal/health/          GET /health
 internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
 cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
