@@ -249,6 +249,10 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"negative timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    timeout: -5\n"},
 		{"empty key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: \"\"\n    auth: bearer\n"},
 		{"reserved name health", "providers:\n  health:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"reserved name admin", "providers:\n  admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"reserved name metrics", "providers:\n  metrics:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"reserved name in another case", "providers:\n  Admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
+		{"reserved name ready", "providers:\n  ready:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
 		{"name containing a slash", "providers:\n  open/ai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},
 		// A space or brace would change the ServeMux pattern and panic.
 		{"name containing a space", "providers:\n  \"open ai\":\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n"},

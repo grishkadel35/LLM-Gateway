@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -43,9 +44,14 @@ const (
 var validName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 // reservedNames are provider names that would collide with the gateway's own
-// routes. A provider called "health" would shadow GET /health.
+// routes: a provider called "health" would shadow GET /health, and one called
+// "admin" would catch and proxy every /admin/ path the admin API doesn't
+// serve. Checked case-insensitively, so "Admin" can't sit beside "admin".
 var reservedNames = map[string]bool{
-	"health": true,
+	"health":  true,
+	"admin":   true,
+	"metrics": true,
+	"ready":   true,
 }
 
 // Config is the top-level shape of config.yaml.
@@ -207,8 +213,8 @@ func (pc ProviderConfig) validate(name string) error {
 	if !validName.MatchString(name) {
 		return fmt.Errorf("provider name %q must be non-empty and contain only letters, digits, '-' and '_': it is used as a URL path prefix", name)
 	}
-	if reservedNames[name] {
-		return fmt.Errorf("provider name %q is reserved: it would shadow the gateway's own /%s route", name, name)
+	if reservedNames[strings.ToLower(name)] {
+		return fmt.Errorf("provider name %q is reserved: it collides with the gateway's own /%s routes", name, strings.ToLower(name))
 	}
 
 	if pc.URL == "" {

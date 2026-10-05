@@ -74,13 +74,7 @@ func Auth(keys KeyLookup, logger *slog.Logger) func(http.Handler) http.Handler {
 // if there is none.
 func credential(h http.Header) string {
 	if v := h.Get("Authorization"); v != "" {
-		// The auth scheme is case-insensitive (RFC 9110 §11.1). Anything but
-		// Bearer, such as Basic, doesn't carry a key.
-		scheme, token, ok := strings.Cut(v, " ")
-		if ok && strings.EqualFold(scheme, "Bearer") {
-			return strings.TrimSpace(token)
-		}
-		return ""
+		return bearerToken(v)
 	}
 	if v := h.Get("X-Api-Key"); v != "" {
 		return v
@@ -88,10 +82,30 @@ func credential(h http.Header) string {
 	return h.Get("X-Goog-Api-Key")
 }
 
+// bearerToken returns the token from an Authorization header value, or "" if
+// it isn't a Bearer credential. The auth scheme is case-insensitive (RFC 9110
+// §11.1); any other scheme, such as Basic, doesn't carry a key.
+//
+// The token is returned exactly as sent, not trimmed: net/http already strips
+// the spaces and tabs around a header value, and trimming further (say, a
+// trailing non-breaking space) would let a credential that isn't the key
+// match it.
+func bearerToken(authorization string) string {
+	scheme, token, ok := strings.Cut(authorization, " ")
+	if ok && strings.EqualFold(scheme, "Bearer") {
+		return token
+	}
+	return ""
+}
+
 func unauthorized(w http.ResponseWriter, message string) {
+	unauthorizedAs(w, "invalid_api_key", message)
+}
+
+func unauthorizedAs(w http.ResponseWriter, errType, message string) {
 	// A 401 must say how to authenticate (RFC 9110 §15.5.2).
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	writeError(w, http.StatusUnauthorized, "invalid_api_key", message)
+	writeError(w, http.StatusUnauthorized, errType, message)
 }
 
 func writeError(w http.ResponseWriter, status int, errType, message string) {
