@@ -488,3 +488,48 @@ func TestOpenDBFailsFast(t *testing.T) {
 		t.Error("openDB() on an unreachable database returned no error")
 	}
 }
+
+// TestUnmeteredEndpointsAreRefused: tenant requests reach only endpoints the
+// gateway can meter, and the check sees the path after the provider prefix,
+// so Groq's base path doesn't confuse it.
+func TestUnmeteredEndpointsAreRefused(t *testing.T) {
+	cases := []struct {
+		path       string
+		wantStatus int
+	}{
+		{"/groq/v1/chat/completions", http.StatusOK},
+		{"/openai/v1/embeddings", http.StatusForbidden},
+		{"/groq/v1/responses", http.StatusForbidden},
+		{"/anthropic/v1/messages/count_tokens", http.StatusForbidden},
+		{"/gemini/v1beta/models/x:countTokens", http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			r, ups := newTestRouter(t)
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d; body %s", rec.Code, tc.wantStatus, rec.Body)
+			}
+			if tc.wantStatus == http.StatusForbidden {
+				for name, up := range ups {
+					if up.path != "" {
+						t.Errorf("unmetered request reached provider %q", name)
+					}
+				}
+			}
+		})
+	}
+
+	// Auth comes first: without a key the answer is 401, so unauthenticated
+	// callers can't map which endpoints are metered.
+	r, _ := newTestRouter(t)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/openai/v1/embeddings", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated unmetered request: status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+}

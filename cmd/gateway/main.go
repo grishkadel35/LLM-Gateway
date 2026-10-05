@@ -28,6 +28,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 func main() {
@@ -96,7 +97,10 @@ func router(cfg *config.Config, store tenantStore, adminKey string, logger *slog
 		// Auth runs first: a request without a valid gateway key never reaches
 		// the proxy, so it can't spend the provider's key.
 		prefix := "/" + p.Name
-		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, proxy.New(p, logger))))
+		// RequireMetered then refuses endpoints the gateway can't read usage
+		// from; it runs after StripPrefix so it sees the provider-relative path.
+		metered := usage.RequireMetered(p.Format)(proxy.New(p, logger))
+		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, metered)))
 	}
 
 	// Anything that names no provider is rejected. There is deliberately no

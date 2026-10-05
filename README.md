@@ -25,6 +25,14 @@ metering is next.
 
 ### What changed
 
+- **Only metered endpoints are forwarded.** Tenants can reach exactly the
+  endpoints whose token usage the gateway can read: OpenAI-format
+  `POST /v1/chat/completions`, Anthropic `POST /v1/messages`, and Gemini
+  `POST /{v1,v1beta}/models/{model}:generateContent` / `:streamGenerateContent`.
+  Anything else (`/v1/responses`, embeddings, batches, `count_tokens`,
+  `countTokens`...) gets `403 unmetered_endpoint`, since an endpoint the
+  gateway can't meter would get around every future limit. Endpoints join the
+  list only with a parser for their usage.
 - **Tenant auth is live.** Every provider route needs a gateway key (`gw_…`),
   sent where the client's SDK sends its API key; anything else gets a 401 and
   never reaches the provider. The gateway now needs Postgres and an admin key
@@ -340,11 +348,19 @@ SigV4, Vertex AI's OAuth — can't be expressed this way and would need code.
 | Path                              | Behavior                                                                                  |
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Returns `{"status":"ok"}`. Handled locally, no key needed.                                |
-| `/<provider>/...`                 | Needs a gateway key (`401` otherwise). Prefix stripped, forwarded with the provider's key. |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below). Prefix stripped, forwarded with the provider's key. |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
+
+Metered endpoints, the only ones forwarded:
+
+| Format      | Endpoints                                                                          |
+| ----------- | ---------------------------------------------------------------------------------- |
+| `openai`    | `POST /v1/chat/completions`                                                        |
+| `anthropic` | `POST /v1/messages`                                                                |
+| `gemini`    | `POST /v1/models/{model}:generateContent`, `:streamGenerateContent` (also `/v1beta/`) |
 
 Every response carries an `X-Request-ID`. Key plaintext appears only in the
 `201` that issues it, with `Cache-Control: no-store`. Any `/admin/` request
