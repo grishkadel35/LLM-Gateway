@@ -21,9 +21,10 @@ type Result struct {
 	// event stream, or a stream the client asked for in another shape (such
 	// as Gemini's default JSON array).
 	Streamed bool
-	// Complete is false when the body was closed before EOF, typically
-	// because the client disconnected mid-stream: Usage then holds only what
-	// had been seen.
+	// Complete is false when usage may be missing: the body was closed
+	// before EOF (typically a client disconnecting mid-stream), or was too
+	// large to parse. Usage then holds only what had been seen, and the
+	// response's real cost is unknown.
 	Complete bool
 	// ProviderRequestID is the provider's own ID for the request, which its
 	// support asks for. "" if it sent none.
@@ -132,8 +133,13 @@ func (m *meteredBody) feed(b []byte) {
 		if i < 0 {
 			break
 		}
-		m.line(m.buf[:i])
+		l := m.buf[:i]
 		m.buf = m.buf[i+1:]
+		m.line(l)
+		if m.overflow {
+			// line gave up on the response and dropped the buffers.
+			return
+		}
 	}
 	m.buf = append([]byte(nil), m.buf...)
 }
@@ -147,6 +153,11 @@ func (m *meteredBody) line(l []byte) {
 		m.dispatch()
 	case bytes.HasPrefix(l, []byte("data:")):
 		v := bytes.TrimPrefix(l[len("data:"):], []byte(" "))
+		// An event that never ends must not grow without bound either.
+		if len(m.data)+len(v) > maxBufferedBody {
+			m.overflow, m.buf, m.data = true, nil, nil
+			return
+		}
 		if len(m.data) > 0 {
 			m.data = append(m.data, '\n')
 		}
@@ -181,7 +192,7 @@ func (m *meteredBody) finish(complete bool) {
 			m.result.Model = m.req.Model
 		}
 		m.buf, m.data = nil, nil
-		m.result.Complete = complete
+		m.result.Complete = complete && !m.overflow
 		m.done(m.ctx, m.result)
 	})
 }

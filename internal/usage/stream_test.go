@@ -162,3 +162,27 @@ func TestMeterReportsJSONStreamAsStreamed(t *testing.T) {
 		t.Errorf("result = %+v, want streamed with input 3", res)
 	}
 }
+
+// TestMeterOverflowIsIncomplete: a body too large to parse has unknown
+// usage, which must not look like a complete response with no tokens.
+func TestMeterOverflowIsIncomplete(t *testing.T) {
+	cases := []struct {
+		name, contentType, body string
+	}{
+		{"json", "application/json", `{"pad":"` + strings.Repeat("a", maxBufferedBody) + `"}`},
+		// One event that never ends: many data lines, no blank line.
+		{"sse", "text/event-stream", strings.Repeat("data: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", maxBufferedBody/30)},
+	}
+	for _, tc := range cases {
+		resp := response(http.StatusOK, tc.contentType, strings.NewReader(tc.body))
+		calls := meter(resp, provider.FormatOpenAI)
+		n, _ := io.Copy(io.Discard, resp.Body)
+
+		if n != int64(len(tc.body)) {
+			t.Errorf("%s: client got %d bytes, want all %d", tc.name, n, len(tc.body))
+		}
+		if res := (*calls)[0]; res.Complete {
+			t.Errorf("%s: result = Complete, want incomplete after overflow", tc.name)
+		}
+	}
+}

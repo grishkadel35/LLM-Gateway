@@ -33,7 +33,8 @@ next.
 - **Usage is recorded in Postgres.** Every request that reaches a provider
   now leaves one `usage_logs` row: the `X-Request-ID` the client got, the
   provider's own request ID, tenant, key, provider, model, endpoint, status,
-  tokens, cost in micro-dollars (NULL for an unpriced model, with a warning),
+  tokens, cost in micro-dollars (NULL, with a warning, for an unpriced model or
+  a response whose usage is incomplete),
   whether it streamed, and latency. Rows are queued and batch-inserted every
   100 rows or second, off the response path: a full queue drops a row (logged
   and counted) rather than slow a response down, and shutdown drains the
@@ -58,9 +59,10 @@ next.
   SSE, and the default JSON-array stream), with thinking tokens counted as
   output, as they are billed. Verified through the openai, anthropic and
   google-genai SDKs against the mock. A
-  client that disconnects mid-stream still gets what was seen recorded,
-  marked `"complete": false`. `input_tokens` means tokens billed at the input
-  rate: cache reads and writes are counted separately.
+  client that disconnects mid-stream still gets what was seen recorded; since
+  its full usage is unknown, its cost is NULL, never 0. `input_tokens` means
+  tokens billed at the input rate: cache reads and writes are counted
+  separately.
 - **One owner for the request body.** The gateway reads each body once (up to
   `max_request_bytes`, default 32 MiB; `413` beyond that), and forwards the
   client's exact bytes unless it has to rewrite something. For OpenAI-format

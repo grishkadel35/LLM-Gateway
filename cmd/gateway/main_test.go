@@ -20,6 +20,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
+	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
@@ -968,6 +969,73 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 			}
 			if !cost.Valid || cost.Int64 != wantCost {
 				t.Errorf("cost = %v, want %d", cost, wantCost)
+			}
+		})
+	}
+}
+
+// TestRecordUsageCost: cost is recorded only when the usage is known. A
+// response cut short, or too large to parse, has unknown usage, so its cost
+// is NULL, not 0; a complete response with no tokens (an upstream error)
+// really did cost nothing.
+func TestRecordUsageCost(t *testing.T) {
+	gpt4o := usage.Usage{Model: "gpt-4o", Input: 15, CachedInput: 5, Output: 10}
+	cases := []struct {
+		name     string
+		provider string
+		result   usage.Result
+		wantNull bool
+		want     int64
+	}{
+		{"complete, priced", "openai", usage.Result{Usage: gpt4o, Status: 200, Complete: true}, false, 144},
+		{"complete, no tokens", "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o"}, Status: 429, Complete: true}, false, 0},
+		{"complete, unpriced", "groq", usage.Result{Usage: usage.Usage{Model: "llama-3.3-70b-versatile", Input: 10}, Status: 200, Complete: true}, true, 0},
+		{"cut off before usage arrived", "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o"}, Status: 200}, true, 0},
+		{"cut off with partial usage", "anthropic", usage.Result{Usage: usage.Usage{Model: "claude-sonnet-4", Input: 15}, Status: 200}, true, 0},
+	}
+
+	conn := dbtest.New(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
+	_, key, err := store.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	writer := usage.NewWriter(conn, logger)
+	record := recordUsage(writer, logger)
+
+	// recordUsage reads the tenant and request ID from the context, so each
+	// call runs inside the real middleware.
+	ids := make([]string, len(cases))
+	for i, tc := range cases {
+		h := middleware.RequestID(middleware.Auth(store, logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			record(r.Context(), tc.provider, tc.result)
+		})))
+		req := httptest.NewRequest(http.MethodPost, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+key.Plaintext)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		ids[i] = rec.Header().Get("X-Request-ID")
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cost sql.NullInt64
+			if err := conn.QueryRow(`SELECT cost_micros FROM usage_logs WHERE request_id = $1`, ids[i]).Scan(&cost); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantNull && cost.Valid {
+				t.Errorf("cost = %d, want NULL", cost.Int64)
+			}
+			if !tc.wantNull && (!cost.Valid || cost.Int64 != tc.want) {
+				t.Errorf("cost = %v, want %d", cost, tc.want)
 			}
 		})
 	}

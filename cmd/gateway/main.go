@@ -326,17 +326,23 @@ func recordUsage(w *usage.Writer, logger *slog.Logger) usageFunc {
 			CreatedAt:         req.Received,
 		}
 
-		// No tokens cost nothing, priced or not: upstream errors report none.
-		var cost int64
-		priced := true
-		if hasTokens := r.Usage != (usage.Usage{Model: r.Model}); hasTokens {
-			cost, priced = pricing.Cost(provider, r.Usage, req.Model, req.Received)
-		}
-		if priced {
-			row.CostMicros = &cost
-		} else {
-			logger.Warn("model not priced; usage logged without cost",
+		// Cost is recorded only when the usage is known. A response cut short
+		// (or too large to parse) may be missing its usage, so its cost is
+		// NULL, never a guess and never 0. A complete response with no tokens,
+		// such as an upstream error, really did cost nothing.
+		switch {
+		case !r.Complete:
+			logger.Warn("usage incomplete; logged without cost",
 				"request_id", row.RequestID, "provider", provider, "model", r.Model)
+		case r.Usage.Tokens() == 0:
+			row.CostMicros = new(int64)
+		default:
+			if cost, ok := pricing.Cost(provider, r.Usage, req.Model, req.Received); ok {
+				row.CostMicros = &cost
+			} else {
+				logger.Warn("model not priced; usage logged without cost",
+					"request_id", row.RequestID, "provider", provider, "model", r.Model)
+			}
 		}
 
 		w.Write(row)

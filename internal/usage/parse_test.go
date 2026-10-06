@@ -256,3 +256,13 @@ func TestOpenAICacheWrites(t *testing.T) {
 		t.Errorf("usage = %+v, want %+v", got, want)
 	}
 }
+
+func TestUsageTokens(t *testing.T) {
+	u := Usage{Model: "m", Input: 1, CachedInput: 2, CacheWrite: 3, CacheWrite1h: 4, Output: 5}
+	if got := u.Tokens(); got != 15 {
+		t.Errorf("Tokens() = %d, want 15", got)
+	}
+	if got := (Usage{Model: "m"}).Tokens(); got != 0 {
+		t.Errorf("Tokens() with only a model = %d, want 0", got)
+	}
+}

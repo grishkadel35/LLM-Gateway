@@ -32,6 +32,11 @@ type Usage struct {
 	Output int64
 }
 
+// Tokens is the total of every kind of token.
+func (u Usage) Tokens() int64 {
+	return u.Input + u.CachedInput + u.CacheWrite + u.CacheWrite1h + u.Output
+}
+
 // parser reads one response's usage, fed either SSE event payloads or one
 // complete body.
 type parser interface {
