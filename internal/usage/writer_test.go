@@ -209,3 +209,55 @@ func TestWriterStoresEveryField(t *testing.T) {
 		t.Errorf("cost = %v, provider_request_id = %v; want both NULL", u.cost, u.providerRequestID)
 	}
 }
+
+// TestWriterStoresUnsafeText: model and endpoint come from the client and
+// provider headers from upstream. A NUL byte or invalid UTF-8 there must not
+// make Postgres reject the row, let alone the batch around it.
+func TestWriterStoresUnsafeText(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	w := newWriter(conn, discard(), 10, 100, time.Hour)
+	w.start()
+
+	good := testRow(tn, key, "req_good")
+	bad := testRow(tn, key, "req_bad")
+	bad.Model = "gpt\x00-4o"
+	bad.Endpoint = "/v1beta/models/\xff:generateContent"
+	bad.ProviderRequestID = "id\x00"
+	w.Write(good)
+	w.Write(bad)
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := countRows(t, conn); n != 2 {
+		t.Fatalf("usage_logs has %d rows, want both", n)
+	}
+	var model, endpoint string
+	if err := conn.QueryRow(`SELECT model, endpoint FROM usage_logs WHERE request_id = 'req_bad'`).Scan(&model, &endpoint); err != nil {
+		t.Fatal(err)
+	}
+	if model != "gpt-4o" || endpoint != "/v1beta/models/�:generateContent" {
+		t.Errorf("model, endpoint = %q, %q; want NUL removed and bad UTF-8 replaced", model, endpoint)
+	}
+}
+
+// TestWriterIsolatesBadRow: if Postgres still rejects one row, the rest of
+// its batch, other tenants' rows included, is written anyway.
+func TestWriterIsolatesBadRow(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	w := newWriter(conn, discard(), 10, 100, time.Hour)
+	w.start()
+
+	orphan := testRow(tn, key, "req_orphan")
+	orphan.TenantID = "tn_does_not_exist" // violates the foreign key
+	w.Write(testRow(tn, key, "req_1"))
+	w.Write(orphan)
+	w.Write(testRow(tn, key, "req_2"))
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := countRows(t, conn); n != 2 {
+		t.Errorf("usage_logs has %d rows, want the 2 good ones", n)
+	}
+}

@@ -48,8 +48,9 @@ const (
 // whichever comes first.
 //
 // Rows are lost only when the queue is full, on a write after Close, or when
-// a batch insert fails; each is logged, and the first two are counted by
-// Dropped. A gateway crash loses at most what is queued.
+// Postgres rejects that row itself (a failed batch is retried row by row);
+// each is logged, and the first two are counted by Dropped. A gateway crash
+// loses at most what is queued.
 type Writer struct {
 	db         *sql.DB
 	logger     *slog.Logger
@@ -151,18 +152,36 @@ func (w *Writer) run() {
 
 const rowColumns = 17
 
-// flush inserts batch as one multi-row INSERT.
+// flush writes batch as one multi-row INSERT. If Postgres rejects it, each
+// row is retried on its own, so one bad row costs only itself, not the other
+// rows (other tenants' included) that happened to share its batch.
 func (w *Writer) flush(batch []Row) {
 	if len(batch) == 0 {
 		return
 	}
+	err := w.insert(batch)
+	if err == nil {
+		return
+	}
+	if len(batch) == 1 {
+		w.logger.Error("usage row lost: insert failed", "request_id", batch[0].RequestID, "error", err)
+		return
+	}
+	w.logger.Warn("usage batch insert failed; retrying rows one by one", "rows", len(batch), "error", err)
+	for _, r := range batch {
+		if err := w.insert([]Row{r}); err != nil {
+			w.logger.Error("usage row lost: insert failed", "request_id", r.RequestID, "tenant_id", r.TenantID, "error", err)
+		}
+	}
+}
 
+func (w *Writer) insert(rows []Row) error {
 	var q strings.Builder
 	q.WriteString(`INSERT INTO usage_logs (request_id, provider_request_id, tenant_id, api_key_id,
 		provider, model, endpoint, status, input_tokens, cached_input_tokens, cache_write_tokens,
 		output_tokens, cost_micros, cached, streamed, latency_ms, created_at) VALUES `)
-	args := make([]any, 0, len(batch)*rowColumns)
-	for i, r := range batch {
+	args := make([]any, 0, len(rows)*rowColumns)
+	for i, r := range rows {
 		if i > 0 {
 			q.WriteString(", ")
 		}
@@ -177,10 +196,10 @@ func (w *Writer) flush(batch []Row) {
 
 		var providerID sql.NullString
 		if r.ProviderRequestID != "" {
-			providerID = sql.NullString{String: r.ProviderRequestID, Valid: true}
+			providerID = sql.NullString{String: text(r.ProviderRequestID), Valid: true}
 		}
-		args = append(args, r.RequestID, providerID, r.TenantID, r.APIKeyID,
-			r.Provider, r.Model, r.Endpoint, r.Status, r.Input, r.CachedInput,
+		args = append(args, text(r.RequestID), providerID, text(r.TenantID), r.APIKeyID,
+			text(r.Provider), text(r.Model), text(r.Endpoint), r.Status, r.Input, r.CachedInput,
 			// One column for both TTLs: the cost already priced them apart.
 			r.CacheWrite+r.CacheWrite1h,
 			r.Output, r.CostMicros, r.Cached, r.Streamed, r.LatencyMS, r.CreatedAt)
@@ -188,7 +207,13 @@ func (w *Writer) flush(batch []Row) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
-	if _, err := w.db.ExecContext(ctx, q.String(), args...); err != nil {
-		w.logger.Error("usage rows lost: batch insert failed", "rows", len(batch), "error", err)
-	}
+	_, err := w.db.ExecContext(ctx, q.String(), args...)
+	return err
+}
+
+// text makes s storable in a Postgres TEXT column, which rejects NUL bytes
+// and invalid UTF-8. Model and endpoint come from the client, and the
+// provider request ID from upstream, so either could carry them.
+func text(s string) string {
+	return strings.ReplaceAll(strings.ToValidUTF8(s, "\uFFFD"), "\x00", "")
 }
