@@ -266,3 +266,17 @@ func TestUsageTokens(t *testing.T) {
 		t.Errorf("Tokens() with only a model = %d, want 0", got)
 	}
 }
+
+// Tool use (code execution, grounding) adds input outside promptTokenCount:
+// verified live 2026-10-05 on gemini-3.8-flash with code execution, where
+// totalTokenCount 210 = prompt 45 + candidates 48 + thoughts 24 + tool use
+// 93. Google bills those intermediate tokens as input.
+func TestGeminiToolUseIsInput(t *testing.T) {
+	got := parseBody(t, provider.FormatGemini, `{"usageMetadata":{"promptTokenCount":45,"candidatesTokenCount":48,
+		"totalTokenCount":210,"toolUsePromptTokenCount":93,"thoughtsTokenCount":24},"modelVersion":"gemini-3.8-flash"}`)
+
+	want := Usage{Model: "gemini-3.8-flash", Input: 45 + 93, Output: 48 + 24}
+	if got != want {
+		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}

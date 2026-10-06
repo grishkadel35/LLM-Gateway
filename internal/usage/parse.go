@@ -194,9 +194,12 @@ func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
 func (p *anthropicParser) usage() Usage { return p.u }
 
 // geminiParser reads Gemini's generateContent shape. promptTokenCount
-// includes cache reads, so they are subtracted for Input. Thinking is billed
-// as output but reported in thoughtsTokenCount, outside candidatesTokenCount,
-// so Output is their sum.
+// includes cache reads, so they are subtracted for Input. Tool use (code
+// execution, grounding) adds input reported in toolUsePromptTokenCount,
+// outside promptTokenCount, and billed as input, so it is added to Input.
+// Thinking is billed as output but reported in thoughtsTokenCount, outside
+// candidatesTokenCount, so Output is their sum. (Both verified live:
+// totalTokenCount is the sum of prompt, tool use, candidates and thoughts.)
 //
 // Every streamed chunk carries usageMetadata as a running total, so the last
 // one wins. Without ?alt=sse the stream is one JSON array of chunks.
@@ -209,6 +212,7 @@ type geminiChunk struct {
 	UsageMetadata *struct {
 		PromptTokenCount        int64 `json:"promptTokenCount"`
 		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
+		ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount"`
 		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
 		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
@@ -240,7 +244,7 @@ func (p *geminiParser) chunk(c geminiChunk) {
 		p.u.Model = c.ModelVersion
 	}
 	if m := c.UsageMetadata; m != nil {
-		p.u.Input = m.PromptTokenCount - m.CachedContentTokenCount
+		p.u.Input = m.PromptTokenCount - m.CachedContentTokenCount + m.ToolUsePromptTokenCount
 		p.u.CachedInput = m.CachedContentTokenCount
 		p.u.Output = m.CandidatesTokenCount + m.ThoughtsTokenCount
 	}
