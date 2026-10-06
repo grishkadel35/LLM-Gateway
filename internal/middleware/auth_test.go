@@ -67,6 +67,8 @@ func TestAuthAcceptsEachNativeCredentialHeader(t *testing.T) {
 	}{
 		{"openai", "Authorization", "Bearer gw_good"},
 		{"openai lowercase scheme", "Authorization", "bearer gw_good"},
+		// RFC 6750: "Bearer" 1*SP b64token, so any run of spaces is valid.
+		{"several spaces after the scheme", "Authorization", "Bearer   gw_good"},
 		{"anthropic", "X-Api-Key", "gw_good"},
 		{"gemini", "X-Goog-Api-Key", "gw_good"},
 	}

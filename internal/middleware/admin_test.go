@@ -23,11 +23,12 @@ func serveAdmin(adminKey, authorization string) (rec *httptest.ResponseRecorder,
 }
 
 func TestAdminAuthAcceptsAdminKey(t *testing.T) {
-	// The auth scheme is case-insensitive (RFC 9110 §11.1).
-	for _, scheme := range []string{"Bearer", "bearer"} {
-		rec, reached := serveAdmin(testAdminKey, scheme+" "+testAdminKey)
+	// The auth scheme is case-insensitive (RFC 9110 §11.1), and RFC 6750
+	// allows one or more spaces after it.
+	for _, prefix := range []string{"Bearer ", "bearer ", "Bearer   "} {
+		rec, reached := serveAdmin(testAdminKey, prefix+testAdminKey)
 		if !reached {
-			t.Errorf("%s admin key rejected: status %d, body %s", scheme, rec.Code, rec.Body)
+			t.Errorf("%q + admin key rejected: status %d, body %s", prefix, rec.Code, rec.Body)
 		}
 	}
 }
@@ -47,7 +48,8 @@ func TestAdminAuthRejects(t *testing.T) {
 		{"key plus suffix", "Bearer " + testAdminKey + "x"},
 		// Exact means exact: no trimming of what was presented.
 		{"key plus non-breaking space", "Bearer " + testAdminKey + "\u00a0"},
-		{"extra space before key", "Bearer  " + testAdminKey},
+		{"non-breaking space before key", "Bearer \u00a0" + testAdminKey},
+		{"tab before key", "Bearer \t" + testAdminKey},
 		{"other scheme", "Basic " + testAdminKey},
 		{"empty bearer", "Bearer "},
 	}

@@ -86,14 +86,14 @@ func credential(h http.Header) string {
 // it isn't a Bearer credential. The auth scheme is case-insensitive (RFC 9110
 // §11.1); any other scheme, such as Basic, doesn't carry a key.
 //
-// The token is returned exactly as sent, not trimmed: net/http already strips
-// the spaces and tabs around a header value, and trimming further (say, a
-// trailing non-breaking space) would let a credential that isn't the key
-// match it.
+// RFC 6750 allows one or more spaces after "Bearer", so those are skipped.
+// Nothing else is trimmed: net/http already strips the spaces and tabs around
+// a header value, and trimming further (a tab, a non-breaking space) would
+// let a credential that isn't the key match it.
 func bearerToken(authorization string) string {
 	scheme, token, ok := strings.Cut(authorization, " ")
 	if ok && strings.EqualFold(scheme, "Bearer") {
-		return token
+		return strings.TrimLeft(token, " ")
 	}
 	return ""
 }
