@@ -78,6 +78,18 @@ func Meter(resp *http.Response, format provider.Format, done Callback) {
 	}
 }
 
+// Unanswered is the Result for a request that got no response from the
+// provider: a timeout, an unreachable provider, or a client that gave up
+// first. The provider may still have received and billed it, so it is
+// reported as incomplete, with unknown usage.
+func Unanswered(ctx context.Context, status int) Result {
+	r := Result{Status: status}
+	if req, ok := RequestFrom(ctx); ok {
+		r.Model, r.Streamed = req.Model, req.Stream
+	}
+	return r
+}
+
 type meteredBody struct {
 	body   io.ReadCloser
 	parser parser // nil: the format has no parser, report no usage

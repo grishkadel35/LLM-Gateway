@@ -592,3 +592,53 @@ func TestMeteredStreamIsNotBuffered(t *testing.T) {
 		t.Fatal("usage callback never ran")
 	}
 }
+
+// TestFailedRequestsAreMetered: a request that got no response may still
+// have reached the provider, and be billed (a timeout or a client giving up
+// after the provider started generating). Each one is reported to onUsage,
+// marked incomplete, so it leaves a row with unknown cost rather than none.
+func TestFailedRequestsAreMetered(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+	defer slow.Close()
+	defer close(release)
+
+	cases := []struct {
+		name       string
+		url        string
+		timeout    time.Duration
+		cancel     bool
+		wantStatus int
+	}{
+		{"unreachable", deadURL, 5 * time.Second, false, http.StatusBadGateway},
+		{"timeout", slow.URL, 50 * time.Millisecond, false, http.StatusGatewayTimeout},
+		{"client cancel", slow.URL, 5 * time.Second, true, StatusClientClosedRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProvider(t, tc.url)
+			p.Timeout = tc.timeout
+			var got []usage.Result
+			h := New(p, discardLogger(), func(_ context.Context, r usage.Result) { got = append(got, r) })
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if tc.cancel {
+				ctx, cancel := context.WithCancel(context.Background())
+				time.AfterFunc(50*time.Millisecond, cancel)
+				req = req.WithContext(ctx)
+			}
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if len(got) != 1 {
+				t.Fatalf("onUsage ran %d times, want once", len(got))
+			}
+			if got[0].Status != tc.wantStatus || got[0].Complete || got[0].Usage.Tokens() != 0 {
+				t.Errorf("result = %+v, want status %d, incomplete, no tokens", got[0], tc.wantStatus)
+			}
+		})
+	}
+}

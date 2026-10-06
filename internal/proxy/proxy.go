@@ -27,7 +27,7 @@ func New(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) *http
 	return &httputil.ReverseProxy{
 		Rewrite:        rewrite(p),
 		ModifyResponse: modifyResponse(p, logger, onUsage),
-		ErrorHandler:   errorHandler(p, logger),
+		ErrorHandler:   errorHandler(p, logger, onUsage),
 		Transport:      transport(p.Timeout),
 	}
 }
@@ -125,11 +125,17 @@ const StatusClientClosedRequest = 499
 // failure, connection refused, timeout, or the client giving up first).
 // Without it, ReverseProxy logs to stderr and returns a bare 502 with an empty
 // body; clients deserve JSON.
-func errorHandler(p provider.Provider, logger *slog.Logger) func(http.ResponseWriter, *http.Request, error) {
+//
+// Each case is also reported to onUsage: the provider may have received the
+// request and billed it, so it must leave a usage row, with unknown cost.
+func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		// The client went away, so nobody will read a response. It isn't an
 		// upstream failure either, so it doesn't belong at ERROR level.
 		if errors.Is(err, context.Canceled) {
+			if onUsage != nil {
+				onUsage(r.Context(), usage.Unanswered(r.Context(), StatusClientClosedRequest))
+			}
 			logger.Info("client closed request before upstream responded",
 				"provider", p.Name,
 				"method", r.Method,
@@ -142,6 +148,10 @@ func errorHandler(p provider.Provider, logger *slog.Logger) func(http.ResponseWr
 		status, errType, message := http.StatusBadGateway, "upstream_unavailable", "the gateway could not reach the upstream provider"
 		if isTimeout(err) {
 			status, errType, message = http.StatusGatewayTimeout, "upstream_timeout", "the upstream provider did not respond in time"
+		}
+
+		if onUsage != nil {
+			onUsage(r.Context(), usage.Unanswered(r.Context(), status))
 		}
 
 		logger.Error("upstream request failed",

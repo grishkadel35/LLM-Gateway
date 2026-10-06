@@ -35,7 +35,9 @@ next.
   provider's own request ID, tenant, key, provider, model, endpoint, status,
   tokens, cost in micro-dollars (NULL, with a warning, for an unpriced model or
   a response whose usage is incomplete),
-  whether it streamed, and latency. Rows are queued and batch-inserted every
+  whether it streamed, and latency. A request that got no response (timeout,
+  unreachable provider, client gone) still leaves a row, with status
+  499/502/504 and NULL cost: the provider may have billed it. Rows are queued and batch-inserted every
   100 rows or second, off the response path: a full queue drops a row (logged
   and counted) rather than slow a response down, and shutdown drains the
   queue. This replaces the interim `usage` log line.
