@@ -2,12 +2,12 @@ package middleware
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 )
 
@@ -60,7 +60,7 @@ func Auth(keys KeyLookup, logger *slog.Logger) func(http.Handler) http.Handler {
 				// Not a 401: the key may be fine, and the client shouldn't go
 				// rotating it because the database is down.
 				logger.Error("key lookup failed", "error", err)
-				writeError(w, http.StatusServiceUnavailable, "auth_unavailable", "could not verify the API key; retry shortly")
+				apierror.Write(w, http.StatusServiceUnavailable, "auth_unavailable", "could not verify the API key; retry shortly", nil)
 				return
 			}
 
@@ -105,13 +105,5 @@ func unauthorized(w http.ResponseWriter, message string) {
 func unauthorizedAs(w http.ResponseWriter, errType, message string) {
 	// A 401 must say how to authenticate (RFC 9110 §15.5.2).
 	w.Header().Set("WWW-Authenticate", "Bearer")
-	writeError(w, http.StatusUnauthorized, errType, message)
-}
-
-func writeError(w http.ResponseWriter, status int, errType, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"type": errType, "message": message},
-	})
+	apierror.Write(w, http.StatusUnauthorized, errType, message, nil)
 }

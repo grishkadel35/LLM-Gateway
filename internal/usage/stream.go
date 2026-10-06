@@ -57,7 +57,7 @@ func Meter(resp *http.Response, format provider.Format, done Callback) {
 	}
 
 	ctx := resp.Request.Context()
-	sse := isEventStream(resp)
+	sse := IsEventStream(resp)
 	req, _ := RequestFrom(ctx)
 	if req == nil {
 		req = &Request{}
@@ -209,8 +209,12 @@ func (m *meteredBody) finish(complete bool) {
 	})
 }
 
-// isEventStream reports whether resp is a server-sent event stream.
-func isEventStream(resp *http.Response) bool {
+// IsEventStream reports whether resp is a server-sent event stream, which is
+// how every supported provider delivers streamed completions.
+//
+// Go note: mime.ParseMediaType drops parameters like "; charset=utf-8" and
+// lowercases the type, so we compare only the media type itself.
+func IsEventStream(resp *http.Response) bool {
 	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	return err == nil && mediaType == "text/event-stream"
 }

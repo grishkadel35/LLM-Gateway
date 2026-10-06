@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/provider"
 )
 
@@ -59,11 +60,11 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 			if err != nil {
 				var tooLarge *http.MaxBytesError
 				if errors.As(err, &tooLarge) {
-					writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-						"request body is larger than the gateway's limit of "+formatBytes(maxBytes))
+					apierror.Write(w, http.StatusRequestEntityTooLarge, "request_too_large",
+						"request body is larger than the gateway's limit of "+formatBytes(maxBytes), nil)
 					return
 				}
-				writeError(w, http.StatusBadRequest, "invalid_request", "could not read the request body")
+				apierror.Write(w, http.StatusBadRequest, "invalid_request", "could not read the request body", nil)
 				return
 			}
 
@@ -140,12 +141,4 @@ func formatBytes(n int64) string {
 		return strconv.FormatInt(n/mib, 10) + " MiB"
 	}
 	return strconv.FormatInt(n, 10) + " bytes"
-}
-
-func writeError(w http.ResponseWriter, status int, errType, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]any{"type": errType, "message": message},
-	})
 }

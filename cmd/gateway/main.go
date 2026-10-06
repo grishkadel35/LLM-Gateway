@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -23,6 +22,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"github.com/grishkadel/llm-gateway/internal/admin"
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
@@ -136,16 +136,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 // misspelled base URL.
 func unknownProvider(names []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"type":      "unknown_provider",
-				"message":   "no provider matches this path; point your client's base URL at /<provider>",
-				"providers": names,
-			},
-		})
+		apierror.Write(w, http.StatusNotFound, "unknown_provider",
+			"no provider matches this path; point your client's base URL at /<provider>",
+			map[string]any{"providers": names})
 	})
 }
 

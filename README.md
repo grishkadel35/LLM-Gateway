@@ -456,6 +456,7 @@ internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
 internal/admin/           admin API: create tenants, issue and revoke keys
+internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
 deployments/              docker compose dev stack (Postgres)
 .github/workflows/ci.yml  vet + race-enabled tests against Postgres

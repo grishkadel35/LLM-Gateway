@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -41,7 +42,7 @@ func Handler(store Store, logger *slog.Logger) http.Handler {
 	// Everything else under /admin/, wrong methods included, gets a JSON 404
 	// rather than ServeMux's plain-text 404 or 405.
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotFound, "not_found", "no such admin endpoint")
+		apierror.Write(w, http.StatusNotFound, "not_found", "no such admin endpoint", nil)
 	})
 	return mux
 }
@@ -101,12 +102,12 @@ func (a *api) createTenant(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", `body must be JSON: {"name": "..."}`)
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", `body must be JSON: {"name": "..."}`, nil)
 		return
 	}
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
-		writeError(w, http.StatusBadRequest, "invalid_request", "name must not be empty")
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", "name must not be empty", nil)
 		return
 	}
 
@@ -126,7 +127,7 @@ func (a *api) issueKey(w http.ResponseWriter, r *http.Request) {
 
 	key, err := a.store.IssueKey(r.Context(), tenantID)
 	if errors.Is(err, tenant.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "not_found", "no tenant with that ID")
+		apierror.Write(w, http.StatusNotFound, "not_found", "no tenant with that ID", nil)
 		return
 	}
 	if err != nil {
@@ -142,13 +143,13 @@ func (a *api) issueKey(w http.ResponseWriter, r *http.Request) {
 func (a *api) revokeKey(w http.ResponseWriter, r *http.Request) {
 	keyID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil || keyID <= 0 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "key ID must be a positive integer")
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", "key ID must be a positive integer", nil)
 		return
 	}
 
 	err = a.store.RevokeKey(r.Context(), keyID)
 	if errors.Is(err, tenant.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "not_found", "no key with that ID")
+		apierror.Write(w, http.StatusNotFound, "not_found", "no key with that ID", nil)
 		return
 	}
 	if err != nil {
@@ -175,20 +176,20 @@ func (a *api) tenantUsage(w http.ResponseWriter, r *http.Request) {
 		}
 		parsed, err := time.Parse(time.RFC3339, v)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, "invalid_request", name+" must be an RFC 3339 time, such as 2026-10-01T00:00:00Z")
+			apierror.Write(w, http.StatusBadRequest, "invalid_request", name+" must be an RFC 3339 time, such as 2026-10-01T00:00:00Z", nil)
 			return
 		}
 		*t = parsed.UTC()
 	}
 	if !from.Before(to) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "from must be before to")
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", "from must be before to", nil)
 		return
 	}
 
 	tenantID := r.PathValue("id")
 	summary, err := a.store.TenantUsage(r.Context(), tenantID, from, to)
 	if errors.Is(err, tenant.ErrNotFound) {
-		writeError(w, http.StatusNotFound, "not_found", "no tenant with that ID")
+		apierror.Write(w, http.StatusNotFound, "not_found", "no tenant with that ID", nil)
 		return
 	}
 	if err != nil {
@@ -209,7 +210,7 @@ func (a *api) tenantUsage(w http.ResponseWriter, r *http.Request) {
 // database hosts or SQL.
 func (a *api) internalError(w http.ResponseWriter, action string, err error) {
 	a.logger.Error("admin request failed", "action", action, "error", err)
-	writeError(w, http.StatusInternalServerError, "internal_error", "the request failed; see the gateway log")
+	apierror.Write(w, http.StatusInternalServerError, "internal_error", "the request failed; see the gateway log", nil)
 }
 
 // writeSecret writes a 201 whose body carries a key's plaintext. no-store
@@ -217,12 +218,6 @@ func (a *api) internalError(w http.ResponseWriter, action string, err error) {
 func writeSecret(w http.ResponseWriter, v any) {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusCreated, v)
-}
-
-func writeError(w http.ResponseWriter, status int, errType, message string) {
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{"type": errType, "message": message},
-	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

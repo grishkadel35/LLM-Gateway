@@ -4,15 +4,14 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
-	"mime"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"time"
 
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/provider"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -97,23 +96,13 @@ func modifyResponse(p provider.Provider, logger *slog.Logger, onUsage usage.Call
 			// ordinary JSON replies too.
 			"content_length", resp.ContentLength,
 			"content_type", resp.Header.Get("Content-Type"),
-			"streaming", isEventStream(resp),
+			"streaming", usage.IsEventStream(resp),
 		)
 		if onUsage != nil {
 			usage.Meter(resp, p.Format, onUsage)
 		}
 		return nil
 	}
-}
-
-// isEventStream reports whether resp is a server-sent event stream, which is
-// how every supported provider delivers streamed completions.
-//
-// Go note: mime.ParseMediaType drops parameters like "; charset=utf-8" and
-// lowercases the type, so we compare only the media type itself.
-func isEventStream(resp *http.Response) bool {
-	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	return err == nil && mediaType == "text/event-stream"
 }
 
 // StatusClientClosedRequest is recorded when the client disconnects before the
@@ -162,19 +151,7 @@ func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callba
 			"error", err,
 		)
 
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-
-		// Go note: we ignore the encode error with `_ =` because the client has
-		// likely gone away if this fails, and there's nothing useful left to do.
-		// Go makes you write that out — an ignored error is always visible.
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]string{
-				"type":     errType,
-				"provider": p.Name,
-				"message":  message,
-			},
-		})
+		apierror.Write(w, status, errType, message, map[string]any{"provider": p.Name})
 	}
 }
 

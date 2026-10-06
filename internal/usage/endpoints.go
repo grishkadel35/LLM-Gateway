@@ -6,10 +6,10 @@
 package usage
 
 import (
-	"encoding/json"
 	"net/http"
 	"regexp"
 
+	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/provider"
 )
 
@@ -47,15 +47,9 @@ func RequireMetered(format provider.Format) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if !Metered(format, r.Method, r.URL.Path) {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusForbidden)
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"error": map[string]any{
-						"type": "unmetered_endpoint",
-						"message": r.Method + " " + r.URL.Path + " is not a metered endpoint for " + string(format) +
-							"-format providers; the gateway only forwards endpoints whose token usage it can record",
-					},
-				})
+				apierror.Write(w, http.StatusForbidden, "unmetered_endpoint",
+					r.Method+" "+r.URL.Path+" is not a metered endpoint for "+string(format)+
+						"-format providers; the gateway only forwards endpoints whose token usage it can record", nil)
 				return
 			}
 			next.ServeHTTP(w, r)
