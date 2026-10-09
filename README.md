@@ -25,6 +25,12 @@ next.
 
 ### What changed
 
+- **Token bucket in Redis (not wired in yet).** `internal/ratelimit` keeps each
+  tenant's tokens-per-minute bucket in Redis. Admission and refunds each run as
+  one Lua script on Redis's clock, so concurrent requests can't spend the same
+  tokens and replicas agree on time. A request bigger than a whole minute's
+  limit gets in on a full bucket and leaves the tenant in debt. A bucket's key
+  expires only when it would be full again, so expiry never forgives debt.
 - **Token estimate per request.** Before forwarding, the gateway estimates a
   request's tokens from its body: one per 4 bytes of text (system prompt, tools
   and every other field included), plus a flat 1,600 per image, audio,
@@ -327,13 +333,16 @@ buckets are disposable: losing them only refills every tenant. It has no
 password either, so binding to loopback is what keeps it private.
 
 The Postgres tests only run when `DATABASE_URL` is set, and each creates and
-drops its own throwaway database, so they never touch dev data:
+drops its own throwaway database, so they never touch dev data. The Redis
+tests likewise need `REDIS_URL`; they share one Redis, each under its own
+random tenant ID:
 
 ```sh
-DATABASE_URL='postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable' go test -race ./...
+DATABASE_URL='postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable' \
+REDIS_URL='redis://127.0.0.1:6379/0' go test -race ./...
 ```
 
-Without it, `go test ./...` skips them and needs nothing running.
+Without them, `go test ./...` skips those tests and needs nothing running.
 
 ## Configuration
 
@@ -468,6 +477,8 @@ cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
+internal/ratelimit/       per-tenant token bucket in Redis (Lua scripts)
+internal/redistest/       Redis client for tests
 internal/admin/           admin API: create tenants, issue and revoke keys
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
