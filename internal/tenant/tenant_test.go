@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 )
@@ -77,6 +79,51 @@ func TestCreateIssuesAWorkingKey(t *testing.T) {
 	}
 	if got.ID != tn.ID || gotKey.ID != key.ID || gotKey.Prefix != key.Prefix || gotKey.TenantID != tn.ID {
 		t.Errorf("Lookup = %+v, %+v; want tenant %q, key %d", got, gotKey, tn.ID, key.ID)
+	}
+}
+
+// TestLimitsMustBePositive checks the CHECK constraints from migration 00002:
+// the rate limiter divides by the limit, and the default cap is the output
+// assumed for a request that sets none, so neither may be zero or negative.
+func TestLimitsMustBePositive(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	// The defaults satisfy the constraints, so a new tenant still inserts.
+	tn, _, err := s.Create(ctx, "acme")
+	if err != nil {
+		t.Fatalf("creating a tenant with the default limits: %v", err)
+	}
+
+	const checkViolation = "23514"
+	for _, col := range []struct{ name, constraint string }{
+		{"rate_limit_tokens_per_min", "tenants_rate_limit_tokens_per_min_positive"},
+		{"default_max_tokens", "tenants_default_max_tokens_positive"},
+	} {
+		for _, value := range []int{0, -1} {
+			// A column name can't be a query parameter; col.name is from the list above.
+			_, err := s.db.ExecContext(ctx, `UPDATE tenants SET `+col.name+` = $1 WHERE id = $2`, value, tn.ID)
+
+			// Go note: database/sql returns the driver's own error value, and
+			// errors.As reaches it even when it is wrapped. The target is a pointer
+			// to a variable of the wanted type, here the pgx driver's
+			// *pgconn.PgError, so the call takes &pgErr. Postgres tags every error
+			// with a five-character SQLSTATE code; testing that is sturdier than
+			// matching the message text.
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != checkViolation {
+				t.Errorf("setting %s to %d: error = %v, want a check violation (SQLSTATE %s)", col.name, value, err, checkViolation)
+			} else if pgErr.ConstraintName != col.constraint {
+				t.Errorf("setting %s to %d: violated %q, want %q", col.name, value, pgErr.ConstraintName, col.constraint)
+			}
+		}
+	}
+
+	// One is the smallest valid limit, so the checks are > 0, not > 1.
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE tenants SET rate_limit_tokens_per_min = 1, default_max_tokens = 1 WHERE id = $1`, tn.ID,
+	); err != nil {
+		t.Errorf("setting both limits to 1: %v", err)
 	}
 }
 
