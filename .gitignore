@@ -26,3 +26,6 @@ llm-gateway-roadmap.md
 
 # graphify knowledge graph output (regenerate with /graphify)
 /graphify-out/
+
+# Personal Claude Code settings
+.claude/settings.local.json
