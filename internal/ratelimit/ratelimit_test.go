@@ -167,8 +167,29 @@ func TestOversizeRequestWaitsForAFullBucket(t *testing.T) {
 	mustAllow(t, l, tenant, 100_000, 30_000)
 	// 30,000 tokens to refill: 18 s.
 	mustRefuse(t, l, tenant, 100_000, 150_000, 18*time.Second)
-	if got := balance(t, rdb, tenant); got != 70_000 {
-		t.Errorf("balance = %v, want 70000: a refusal charges nothing", got)
+	if got := balance(t, rdb, tenant); got < 70_000 || got >= 71_000 {
+		t.Errorf("balance = %v, want 70000 plus refill: a refusal charges nothing", got)
+	}
+}
+
+func TestRefusalAfterLoweringLimitPreservesDebt(t *testing.T) {
+	ctx := context.Background()
+	l, rdb, tenant := newBucket(t)
+	mustAllow(t, l, tenant, 100_000, 150_000)
+	if got := ttlSeconds(t, rdb, tenant); got != 90 {
+		t.Fatalf("initial TTL = %d s, want 90", got)
+	}
+
+	mustRefuse(t, l, tenant, 1_000, 1_000, 3060*time.Second)
+	ttl, err := rdb.PTTL(ctx, key(tenant)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 3060 * time.Second; ttl > want || ttl <= want-500*time.Millisecond {
+		t.Errorf("TTL after lowering limit = %v, want just under %v", ttl, want)
+	}
+	if got := balance(t, rdb, tenant); got <= -50_000 || got >= -49_999 {
+		t.Errorf("balance = %v, want -50000 plus refill without a charge", got)
 	}
 }
 

@@ -6,7 +6,8 @@
 -- ARGV[2]  cost: the request's tokens
 --
 -- Returns 0 when the request is admitted and charged, otherwise the whole
--- seconds until the bucket could admit it. A refusal changes nothing.
+-- seconds until the bucket could admit it. A refusal charges nothing, but
+-- saves the refill and expiry at the current limit.
 
 local key = KEYS[1]
 local limit = tonumber(ARGV[1])
@@ -29,15 +30,16 @@ tokens = math.min(limit, tokens + math.max(0, now - ts) * limit / 60)
 -- A request bigger than the limit needs only a full bucket, or it could
 -- never get in.
 local need = math.min(cost, limit)
+local wait = 0
 if tokens < need then
   -- Redis truncates a number a script returns to an integer, so round up
   -- here. need > tokens, so the wait is at least 1.
-  return math.ceil((need - tokens) * 60 / limit)
+  wait = math.ceil((need - tokens) * 60 / limit)
+else
+  -- Charge the full cost. The balance may go negative: debt, which holds back
+  -- the next request until the refill has paid it off.
+  tokens = tokens - cost
 end
-
--- Charge the full cost. The balance may go negative: debt, which holds back
--- the next request until the refill has paid it off.
-tokens = tokens - cost
 
 -- Redis formats the numbers passed to redis.call itself: whole ones as
 -- integers, the rest with every digit needed to read back the same number.
@@ -49,8 +51,8 @@ redis.call('HSET', key, 'tokens', tokens, 'ts', now)
 -- would delete the key at once.
 --
 -- Redis doesn't roll back the write above if this fails, so it mustn't. It
--- can't: Go caps cost at MaxCost, and the balance covered min(cost, limit)
--- before the charge, so it is still above -MaxCost, and the expiry is one
--- EXPIRE accepts.
+-- can't: Go caps cost at MaxCost, and an admitted request's balance covered
+-- min(cost, limit) before the charge. Existing debt is at most MaxCost, so
+-- either path leaves an expiry EXPIRE accepts.
 redis.call('EXPIRE', key, math.max(1, math.ceil((limit - tokens) * 60 / limit)))
-return 0
+return wait
