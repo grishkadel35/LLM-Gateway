@@ -29,6 +29,15 @@ type Request struct {
 	// Received is when ReadBody started on the request, which latency and
 	// the usage row's time count from.
 	Received time.Time
+	// InputEstimate is the request's input tokens, guessed from the client's
+	// body before any provider has counted them: ceil((body bytes - media
+	// payload bytes) / 4) + 1,600 for each media part (image, audio, document
+	// or file), whose payload is left out of the /4. A body that isn't a JSON
+	// object is ceil(bytes / 4).
+	InputEstimate int64
+	// OutputCap is the output limit the client set, times the number of
+	// choices it asked for (n, candidateCount); 0 when it set none.
+	OutputCap int64
 }
 
 type requestKey struct{}
@@ -45,10 +54,13 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 // It reads the body once, up to maxBytes (413 request_too_large beyond
 // that), and decodes it into map[string]json.RawMessage, so unknown fields
 // and integers too large for a float64 pass through untouched. Every rewrite
-// goes through here: for now, forcing stream_options.include_usage on for
-// OpenAI-format streams, and from Week 3 the default output cap. When nothing
-// is rewritten, the provider receives the client's exact bytes. A body that
-// isn't JSON is forwarded unchanged for the provider to reject.
+// goes through here: for now, only forcing stream_options.include_usage on for
+// OpenAI-format streams. When nothing is rewritten, the provider receives the
+// client's exact bytes. A body that isn't JSON is forwarded unchanged for the
+// provider to reject.
+//
+// It also records the request's InputEstimate and OutputCap. They are read
+// from the client's bytes and never change the body.
 //
 // It expects the provider-relative path, after StripPrefix: Gemini keeps the
 // model and the stream flag in the URL.
@@ -70,7 +82,11 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 
 			req := &Request{Path: r.URL.Path, Received: received}
 			var fields map[string]json.RawMessage
-			if json.Unmarshal(body, &fields) == nil {
+			decoded := json.Unmarshal(body, &fields) == nil
+			// Before the rewrite below, so it sizes the client's request. fields
+			// is nil unless the body is a JSON object.
+			req.InputEstimate, req.OutputCap = estimate(format, body, fields)
+			if decoded {
 				req.Model, req.Stream = modelAndStream(format, r.URL.Path, fields)
 				if format == provider.FormatOpenAI && req.Stream && includeUsage(fields) {
 					if rewritten, err := json.Marshal(fields); err == nil {

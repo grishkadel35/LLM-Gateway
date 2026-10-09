@@ -25,6 +25,15 @@ next.
 
 ### What changed
 
+- **Token estimate per request.** Before forwarding, the gateway estimates a
+  request's tokens from its body: one per 4 bytes of text (system prompt, tools
+  and every other field included), plus a flat 1,600 per image, audio,
+  document or file part, whose base64 payload is left out. Counted as text, a
+  1 MB image would come to ~350,000 tokens. It also reads the output limit the
+  client set (`max_completion_tokens` or `max_tokens` × `n`, Anthropic
+  `max_tokens`, Gemini `maxOutputTokens` × `candidateCount`). The body is never
+  changed for this. The Week 3 rate limiter admits requests against the
+  estimate, then corrects it to the provider's own count.
 - **Usage reports.** `GET /admin/tenants/{id}/usage?from=&to=` sums a
   tenant's usage over a period (RFC 3339, default: the current UTC month):
   totals plus a breakdown by provider and model, with `unpriced_requests`

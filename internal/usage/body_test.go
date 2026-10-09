@@ -212,3 +212,60 @@ func TestReadBodyRecordsPathAndTime(t *testing.T) {
 		t.Errorf("Received = %v, want the time ReadBody ran", got.req.Received)
 	}
 }
+
+// TestReadBodyEstimatesRequest: rate limiting needs a request's input size and
+// output limit before the provider answers, wherever each format keeps them.
+// Estimating never rewrites the body.
+func TestReadBodyEstimatesRequest(t *testing.T) {
+	openAI := `{"model":"gpt-4o","max_tokens":100,"n":2,"messages":[{"role":"user","content":"hi"}]}`
+	anthropic := `{"model":"claude-sonnet-4","max_tokens":512,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}`
+	gemini := `{"contents":[{"parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":300,"candidate_count":2}}`
+	malformed := `{"model":"gpt-4o","max_tokens":100`
+
+	cases := []struct {
+		name       string
+		format     provider.Format
+		path, body string
+		input      int64
+		outputCap  int64
+	}{
+		{"openai", provider.FormatOpenAI, "/v1/chat/completions", openAI, ceilQuarter(len(openAI)), 200},
+		// The image's payload is left out of the /4, and the part costs a flat
+		// 1,600 tokens.
+		{"anthropic with an image", provider.FormatAnthropic, "/v1/messages", anthropic,
+			1600 + ceilQuarter(len(anthropic)-len("image")-len("base64")-len("image/png")-len("iVBORw0KGgo=")), 512},
+		{"gemini", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", gemini, ceilQuarter(len(gemini)), 600},
+		{"malformed", provider.FormatOpenAI, "/v1/chat/completions", malformed, ceilQuarter(len(malformed)), 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := serveBody(t, tc.format, limit, tc.path, tc.body)
+			if got.req == nil {
+				t.Fatal("RequestFrom() found nothing")
+			}
+			if got.req.InputEstimate != tc.input || got.req.OutputCap != tc.outputCap {
+				t.Errorf("InputEstimate, OutputCap = %d, %d; want %d, %d", got.req.InputEstimate, got.req.OutputCap, tc.input, tc.outputCap)
+			}
+			if got.body != tc.body {
+				t.Errorf("forwarded body = %q, want the client's bytes %q", got.body, tc.body)
+			}
+		})
+	}
+}
+
+// TestReadBodyEstimatesClientBytes: forcing include_usage on adds bytes to the
+// forwarded body but nothing to the prompt, so the estimate counts what the
+// client sent.
+func TestReadBodyEstimatesClientBytes(t *testing.T) {
+	body := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	_, got := serveBody(t, provider.FormatOpenAI, limit, "/v1/chat/completions", body)
+
+	if ceilQuarter(len(got.body)) == ceilQuarter(len(body)) {
+		t.Fatalf("forwarded body is %d bytes against the client's %d; want the include_usage rewrite to make a difference here", len(got.body), len(body))
+	}
+	if want := ceilQuarter(len(body)); got.req.InputEstimate != want {
+		t.Errorf("InputEstimate = %d, want %d, counted from the client's %d bytes", got.req.InputEstimate, want, len(body))
+	}
+}
