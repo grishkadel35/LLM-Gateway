@@ -195,7 +195,7 @@ metered too; otherwise `stream: true` would bypass every future limit.
 
 ## Quick start
 
-Start Postgres and create the schema (see [Database](#database)):
+Start Postgres and Redis and create the schema (see [Database](#database)):
 
 ```sh
 make db-up migrate
@@ -300,18 +300,22 @@ in-process with `httptest.NewServer(mockprovider.Handler())`.
 
 ### Database
 
-Postgres runs in Docker (any runtime works; on macOS, `brew install colima
-docker docker-compose` then `colima start` is enough):
+Postgres and Redis run in Docker (any runtime works; on macOS, `brew install
+colima docker docker-compose` then `colima start` is enough):
 
 ```sh
-make db-up      # Postgres 18 on 127.0.0.1:5432, waits until healthy
+make db-up      # Postgres 18 on 127.0.0.1:5432 and Redis 8 on 127.0.0.1:6379, waits until healthy
 make migrate    # apply pending migrations
-make db-down    # stop it; data survives in the llm-gateway_pgdata volume
+make db-down    # stop both; Postgres data survives in the llm-gateway_pgdata volume
 ```
 
 Migrations live in `internal/db/migrations` and are embedded into the binary,
 so a build always carries the schema its code expects. `make migrate` targets
 the compose database; pass `DATABASE_URL=postgres://...` to use another.
+
+Redis holds the rate-limit buckets (Week 3). It has no volume, because the
+buckets are disposable: losing them only refills every tenant. It has no
+password either, so binding to loopback is what keeps it private.
 
 The Postgres tests only run when `DATABASE_URL` is set, and each creates and
 drops its own throwaway database, so they never touch dev data:
@@ -431,8 +435,8 @@ rotation even though it is working fine.
 | `make run`      | Build, then run                        |
 | `make mock`     | Run the mock provider on :9090         |
 | `make run-mock` | Run the gateway against the mock       |
-| `make db-up`    | Start local Postgres (docker compose)  |
-| `make db-down`  | Stop local Postgres                    |
+| `make db-up`    | Start local Postgres and Redis         |
+| `make db-down`  | Stop local Postgres and Redis          |
 | `make migrate`  | Apply pending database migrations      |
 | `make test`     | Run all tests                          |
 | `make vet`      | Run `go vet` (catches suspicious code) |
@@ -458,8 +462,8 @@ internal/tenant/          tenants and API keys: issue, revoke, look up
 internal/admin/           admin API: create tenants, issue and revoke keys
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
-deployments/              docker compose dev stack (Postgres)
-.github/workflows/ci.yml  vet + race-enabled tests against Postgres
+deployments/              docker compose dev stack (Postgres, Redis)
+.github/workflows/ci.yml  vet + race-enabled tests against Postgres and Redis
 ```
 
 Routing costs no custom code: each provider is registered on `ServeMux` as

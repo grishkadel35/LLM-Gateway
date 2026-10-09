@@ -1,9 +1,9 @@
-# Local dev stack. Week 2: Postgres only; later weeks add Redis, Prometheus,
+# Local dev stack. Week 3: Postgres and Redis; later weeks add Prometheus,
 # Grafana and the gateway itself.
 #
-#   make db-up      # start Postgres and wait until it accepts connections
+#   make db-up      # start Postgres and Redis and wait until both are healthy
 #   make migrate    # apply schema migrations
-#   make db-down    # stop it (data survives in the pgdata volume)
+#   make db-down    # stop them (Postgres data survives in the pgdata volume)
 
 # Without a name, Compose would call the project "deployments", after this
 # file's directory.
@@ -26,6 +26,19 @@ services:
       - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "gateway", "-d", "gateway"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  redis:
+    image: redis:8-alpine
+    # Bound to loopback like Postgres, so nothing off this machine can reach it.
+    ports:
+      - "127.0.0.1:6379:6379"
+    # No volume: the rate-limit buckets are disposable, and losing them only
+    # refills every tenant.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       timeout: 5s
       retries: 15

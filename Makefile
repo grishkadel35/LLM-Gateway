@@ -5,6 +5,10 @@ PKG    := ./cmd/gateway
 #   make migrate DATABASE_URL=postgres://...
 DATABASE_URL ?= postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable
 
+# The compose Redis. Override to use another:
+#   make run REDIS_URL=redis://...
+REDIS_URL ?= redis://127.0.0.1:6379/0
+
 # Admin key for the mock setup only, where nothing real is at stake. `make run`
 # takes GATEWAY_ADMIN_KEY from your environment instead.
 MOCK_ADMIN_KEY := mock-admin-key-for-local-testing-only
@@ -19,7 +23,7 @@ build:
 	go build -o $(BINARY) $(PKG)
 
 run: build
-	DATABASE_URL='$(DATABASE_URL)' ./$(BINARY)
+	DATABASE_URL='$(DATABASE_URL)' REDIS_URL='$(REDIS_URL)' ./$(BINARY)
 
 # Fake OpenAI/Groq/Anthropic/Gemini on 127.0.0.1:9090. Pair with run-mock.
 mock:
@@ -29,10 +33,10 @@ mock:
 # compose database: make db-up migrate.
 run-mock: build
 	MOCK_API_KEY=mock GATEWAY_ADMIN_KEY=$(MOCK_ADMIN_KEY) DATABASE_URL='$(DATABASE_URL)' \
-		GATEWAY_CONFIG=config.mock.yaml ./$(BINARY)
+		REDIS_URL='$(REDIS_URL)' GATEWAY_CONFIG=config.mock.yaml ./$(BINARY)
 
-# Local Postgres from deployments/docker-compose.yml. --wait blocks until the
-# healthcheck passes, so `make db-up migrate` works in one go.
+# Local Postgres and Redis from deployments/docker-compose.yml. --wait blocks
+# until the healthchecks pass, so `make db-up migrate` works in one go.
 db-up:
 	docker compose -f deployments/docker-compose.yml up -d --wait
 
