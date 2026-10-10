@@ -5,6 +5,11 @@
 # API keys are NEVER written here. This file is committed to git. Keys are
 # environment references, expanded at startup; an unset variable is a startup
 # error, not a surprise 401 on the first request.
+#
+# A provider's url and timeout may be environment references too, and may
+# carry a default: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434} is the variable
+# when it is set and non-empty, the default otherwise. A key never takes a
+# default: that would be a literal key in git.
 
 # Port the gateway itself listens on.
 port: 8080
@@ -66,7 +71,7 @@ providers:
   # gateway key. The timeout is a response-header timeout, so it has to cover
   # a whole non-streaming generation, model load included.
   ollama:
-    url: http://127.0.0.1:11434
-    timeout: 120
+    url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+    timeout: ${OLLAMA_TIMEOUT_SECONDS:-120}
     auth: none
     format: openai

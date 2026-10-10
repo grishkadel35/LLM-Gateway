@@ -77,9 +77,12 @@ type Config struct {
 // This is the on-disk shape. Provider() turns it into a provider.Provider,
 // which is the parsed, ready-to-use form the rest of the gateway consumes.
 type ProviderConfig struct {
-	URL string `yaml:"url"`
-	// TimeoutSeconds is a plain int because that's what the YAML file holds.
-	TimeoutSeconds int `yaml:"timeout"`
+	// URL may be written as an environment reference with a default, such as
+	// ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}; see decodeEnv.
+	URL envString `yaml:"url"`
+	// TimeoutSeconds is an int, not a Duration, because that's what the YAML
+	// file holds. Like URL, it may be an environment reference.
+	TimeoutSeconds envInt `yaml:"timeout"`
 	// Key is written as an environment reference such as ${OPENAI_API_KEY}.
 	// Load expands it. config.yaml is committed to git, so a literal key must
 	// never be written here. With auth none there is no key, so it must be
@@ -151,8 +154,9 @@ func Load(path string) (*Config, error) {
 // resolve fills in per-provider defaults and expands API keys from the
 // environment.
 //
-// Only the key field is expanded, not the whole file: running os.ExpandEnv over
-// the raw YAML would also mangle any other value containing a `$`.
+// Only named fields are expanded, never the whole file: keys here, url and
+// timeout as they are decoded (decodeEnv). Running os.ExpandEnv over the raw
+// YAML would also mangle any other value containing a `$`.
 func (c *Config) resolve() error {
 	for name, pc := range c.Providers {
 		if pc.TimeoutSeconds == 0 {
@@ -207,6 +211,63 @@ func expandKey(name, raw string) (string, error) {
 	return value, nil
 }
 
+// fieldRef matches a value written as exactly one environment reference with
+// an optional default, such as ${OLLAMA_TIMEOUT_SECONDS:-120}. It captures the
+// variable name and, if there is one, ":-" and the default.
+var fieldRef = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)(:-[^}]*)?\}$`)
+
+// envString is a string field that may be written as an environment
+// reference; see decodeEnv.
+type envString string
+
+// envInt is an int field that may be written as an environment reference;
+// see decodeEnv.
+type envInt int
+
+// UnmarshalYAML decodes s with decodeEnv.
+//
+// Go note: implementing yaml.Unmarshaler hooks the decoding of each field of
+// this type, while the Decoder's KnownFields check still covers the mapping
+// around it. Decoding into (*string)(s) rather than s matters: s has this
+// method, so decoding into it would call this method again, forever.
+func (s *envString) UnmarshalYAML(n *yaml.Node) error { return decodeEnv(n, (*string)(s)) }
+
+// UnmarshalYAML decodes i with decodeEnv.
+func (i *envInt) UnmarshalYAML(n *yaml.Node) error { return decodeEnv(n, (*int)(i)) }
+
+// decodeEnv decodes n into out, expanding it first if it is one whole
+// environment reference: ${VAR}, or ${VAR:-default}, which as in the shell
+// takes the default when VAR is unset or empty. ${VAR} with VAR unset or
+// empty is an error, so a missing setting fails at startup.
+//
+// The expansion is decoded as if written in the file unquoted, even when the
+// reference was quoted: ${OLLAMA_TIMEOUT_SECONDS:-120} is an int, and a bad
+// value is the usual type error with its line number. Anything that isn't one
+// whole reference, such as http://${HOST} or $VAR, is the literal it looks
+// like.
+//
+// n.Decode runs a fresh decoder without KnownFields. That is harmless here:
+// KnownFields only checks mappings, and neither field type is one.
+func decodeEnv(n *yaml.Node, out any) error {
+	if m := fieldRef.FindStringSubmatch(n.Value); m != nil {
+		value := os.Getenv(m[1])
+		if value == "" {
+			def, ok := strings.CutPrefix(m[2], ":-")
+			if !ok {
+				return fmt.Errorf("line %d: environment variable %s is unset or empty, and %s has no default", n.Line, m[1], n.Value)
+			}
+			value = def
+		}
+		// A copy, so the decoder's own tree is untouched. With no Tag or
+		// Style, the value's type is resolved from its text, as for a plain
+		// scalar; a quoted style would force a string.
+		plain := *n
+		plain.Value, plain.Tag, plain.Style = value, "", 0
+		n = &plain
+	}
+	return n.Decode(out)
+}
+
 // Validate checks that the config makes sense before we try to serve traffic.
 // Failing loudly at startup beats a confusing error on the first request.
 func (c *Config) Validate() error {
@@ -243,7 +304,7 @@ func (pc ProviderConfig) validate(name string) error {
 	if pc.URL == "" {
 		return fmt.Errorf("provider %q: url must not be empty", name)
 	}
-	u, err := url.Parse(pc.URL)
+	u, err := url.Parse(string(pc.URL))
 	if err != nil {
 		return fmt.Errorf("provider %q: url is not valid: %w", name, err)
 	}
@@ -292,7 +353,7 @@ func (c *Config) BuildProviders() ([]provider.Provider, error) {
 	for _, name := range names {
 		pc := c.Providers[name]
 
-		u, err := url.Parse(pc.URL)
+		u, err := url.Parse(string(pc.URL))
 		if err != nil {
 			return nil, fmt.Errorf("provider %q: url is not valid: %w", name, err)
 		}

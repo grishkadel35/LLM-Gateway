@@ -170,6 +170,85 @@ providers:
 	}
 }
 
+// unsetenv removes name from the environment until the test ends.
+//
+// Go note: t.Setenv restores the variable's old value when the test ends, so
+// calling it first makes the Unsetenv temporary too.
+func unsetenv(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "")
+	os.Unsetenv(name)
+}
+
+// TestLoadExpandsFieldReferences: url and timeout may be written as ${VAR} or
+// ${VAR:-default}, which as in the shell takes the default when VAR is unset
+// or empty.
+func TestLoadExpandsFieldReferences(t *testing.T) {
+	cases := []struct {
+		name         string
+		env          map[string]string // TEST_URL and TEST_TIMEOUT are unset unless set here
+		url, timeout string            // as written in the file
+		wantURL      envString
+		wantTimeout  envInt
+		wantErr      string // a substring of Load's error, for a case that fails
+	}{
+		{name: "set", env: map[string]string{"TEST_URL": "http://10.0.0.5:11434", "TEST_TIMEOUT": "45"},
+			url: "${TEST_URL:-http://127.0.0.1:11434}", timeout: "${TEST_TIMEOUT:-120}",
+			wantURL: "http://10.0.0.5:11434", wantTimeout: 45},
+		{name: "unset takes the default",
+			url: "${TEST_URL:-http://127.0.0.1:11434}", timeout: "${TEST_TIMEOUT:-120}",
+			wantURL: "http://127.0.0.1:11434", wantTimeout: 120},
+		{name: "empty takes the default", env: map[string]string{"TEST_URL": "", "TEST_TIMEOUT": ""},
+			url: "${TEST_URL:-http://127.0.0.1:11434}", timeout: "${TEST_TIMEOUT:-120}",
+			wantURL: "http://127.0.0.1:11434", wantTimeout: 120},
+		{name: "no default, set", env: map[string]string{"TEST_URL": "http://10.0.0.5:11434", "TEST_TIMEOUT": "45"},
+			url: "${TEST_URL}", timeout: "${TEST_TIMEOUT}",
+			wantURL: "http://10.0.0.5:11434", wantTimeout: 45},
+		// Quoting a reference is natural YAML; it doesn't make the int a string.
+		{name: "quoted", env: map[string]string{"TEST_TIMEOUT": "45"},
+			url: "https://api.openai.com", timeout: `"${TEST_TIMEOUT:-120}"`,
+			wantURL: "https://api.openai.com", wantTimeout: 45},
+		// Only a whole-value reference is expanded.
+		{name: "partial reference stays literal", env: map[string]string{"TEST_URL": "v1"},
+			url: "https://api.openai.com/${TEST_URL}", timeout: "30",
+			wantURL: "https://api.openai.com/${TEST_URL}", wantTimeout: 30},
+		// Both errors carry the timeout's line, 4.
+		{name: "unset, no default", url: "https://api.openai.com", timeout: "${TEST_TIMEOUT}",
+			wantErr: "line 4: environment variable TEST_TIMEOUT is unset or empty"},
+		{name: "not an integer", env: map[string]string{"TEST_TIMEOUT": "2m"},
+			url: "https://api.openai.com", timeout: "${TEST_TIMEOUT:-120}",
+			wantErr: "line 4: cannot unmarshal"},
+	}
+
+	setTestKey(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetenv(t, "TEST_URL")
+			unsetenv(t, "TEST_TIMEOUT")
+			for name, value := range tc.env {
+				t.Setenv(name, value)
+			}
+
+			cfg, err := Load(writeConfig(t, "providers:\n  openai:\n    url: "+tc.url+"\n    timeout: "+tc.timeout+
+				"\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() = %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+
+			pc := cfg.Providers["openai"]
+			if pc.URL != tc.wantURL || pc.TimeoutSeconds != tc.wantTimeout {
+				t.Errorf("url, timeout = %q, %d; want %q, %d", pc.URL, pc.TimeoutSeconds, tc.wantURL, tc.wantTimeout)
+			}
+		})
+	}
+}
+
 // TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
 // configured with auth none and no key line at all.
 func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
@@ -199,8 +278,12 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	t.Setenv("ANTHROPIC_API_KEY", "sk-test")
 	t.Setenv("GEMINI_API_KEY", "sk-test")
 	t.Setenv("GROQ_API_KEY", "sk-test")
+	// Unset, Ollama's url and timeout take the defaults written in the file.
+	unsetenv(t, "OLLAMA_BASE_URL")
+	unsetenv(t, "OLLAMA_TIMEOUT_SECONDS")
 
-	cfg, err := Load(filepath.Join("..", "..", "config.yaml"))
+	path := filepath.Join("..", "..", "config.yaml")
+	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() on the repo's config.yaml returned error: %v", err)
 	}
@@ -218,8 +301,22 @@ func TestLoadOnRepoConfig(t *testing.T) {
 
 	// Groq's base path is what makes it a useful test case; don't let it be
 	// silently dropped from the committed config.
-	if url := cfg.Providers["groq"].URL; !strings.HasSuffix(url, "/openai") {
+	if url := string(cfg.Providers["groq"].URL); !strings.HasSuffix(url, "/openai") {
 		t.Errorf("groq url = %q, want it to keep its /openai base path", url)
+	}
+
+	ollama := cfg.Providers["ollama"]
+	if ollama.URL != "http://127.0.0.1:11434" || ollama.TimeoutSeconds != 120 {
+		t.Errorf("ollama url, timeout = %q, %d; want the defaults http://127.0.0.1:11434, 120", ollama.URL, ollama.TimeoutSeconds)
+	}
+
+	t.Setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load() with OLLAMA_BASE_URL set returned error: %v", err)
+	}
+	if got := cfg.Providers["ollama"].URL; got != "http://10.0.0.5:11434" {
+		t.Errorf("ollama url = %q, want OLLAMA_BASE_URL's %q", got, "http://10.0.0.5:11434")
 	}
 }
 
@@ -295,6 +392,8 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"literal key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-literal\n    auth: bearer\n    format: openai\n"},
 		{"key with text around the reference", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}-suffix\n    auth: bearer\n    format: openai\n"},
 		{"key as bare $VAR", "providers:\n  openai:\n    url: https://api.openai.com\n    key: $TEST_KEY\n    auth: bearer\n    format: openai\n"},
+		// Unlike url and timeout: the default would be a literal key in git.
+		{"key with a default", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY:-sk-literal}\n    auth: bearer\n    format: openai\n"},
 		// auth none would silently ignore the key.
 		{"key with auth none", "providers:\n  ollama:\n    url: http://127.0.0.1:11434\n    key: ${TEST_KEY}\n    auth: none\n    format: openai\n"},
 		// Unknown keys are typos; ignoring them would apply a default silently.
