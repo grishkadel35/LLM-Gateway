@@ -32,8 +32,10 @@ type Request struct {
 	// InputEstimate is the request's input tokens, guessed from the client's
 	// body before any provider has counted them: ceil((body bytes - media
 	// payload bytes) / 4) + 1,600 for each media part (image, audio, document
-	// or file), whose payload is left out of the /4. A body that isn't a JSON
-	// object is ceil(bytes / 4).
+	// or file) in the request format's own shapes. A part's payload, left out
+	// of the /4, is the value of the field that holds its media (image_url,
+	// source, inlineData...) as raw bytes, escapes included. A body that isn't
+	// a JSON object is ceil(bytes / 4).
 	InputEstimate int64
 	// OutputCap is the output limit the client set, times the number of
 	// choices it asked for (n, candidateCount); 0 when it set none.

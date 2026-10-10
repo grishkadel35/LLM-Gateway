@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/mac/LLM Gateway/.codex/hooks/agent-label.sh' start"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/mac/LLM Gateway/.codex/hooks/agent-label.sh' stop"
+          }
+        ]
+      }
+    ]
+  }
+}

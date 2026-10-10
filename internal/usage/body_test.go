@@ -233,7 +233,7 @@ func TestReadBodyEstimatesRequest(t *testing.T) {
 		// The image's payload is left out of the /4, and the part costs a flat
 		// 1,600 tokens.
 		{"anthropic with an image", provider.FormatAnthropic, "/v1/messages", anthropic,
-			1600 + ceilQuarter(len(anthropic)-len("image")-len("base64")-len("image/png")-len("iVBORw0KGgo=")), 512},
+			1600 + ceilQuarter(len(anthropic)-len(`{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`)), 512},
 		{"gemini", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", gemini, ceilQuarter(len(gemini)), 600},
 		{"malformed", provider.FormatOpenAI, "/v1/chat/completions", malformed, ceilQuarter(len(malformed)), 0},
 	}

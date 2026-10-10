@@ -1,6 +1,7 @@
 package usage
 
 import (
+	"bytes"
 	"encoding/json"
 	"math"
 
@@ -23,82 +24,237 @@ func estimate(format provider.Format, body []byte, fields map[string]json.RawMes
 		return textTokens(int64(len(body))), 0
 	}
 
-	// fields decoded, so the body is valid JSON. The one error left is a number
-	// outside float64's range, which leaves the rest of doc decoded.
-	var doc any
-	_ = json.Unmarshal(body, &doc)
-	var found mediaCount
-	found.walk(doc, false)
-
-	// payload sums decoded strings, which can outgrow their bytes in the body
-	// (invalid UTF-8 decodes to 3-byte U+FFFD), so it can exceed the body.
-	textBytes := int64(len(body)) - found.payload
-	if textBytes < 0 {
-		textBytes = 0
-	}
-	return textTokens(textBytes) + mediaPartTokens*found.parts, outputLimit(format, fields)
+	// fields decoded, so the body is valid JSON nested at most 10,000 deep,
+	// which is all scanMedia needs. The payloads it finds are separate pieces
+	// of the body, so they never add up to more than the body.
+	found := scanMedia(format, body)
+	return textTokens(int64(len(body))-found.payload) + mediaPartTokens*found.parts, outputLimit(format, fields)
 }
 
 // textTokens estimates the tokens in n bytes of text: about 4 bytes each,
 // rounded up.
 func textTokens(n int64) int64 { return (n + 3) / 4 }
 
-// mediaCount tallies the media parts in a decoded JSON document and the bytes
-// of the strings inside them.
+// mediaCount tallies media parts and the bytes of their payloads.
 type mediaCount struct {
 	parts   int64
 	payload int64
 }
 
-// walk adds everything in v to c, however deep it sits (messages, tool
-// results, system arrays...). inPart is true inside a media part: its strings
-// are payload, and it holds no further parts.
+// scanMedia counts the media parts in body, a JSON object, wherever they sit
+// (messages, tool results, system arrays...). A part's payload is the value
+// under its payload key, measured in the body's own bytes from the value's
+// first byte to its last, escapes included. body must be valid JSON nested at
+// most 10,000 deep, as json.Unmarshal checks.
+func scanMedia(format provider.Format, body []byte) mediaCount {
+	s := scanner{format: format, keys: payloadKeys[format], b: body}
+	s.space()
+	found, _ := s.object()
+	return found
+}
+
+// payloadKeys are the keys under which each format holds a part's media. An
+// object keeps a slot for each, so a format can have 4 at most.
+var payloadKeys = map[provider.Format][]string{
+	provider.FormatOpenAI:    {"image_url", "input_audio", "file"},
+	provider.FormatAnthropic: {"source"},
+	provider.FormatGemini:    {"inlineData", "inline_data", "fileData", "file_data"},
+}
+
+// isPart reports whether an object whose "type" is typ, holding value under
+// the payload key key, is a media part. Only the format's own shapes count,
+// since JSON the client defines (tool inputs, schemas) can look like any of
+// them.
+func isPart(format provider.Format, typ []byte, key string, value summary) bool {
+	switch format {
+	case provider.FormatOpenAI:
+		// {"type":"image_url","image_url":{"url":...}}: the type names the
+		// key, whatever it holds.
+		return string(typ) == key
+	case provider.FormatAnthropic:
+		// {"type":"image","source":{"type":"base64",...}}. A document whose
+		// source is text or content is text, and any image in it is a part
+		// of its own.
+		return (string(typ) == "image" || string(typ) == "document") &&
+			value.object && string(value.typ) != "text" && string(value.typ) != "content"
+	case provider.FormatGemini:
+		// A part has no type: {"inlineData":{"mimeType":...,"data":...}} or
+		// {"fileData":{"mimeType":...,"fileUri":...}}, in either of proto
+		// JSON's spellings.
+		if key == "inlineData" || key == "inline_data" {
+			return value.object && value.data
+		}
+		return value.object && value.fileURI
+	}
+	return false
+}
+
+// summary is what isPart needs to know about a value. Only an object's has
+// anything set.
+type summary struct {
+	object  bool   // whether the value is an object
+	typ     []byte // its "type", if that's a string: the bytes between the quotes
+	data    bool   // it has a "data" key
+	fileURI bool   // it has a "fileUri" or "file_uri" key
+}
+
+// scanner reads a JSON body's bytes in place, without decoding or copying
+// them, so it allocates nothing however the body is built.
+type scanner struct {
+	format provider.Format
+	keys   []string // payloadKeys[format]
+	b      []byte
+	i      int // the next byte to read
+}
+
+// value reads the value at s.i, returning the media parts in it and, for an
+// object, its summary.
 //
-// Go note: a type switch (`switch v := v.(type)`) runs the case that matches
-// the type an interface value holds, and v has that type inside the case.
-// JSON decoded into `any` only ever holds nil, bool, float64, string, []any
-// or map[string]any, so the cases cover strings and the two containers and
-// ignore the rest.
-func (c *mediaCount) walk(v any, inPart bool) {
-	switch v := v.(type) {
-	case string:
-		if inPart {
-			c.payload += int64(len(v))
+// Go note: value, object and array call each other once per level of nesting.
+// A goroutine's stack starts small and grows as needed, so that is safe even
+// at the decoder's limit of 10,000 levels.
+func (s *scanner) value() (mediaCount, summary) {
+	switch s.b[s.i] {
+	case '{':
+		return s.object()
+	case '[':
+		return s.array(), summary{}
+	case '"':
+		s.str()
+	default:
+		s.literal()
+	}
+	return mediaCount{}, summary{}
+}
+
+// slot is the last value an object holds under one of the payload keys.
+type slot struct {
+	seen   bool
+	size   int64      // its bytes in the body
+	nested mediaCount // the parts inside it
+	value  summary
+}
+
+// object reads the object at s.i. When it is a media part, its payload value
+// counts whole, in place of any parts inside it, so payloads never overlap.
+// Its type can come after its payload, so that is decided at the closing
+// brace. Like a decoder, it goes by the last value of a repeated key.
+func (s *scanner) object() (mediaCount, summary) {
+	var found mediaCount
+	obj := summary{object: true}
+	var slots [4]slot // one for each of s.keys
+
+	s.i++ // {
+	s.space()
+	for s.b[s.i] != '}' {
+		key := s.str()
+		s.space()
+		s.i++ // :
+		s.space()
+		start := s.i
+		nested, value := s.value()
+		found.parts += nested.parts
+		found.payload += nested.payload
+
+		// Go note: converting a []byte to a string normally copies it. Where
+		// the string is only compared, as in this switch, the loop below and
+		// isPart, the compiler compares the bytes in place, so the scan
+		// allocates nothing.
+		switch string(key) {
+		case "type":
+			obj.typ = nil
+			if s.b[start] == '"' {
+				obj.typ = s.b[start+1 : s.i-1]
+			}
+		case "data":
+			obj.data = true
+		case "fileUri", "file_uri":
+			obj.fileURI = true
 		}
-	case map[string]any:
-		if !inPart && isMediaPart(v) {
-			c.parts++
-			inPart = true
+		for n, k := range s.keys {
+			if string(key) == k {
+				slots[n] = slot{seen: true, size: int64(s.i - start), nested: nested, value: value}
+			}
 		}
-		for _, child := range v {
-			c.walk(child, inPart)
+
+		s.space()
+		if s.b[s.i] == ',' {
+			s.i++
+			s.space()
 		}
-	case []any:
-		for _, child := range v {
-			c.walk(child, inPart)
+	}
+	s.i++ // }
+
+	for n, k := range s.keys {
+		if p := &slots[n]; p.seen && isPart(s.format, obj.typ, k, p.value) {
+			found.parts += 1 - p.nested.parts
+			found.payload += p.size - p.nested.payload
+			break // one part per object, however many of its keys qualify
+		}
+	}
+	return found, obj
+}
+
+// array reads the array at s.i, returning the media parts in it.
+func (s *scanner) array() mediaCount {
+	var found mediaCount
+	s.i++ // [
+	s.space()
+	for s.b[s.i] != ']' {
+		nested, _ := s.value()
+		found.parts += nested.parts
+		found.payload += nested.payload
+		s.space()
+		if s.b[s.i] == ',' {
+			s.i++
+			s.space()
+		}
+	}
+	s.i++ // ]
+	return found
+}
+
+// str reads the string at s.i, returning its bytes between the quotes as they
+// are in the body, escapes and all.
+func (s *scanner) str() []byte {
+	s.i++ // "
+	start := s.i
+	for {
+		end := s.i + bytes.IndexByte(s.b[s.i:], '"')
+		s.i = end + 1
+		// The quote ends the string unless an odd number of backslashes
+		// escape it. The opening quote stops the count.
+		backslashes := 0
+		for s.b[end-1-backslashes] == '\\' {
+			backslashes++
+		}
+		if backslashes%2 == 0 {
+			return s.b[start:end]
 		}
 	}
 }
 
-// isMediaPart reports whether obj is an image, audio, document or file part.
-// One check serves all three formats, because their request bodies don't
-// share these names.
-func isMediaPart(obj map[string]any) bool {
-	switch obj["type"] {
-	case "image_url", "input_audio", "file": // OpenAI
-		return true
-	case "image", "document": // Anthropic; a document whose source is text counts as text
-		source, _ := obj["source"].(map[string]any)
-		return source["type"] != "text"
+// literal skips the number, true, false or null at s.i.
+func (s *scanner) literal() {
+	for {
+		switch s.b[s.i] {
+		case ',', '}', ']', ' ', '\t', '\n', '\r':
+			return
+		}
+		s.i++
 	}
-	// Gemini has no type: a part holds its media under one of these keys, in
-	// either of proto JSON's spellings.
-	for _, key := range []string{"inlineData", "inline_data", "fileData", "file_data"} {
-		if _, ok := obj[key]; ok {
-			return true
+}
+
+// space skips the whitespace at s.i, if any.
+func (s *scanner) space() {
+	for {
+		switch s.b[s.i] {
+		case ' ', '\t', '\n', '\r':
+			s.i++
+		default:
+			return
 		}
 	}
-	return false
 }
 
 // outputLimit is the output limit the client set, times the number of choices
