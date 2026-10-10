@@ -20,6 +20,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
+	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
@@ -154,7 +155,7 @@ providers:
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
 
-	r, err := router(cfg, store, testAdminKey, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, store, testAdminKey, nil, metrics.New(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -673,7 +674,7 @@ func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
 		calls = append(calls, meteredCall{provider, r})
 	}
 
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, metrics.New(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -806,7 +807,7 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), metrics.New(), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +927,7 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), metrics.New(), logger)
 	if err != nil {
 		t.Fatal(err)
 	}

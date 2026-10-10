@@ -25,6 +25,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
+	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
@@ -76,12 +77,12 @@ type stores struct {
 
 // router builds the gateway's handler: one reverse proxy per configured
 // provider behind tenant auth, the admin API behind the admin key, /health,
-// and a catch-all that rejects unknown prefixes, all behind the request ID and
-// logging middleware.
+// /metrics, and a catch-all that rejects unknown prefixes, all behind the
+// request ID and logging middleware.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, m *metrics.Metrics, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -91,6 +92,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	// wins, so "/health" beats "/openai/" beats the catch-all "/".
 	mux := http.NewServeMux()
 	mux.Handle("/health", health.Handler())
+	// Unauthenticated for now; roadmap Week 6 decides between admin auth and a
+	// separate port.
+	mux.Handle("/metrics", m.Handler())
 
 	// One subtree behind AdminAuth, not a pattern per admin route: with
 	// per-route patterns, ServeMux would answer an unauthenticated request for
@@ -111,14 +115,18 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		// RequireMetered then refuses endpoints the gateway can't read usage
 		// from, and ReadBody takes ownership of the body. Both run after
 		// StripPrefix, so they see the provider-relative path.
-		var meter usage.Callback
-		if onUsage != nil {
-			name := p.Name
-			meter = func(ctx context.Context, r usage.Result) { onUsage(ctx, name, r) }
+		name := p.Name
+		meter := func(ctx context.Context, r usage.Result) {
+			m.Tokens(name, r.Usage)
+			if onUsage != nil {
+				onUsage(ctx, name, r)
+			}
 		}
 		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(proxy.New(p, logger, meter))
 		metered := usage.RequireMetered(p.Format)(body)
-		mux.Handle(prefix+"/", tenantAuth(http.StripPrefix(prefix, metered)))
+		// The request metrics go outermost, so requests the gateway refuses
+		// itself (401, 403, 413) are counted too.
+		mux.Handle(prefix+"/", m.Requests(p.Name)(tenantAuth(http.StripPrefix(prefix, metered))))
 	}
 
 	// Anything that names no provider is rejected. There is deliberately no
@@ -173,7 +181,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), metrics.New(), logger)
 	if err != nil {
 		return err
 	}
