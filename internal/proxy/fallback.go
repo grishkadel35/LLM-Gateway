@@ -67,8 +67,7 @@ func armedFrom(ctx context.Context) *armed {
 // plain proxy, so auth and ReadBody don't run twice.
 func Fallback(from string, primary http.Handler, to string, target http.Handler, models map[string]string, onFallback func(from, to, reason string), logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set(HeaderProvider, from)
-		w.Header().Set(HeaderFallback, "false")
+		pw := &providerWriter{ResponseWriter: w, provider: from, fallback: "false"}
 
 		req, _ := usage.RequestFrom(r.Context())
 		model, ok := "", false
@@ -76,14 +75,14 @@ func Fallback(from string, primary http.Handler, to string, target http.Handler,
 			model, ok = models[req.Model]
 		}
 		if !ok {
-			primary.ServeHTTP(w, r)
+			primary.ServeHTTP(pw, r)
 			return
 		}
 
 		// Armed, primary's proxy writes nothing when it fails in a way the
 		// fallback fixes; it records why instead.
 		a := &armed{}
-		primary.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), armedKey{}, a)))
+		primary.ServeHTTP(pw, r.WithContext(context.WithValue(r.Context(), armedKey{}, a)))
 		if a.reason == "" {
 			return
 		}
@@ -96,7 +95,7 @@ func Fallback(from string, primary http.Handler, to string, target http.Handler,
 			// Unreachable while ReadBody owns the body: it decoded this one
 			// to find the model.
 			logger.Error("fallback: could not rewrite the request", "from", from, "to", to, "error", err)
-			apierror.Write(w, http.StatusBadGateway, "upstream_unavailable",
+			apierror.Write(pw, http.StatusBadGateway, "upstream_unavailable",
 				"the gateway could not reach the upstream provider", map[string]any{"provider": from})
 			return
 		}
@@ -109,8 +108,41 @@ func Fallback(from string, primary http.Handler, to string, target http.Handler,
 			"fallback_model", model,
 		)
 		onFallback(from, to, a.reason)
-		w.Header().Set(HeaderProvider, to)
-		w.Header().Set(HeaderFallback, "true")
-		target.ServeHTTP(w, retry)
+		pw.provider, pw.fallback = to, "true"
+		target.ServeHTTP(pw, retry)
 	})
+}
+
+// providerWriter sets HeaderProvider and HeaderFallback as each response's
+// headers go out, 1xx included. Setting them once up front isn't enough:
+// ReverseProxy clears the header map after forwarding an informational
+// response, so the final one would go out without them. It works like
+// middleware's requestIDWriter.
+type providerWriter struct {
+	http.ResponseWriter
+	provider, fallback string
+	wroteHeader        bool
+}
+
+func (w *providerWriter) WriteHeader(code int) {
+	w.Header().Set(HeaderProvider, w.provider)
+	w.Header().Set(HeaderFallback, w.fallback)
+	if code >= 200 {
+		w.wroteHeader = true
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *providerWriter) Write(b []byte) (int, error) {
+	// Writing without WriteHeader implies a 200; the headers go out now.
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.NewResponseController reach Flush, as in middleware's
+// responseRecorder.
+func (w *providerWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

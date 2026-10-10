@@ -327,3 +327,51 @@ func jsonHas(body []byte, key, want string) bool {
 	var m map[string]any
 	return json.Unmarshal(body, &m) == nil && m[key] == want
 }
+
+// hinting starts an upstream that sends 103 Early Hints, then answers 200.
+func hinting(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"model":"qwen3.5:9b","choices":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestFallbackHeadersSurviveA1xx: ReverseProxy clears the response headers
+// after forwarding an informational response, so the X-Gateway headers must go
+// out again with the final response, whichever provider answers. It runs over
+// a real server and client: httptest.ResponseRecorder keeps the first status
+// and headers it is given, so it can't show what a 1xx does.
+func TestFallbackHeadersSurviveA1xx(t *testing.T) {
+	cases := []struct {
+		name         string
+		ollama       func(*testing.T) string
+		wantProvider string
+		wantFallback string
+	}{
+		{"ollama sends a 103", func(t *testing.T) string { return hinting(t).URL }, "ollama", "false"},
+		{"groq sends a 103 after ollama's 500", ollamaAnswering(http.StatusInternalServerError), "groq", "true"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newFallbackRig(t, tc.ollama(t), 5*time.Second, &fakeGroq{server: hinting(t)})
+			gateway := httptest.NewServer(rig.handler)
+			t.Cleanup(gateway.Close)
+
+			res, err := http.Post(gateway.URL+"/v1/chat/completions", "application/json", strings.NewReader(chatBody("qwen3.5:9b", false)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			res.Body.Close()
+
+			if res.StatusCode != http.StatusOK || res.Header.Get(HeaderProvider) != tc.wantProvider || res.Header.Get(HeaderFallback) != tc.wantFallback {
+				t.Errorf("status %d, %s %q, %s %q; want 200, %q, %q", res.StatusCode, HeaderProvider, res.Header.Get(HeaderProvider),
+					HeaderFallback, res.Header.Get(HeaderFallback), tc.wantProvider, tc.wantFallback)
+			}
+		})
+	}
+}
