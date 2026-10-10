@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"math"
+	"strconv"
 
 	"github.com/grishkadel/llm-gateway/internal/provider"
 )
@@ -16,19 +17,20 @@ import (
 const mediaPartTokens = 1600
 
 // estimate sizes a request before any provider has counted it: the values for
-// Request.InputEstimate and Request.OutputCap. fields is the body decoded into
-// its top-level keys, nil when the body isn't a JSON object. It only reads the
-// body.
-func estimate(format provider.Format, body []byte, fields map[string]json.RawMessage) (inputEstimate, outputCap int64) {
+// Request.InputEstimate, Request.OutputCap and Request.Choices. fields is the
+// body decoded into its top-level keys, nil when the body isn't a JSON object.
+// It only reads the body.
+func estimate(format provider.Format, body []byte, fields map[string]json.RawMessage) (inputEstimate, outputCap, choices int64) {
 	if fields == nil {
-		return textTokens(int64(len(body))), 0
+		return textTokens(int64(len(body))), 0, 1
 	}
 
 	// fields decoded, so the body is valid JSON nested at most 10,000 deep,
 	// which is all scanMedia needs. The payloads it finds are separate pieces
 	// of the body, so they never add up to more than the body.
 	found := scanMedia(format, body)
-	return textTokens(int64(len(body))-found.payload) + mediaPartTokens*found.parts, outputLimit(format, fields)
+	outputCap, choices = outputLimit(format, fields)
+	return textTokens(int64(len(body))-found.payload) + mediaPartTokens*found.parts, outputCap, choices
 }
 
 // textTokens estimates the tokens in n bytes of text: about 4 bytes each,
@@ -257,11 +259,13 @@ func (s *scanner) space() {
 	}
 }
 
-// outputLimit is the output limit the client set, times the number of choices
-// it asked for, or 0 when it set none. A value that isn't a positive integer
-// counts as unset.
-func outputLimit(format provider.Format, fields map[string]json.RawMessage) int64 {
-	var maxTokens, choices int64
+// outputLimit reads what the client asked for: choices is the number of
+// choices, at least 1, and outputCap the output limit it set times choices, or
+// 0 when it set none. One function returns both, so a request's cap and its
+// count can't come from different readings of the body, and Gemini's config
+// is decoded once. A value that isn't a positive integer counts as unset.
+func outputLimit(format provider.Format, fields map[string]json.RawMessage) (outputCap, choices int64) {
+	var maxTokens int64
 	switch format {
 	case provider.FormatOpenAI:
 		maxTokens = positive(fields, "max_completion_tokens", "max_tokens")
@@ -276,17 +280,17 @@ func outputLimit(format provider.Format, fields map[string]json.RawMessage) int6
 		}
 		var config map[string]json.RawMessage
 		_ = json.Unmarshal(raw, &config) // anything but an object leaves it nil
-		maxTokens = positive(config, "maxOutputTokens", "max_output_tokens")
-		choices = positive(config, "candidateCount", "candidate_count")
+		maxTokens = positiveProto(config, "maxOutputTokens", "max_output_tokens")
+		choices = positiveProto(config, "candidateCount", "candidate_count")
 	}
 
 	if choices == 0 {
 		choices = 1
 	}
 	if maxTokens > math.MaxInt64/choices {
-		return math.MaxInt64 // stop at the largest cap rather than wrap around to a negative one
+		return math.MaxInt64, choices // stop at the largest cap rather than wrap around to a negative one
 	}
-	return maxTokens * choices
+	return maxTokens * choices, choices
 }
 
 // positive returns the first of names that obj holds as a positive integer, or
@@ -296,6 +300,34 @@ func positive(obj map[string]json.RawMessage, names ...string) int64 {
 		var n int64
 		if json.Unmarshal(obj[name], &n) == nil && n > 0 {
 			return n
+		}
+	}
+	return 0
+}
+
+// positiveProto is positive for Gemini, whose API reads the request as proto3
+// JSON. There an int32 field takes a number with no fractional part (8192,
+// 8192.0, 8.192e3) or a string holding one ("8192"), up to math.MaxInt32.
+// Anything else doesn't count: a fraction, null, a bool, an array, an object, a
+// number out of range, or a string that isn't wholly a number ("abc", " 8192").
+// OpenAI's and Anthropic's APIs refuse these forms, so they keep using positive.
+//
+// Go note: a json.Number holds a number's digits as written, unread.
+// encoding/json fills one from a JSON number, or from a JSON string only if the
+// whole string is a valid JSON number, and fails on anything else. strconv then
+// reads it: a float64 holds every int32 exactly, and reads exponent forms. (A
+// fraction too small for a float64 to see beside the integer, like 1e-7 near
+// 2^31, is lost, which is fine for an estimate.)
+func positiveProto(obj map[string]json.RawMessage, names ...string) int64 {
+	for _, name := range names {
+		var num json.Number
+		if json.Unmarshal(obj[name], &num) != nil {
+			continue
+		}
+		// null leaves num empty, which ParseFloat refuses.
+		f, err := strconv.ParseFloat(string(num), 64)
+		if err == nil && f > 0 && f <= math.MaxInt32 && f == math.Trunc(f) {
+			return int64(f)
 		}
 	}
 	return 0

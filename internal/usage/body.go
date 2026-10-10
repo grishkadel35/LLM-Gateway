@@ -40,6 +40,12 @@ type Request struct {
 	// OutputCap is the output limit the client set, times the number of
 	// choices it asked for (n, candidateCount); 0 when it set none.
 	OutputCap int64
+	// Choices is the number of choices the client asked for (n,
+	// candidateCount): at least 1, and 1 when it set none or a value that
+	// doesn't count. It is the multiplier already in OutputCap, kept apart so a
+	// request that asks for several choices but sets no limit can still be
+	// charged for each of them.
+	Choices int64
 }
 
 type requestKey struct{}
@@ -61,8 +67,8 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 // client's exact bytes. A body that isn't JSON is forwarded unchanged for the
 // provider to reject.
 //
-// It also records the request's InputEstimate and OutputCap. They are read
-// from the client's bytes and never change the body.
+// It also records the request's InputEstimate, OutputCap and Choices. They are
+// read from the client's bytes and never change the body.
 //
 // It expects the provider-relative path, after StripPrefix: Gemini keeps the
 // model and the stream flag in the URL.
@@ -87,7 +93,7 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 			decoded := json.Unmarshal(body, &fields) == nil
 			// Before the rewrite below, so it sizes the client's request. fields
 			// is nil unless the body is a JSON object.
-			req.InputEstimate, req.OutputCap = estimate(format, body, fields)
+			req.InputEstimate, req.OutputCap, req.Choices = estimate(format, body, fields)
 			if decoded {
 				req.Model, req.Stream = modelAndStream(format, r.URL.Path, fields)
 				if format == provider.FormatOpenAI && req.Stream && includeUsage(fields) {

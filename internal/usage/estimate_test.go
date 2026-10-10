@@ -13,7 +13,7 @@ import (
 )
 
 // estimateOf decodes body the way ReadBody does, then estimates it.
-func estimateOf(format provider.Format, body string) (inputEstimate, outputCap int64) {
+func estimateOf(format provider.Format, body string) (inputEstimate, outputCap, choices int64) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal([]byte(body), &fields) // stays nil unless body is a JSON object
 	return estimate(format, []byte(body), fields)
@@ -75,7 +75,7 @@ func TestEstimateInlineImage(t *testing.T) {
 				if enc.name != "compact" && len(enc.body) <= len(tc.body) {
 					t.Fatalf("%s escaping changed nothing; want a payload it escapes", enc.name)
 				}
-				got, _ := estimateOf(tc.format, enc.body)
+				got, _, _ := estimateOf(tc.format, enc.body)
 				if got != want {
 					t.Errorf("InputEstimate = %d, want %d", got, want)
 				}
@@ -171,7 +171,7 @@ func TestEstimateMediaParts(t *testing.T) {
 			}
 
 			wantEstimate := 1600*tc.parts + ceilQuarter(len(tc.body)-lenSum(tc.payload))
-			if got, _ := estimateOf(tc.format, tc.body); got != wantEstimate {
+			if got, _, _ := estimateOf(tc.format, tc.body); got != wantEstimate {
 				t.Errorf("InputEstimate = %d, want %d (%d media parts)", got, wantEstimate, tc.parts)
 			}
 		})
@@ -187,7 +187,7 @@ func TestEstimatePartsOfOtherFormats(t *testing.T) {
 				continue
 			}
 			t.Run(tc.name+" as "+string(format), func(t *testing.T) {
-				if got, _ := estimateOf(format, tc.body); got != ceilQuarter(len(tc.body)) {
+				if got, _, _ := estimateOf(format, tc.body); got != ceilQuarter(len(tc.body)) {
 					t.Errorf("InputEstimate = %d, want ceil(%d / 4) = %d", got, len(tc.body), ceilQuarter(len(tc.body)))
 				}
 			})
@@ -233,7 +233,7 @@ var textBodyCases = []struct {
 func TestEstimateTextBody(t *testing.T) {
 	for _, tc := range textBodyCases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, _ := estimateOf(tc.format, tc.body)
+			got, _, _ := estimateOf(tc.format, tc.body)
 			if want := ceilQuarter(len(tc.body)); got != want {
 				t.Errorf("InputEstimate = %d, want ceil(%d / 4) = %d", got, len(tc.body), want)
 			}
@@ -243,7 +243,7 @@ func TestEstimateTextBody(t *testing.T) {
 
 // TestEstimateNonObjectBody: a body that isn't a JSON object has no fields to
 // read and no parts to find. It is estimated as plain text, with no output cap
-// even when it looks like it set one.
+// even when it looks like it set one, and one choice.
 func TestEstimateNonObjectBody(t *testing.T) {
 	cases := []struct {
 		name string
@@ -259,12 +259,15 @@ func TestEstimateNonObjectBody(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			input, outputCap := estimateOf(provider.FormatOpenAI, tc.body)
+			input, outputCap, choices := estimateOf(provider.FormatOpenAI, tc.body)
 			if want := ceilQuarter(len(tc.body)); input != want {
 				t.Errorf("InputEstimate = %d, want ceil(%d / 4) = %d", input, len(tc.body), want)
 			}
 			if outputCap != 0 {
 				t.Errorf("OutputCap = %d, want 0", outputCap)
+			}
+			if choices != 1 {
+				t.Errorf("Choices = %d, want 1", choices)
 			}
 		})
 	}
@@ -276,7 +279,7 @@ func TestEstimateNonObjectBody(t *testing.T) {
 func TestEstimateNumberOutsideFloat64(t *testing.T) {
 	body := `{"temperature":1e999,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/cat.png"}}]}]}`
 
-	got, _ := estimateOf(provider.FormatOpenAI, body)
+	got, _, _ := estimateOf(provider.FormatOpenAI, body)
 
 	want := 1600 + ceilQuarter(len(body)-len(`{"url":"https://example.com/cat.png"}`))
 	if got != want {
@@ -292,7 +295,7 @@ func TestEstimateInvalidUTF8Payload(t *testing.T) {
 	payload := `{"url":"` + strings.Repeat("\xff", 1000) + `"}`
 	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"` + text + `"},{"type":"image_url","image_url":` + payload + `}]}]}`
 
-	got, _ := estimateOf(provider.FormatOpenAI, body)
+	got, _, _ := estimateOf(provider.FormatOpenAI, body)
 
 	if want := 1600 + ceilQuarter(len(body)-len(payload)); got != want {
 		t.Errorf("InputEstimate = %d, want %d", got, want)
@@ -451,7 +454,7 @@ func TestOutputCap(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, got := estimateOf(tc.format, tc.body); got != tc.want {
+			if _, got, _ := estimateOf(tc.format, tc.body); got != tc.want {
 				t.Errorf("OutputCap = %d, want %d", got, tc.want)
 			}
 		})
@@ -481,10 +484,126 @@ func TestOutputCapIgnoresWrongTypes(t *testing.T) {
 
 	for _, tc := range cases {
 		for _, value := range values {
+			// Gemini's proto3 JSON reads an int32 from a string, so for it "100"
+			// is the right type: TestOutputCapGeminiProtoJSON covers it.
+			if tc.format == provider.FormatGemini && value == `"100"` {
+				continue
+			}
 			body := fmt.Sprintf(tc.body, value)
 			t.Run(tc.name+" = "+value, func(t *testing.T) {
-				if _, got := estimateOf(tc.format, body); got != tc.want {
+				// Whichever field is wrong, the request is left with one choice.
+				_, got, choices := estimateOf(tc.format, body)
+				if got != tc.want {
 					t.Errorf("OutputCap of %s = %d, want %d", body, got, tc.want)
+				}
+				if choices != 1 {
+					t.Errorf("Choices of %s = %d, want 1", body, choices)
+				}
+			})
+		}
+	}
+}
+
+// TestChoices: the number of choices the client asked for, from the field each
+// format keeps it in, or 1 when it asked for none. OutputCap holds the count as
+// a multiplier, which leaves nothing to multiply when the client set no cap.
+// Choices keeps the count either way, so a default cap can be charged for each
+// choice.
+func TestChoices(t *testing.T) {
+	cases := []struct {
+		name        string
+		format      provider.Format
+		body        string
+		wantCap     int64
+		wantChoices int64
+	}{
+		{"openai n", provider.FormatOpenAI, `{"max_tokens":100,"n":3}`, 300, 3},
+		{"openai n alone", provider.FormatOpenAI, `{"n":3}`, 0, 3},
+		{"openai no n", provider.FormatOpenAI, `{"max_tokens":100}`, 100, 1},
+		{"openai n is a string", provider.FormatOpenAI, `{"max_tokens":100,"n":"3"}`, 100, 1},
+		{"openai n is 0", provider.FormatOpenAI, `{"max_tokens":100,"n":0}`, 100, 1},
+		{"openai doesn't read Gemini's names", provider.FormatOpenAI, `{"generationConfig":{"candidateCount":3}}`, 0, 1},
+		// The cap stops at the largest int64, but the count stays what was asked.
+		{"openai n with the largest cap", provider.FormatOpenAI, `{"max_tokens":9223372036854775807,"n":2}`, math.MaxInt64, 2},
+
+		{"anthropic has no n", provider.FormatAnthropic, `{"max_tokens":1024,"n":2}`, 1024, 1},
+		{"anthropic no limit", provider.FormatAnthropic, `{"model":"claude-sonnet-4","n":2}`, 0, 1},
+
+		{"gemini candidateCount", provider.FormatGemini, `{"generationConfig":{"maxOutputTokens":800,"candidateCount":2}}`, 1600, 2},
+		{"gemini candidate_count", provider.FormatGemini, `{"generation_config":{"max_output_tokens":800,"candidate_count":3}}`, 2400, 3},
+		{"gemini candidateCount alone", provider.FormatGemini, `{"generationConfig":{"candidateCount":8}}`, 0, 8},
+		{"gemini candidate_count alone", provider.FormatGemini, `{"generation_config":{"candidate_count":8}}`, 0, 8},
+		{"gemini no candidateCount", provider.FormatGemini, `{"generationConfig":{"maxOutputTokens":800}}`, 800, 1},
+		{"gemini no config", provider.FormatGemini, `{"contents":[]}`, 0, 1},
+		{"gemini candidateCount outside the config", provider.FormatGemini, `{"candidateCount":3}`, 0, 1},
+		{"gemini candidateCount is a fraction", provider.FormatGemini, `{"generationConfig":{"maxOutputTokens":800,"candidateCount":2.5}}`, 800, 1},
+		{"gemini candidateCount is null", provider.FormatGemini, `{"generationConfig":{"maxOutputTokens":800,"candidateCount":null}}`, 800, 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, outputCap, choices := estimateOf(tc.format, tc.body)
+			if outputCap != tc.wantCap || choices != tc.wantChoices {
+				t.Errorf("OutputCap, Choices of %s = %d, %d; want %d, %d", tc.body, outputCap, choices, tc.wantCap, tc.wantChoices)
+			}
+		})
+	}
+}
+
+// TestOutputCapGeminiProtoJSON: Gemini's API reads its request as proto3 JSON,
+// where an int32 field takes a string as well as a number, and a number with no
+// fractional part in any notation. OpenAI's and Anthropic's APIs refuse these
+// forms with a 400 (TestOutputCapIgnoresWrongTypes), so only Gemini's limit and
+// choice count read them. Whatever the API refuses counts as unset.
+func TestOutputCapGeminiProtoJSON(t *testing.T) {
+	forms := []struct {
+		value string
+		want  int64 // the integer it stands for, or 0 when it counts as unset
+	}{
+		{`100`, 100},
+		{`"100"`, 100},
+		{`100.0`, 100},
+		{`1e2`, 100},
+		{`"1e2"`, 100},
+		{`8.192e3`, 8192},
+		{`2147483647`, math.MaxInt32},
+		{`"2147483647"`, math.MaxInt32},
+		{`2147483648`, 0},
+		{`"2147483648"`, 0},
+		{`1e999`, 0},
+		{`1.5`, 0},
+		{`"1.5"`, 0},
+		{`"0"`, 0},
+		{`"-5"`, 0},
+		{`"abc"`, 0},
+		{`""`, 0},
+		// Space between tokens is JSON's own and never reaches the value. But
+		// encoding/json reads a string as a number only when all of it is one, so
+		// a space inside the quotes makes it unset. protojson, Go's reference
+		// implementation of proto3 JSON, refuses these strings too.
+		{` 100 `, 100},
+		{`" 100"`, 0},
+		{`"100 "`, 0},
+	}
+	// Each spelling holds the value as the limit, then as the choice count
+	// beside a limit of 10.
+	spellings := []struct{ name, asLimit, asCount string }{
+		{"camelCase", `{"generationConfig":{"maxOutputTokens":%s}}`, `{"generationConfig":{"maxOutputTokens":10,"candidateCount":%s}}`},
+		{"snake_case", `{"generation_config":{"max_output_tokens":%s}}`, `{"generation_config":{"max_output_tokens":10,"candidate_count":%s}}`},
+	}
+
+	for _, s := range spellings {
+		for _, f := range forms {
+			t.Run(s.name+" "+f.value, func(t *testing.T) {
+				body := fmt.Sprintf(s.asLimit, f.value)
+				if _, outputCap, choices := estimateOf(provider.FormatGemini, body); outputCap != f.want || choices != 1 {
+					t.Errorf("OutputCap, Choices of %s = %d, %d; want %d, 1", body, outputCap, choices, f.want)
+				}
+
+				wantChoices := max(f.want, 1)
+				body = fmt.Sprintf(s.asCount, f.value)
+				if _, outputCap, choices := estimateOf(provider.FormatGemini, body); outputCap != 10*wantChoices || choices != wantChoices {
+					t.Errorf("OutputCap, Choices of %s = %d, %d; want %d, %d", body, outputCap, choices, 10*wantChoices, wantChoices)
 				}
 			})
 		}

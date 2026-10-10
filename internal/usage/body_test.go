@@ -213,13 +213,14 @@ func TestReadBodyRecordsPathAndTime(t *testing.T) {
 	}
 }
 
-// TestReadBodyEstimatesRequest: rate limiting needs a request's input size and
-// output limit before the provider answers, wherever each format keeps them.
-// Estimating never rewrites the body.
+// TestReadBodyEstimatesRequest: rate limiting needs a request's input size,
+// output limit and choice count before the provider answers, wherever each
+// format keeps them. Estimating never rewrites the body.
 func TestReadBodyEstimatesRequest(t *testing.T) {
 	openAI := `{"model":"gpt-4o","max_tokens":100,"n":2,"messages":[{"role":"user","content":"hi"}]}`
 	anthropic := `{"model":"claude-sonnet-4","max_tokens":512,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}`
 	gemini := `{"contents":[{"parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":300,"candidate_count":2}}`
+	geminiNoLimit := `{"contents":[{"parts":[{"text":"hi"}]}],"generationConfig":{"candidateCount":8}}`
 	malformed := `{"model":"gpt-4o","max_tokens":100`
 
 	cases := []struct {
@@ -228,14 +229,17 @@ func TestReadBodyEstimatesRequest(t *testing.T) {
 		path, body string
 		input      int64
 		outputCap  int64
+		choices    int64
 	}{
-		{"openai", provider.FormatOpenAI, "/v1/chat/completions", openAI, ceilQuarter(len(openAI)), 200},
+		{"openai", provider.FormatOpenAI, "/v1/chat/completions", openAI, ceilQuarter(len(openAI)), 200, 2},
 		// The image's payload is left out of the /4, and the part costs a flat
 		// 1,600 tokens.
 		{"anthropic with an image", provider.FormatAnthropic, "/v1/messages", anthropic,
-			1600 + ceilQuarter(len(anthropic)-len(`{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`)), 512},
-		{"gemini", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", gemini, ceilQuarter(len(gemini)), 600},
-		{"malformed", provider.FormatOpenAI, "/v1/chat/completions", malformed, ceilQuarter(len(malformed)), 0},
+			1600 + ceilQuarter(len(anthropic)-len(`{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`)), 512, 1},
+		{"gemini", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", gemini, ceilQuarter(len(gemini)), 600, 2},
+		// A count with no limit: there is no cap to multiply, but the count stays.
+		{"gemini with a count and no limit", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", geminiNoLimit, ceilQuarter(len(geminiNoLimit)), 0, 8},
+		{"malformed", provider.FormatOpenAI, "/v1/chat/completions", malformed, ceilQuarter(len(malformed)), 0, 1},
 	}
 
 	for _, tc := range cases {
@@ -244,8 +248,9 @@ func TestReadBodyEstimatesRequest(t *testing.T) {
 			if got.req == nil {
 				t.Fatal("RequestFrom() found nothing")
 			}
-			if got.req.InputEstimate != tc.input || got.req.OutputCap != tc.outputCap {
-				t.Errorf("InputEstimate, OutputCap = %d, %d; want %d, %d", got.req.InputEstimate, got.req.OutputCap, tc.input, tc.outputCap)
+			if got.req.InputEstimate != tc.input || got.req.OutputCap != tc.outputCap || got.req.Choices != tc.choices {
+				t.Errorf("InputEstimate, OutputCap, Choices = %d, %d, %d; want %d, %d, %d",
+					got.req.InputEstimate, got.req.OutputCap, got.req.Choices, tc.input, tc.outputCap, tc.choices)
 			}
 			if got.body != tc.body {
 				t.Errorf("forwarded body = %q, want the client's bytes %q", got.body, tc.body)
