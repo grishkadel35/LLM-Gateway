@@ -114,6 +114,10 @@ type Provider struct {
 	// Headers are static headers this provider requires, such as Anthropic's
 	// "anthropic-version".
 	Headers map[string]string
+	// MaxConcurrency caps the requests in flight to this provider; 0 means no
+	// cap. A request beyond it waits up to QueueTimeout for a slot.
+	MaxConcurrency int
+	QueueTimeout   time.Duration
 }
 
 // Apply swaps the client's credential for this provider's own, and adds any

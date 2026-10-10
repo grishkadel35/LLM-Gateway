@@ -249,6 +249,37 @@ func TestLoadExpandsFieldReferences(t *testing.T) {
 	}
 }
 
+// TestLoadConcurrencyCap: queue_timeout defaults to 30 seconds only when
+// max_concurrency sets a cap, as timeout's default does; without a cap there
+// is no queue to time. Both reach the parsed provider.
+func TestLoadConcurrencyCap(t *testing.T) {
+	cases := []struct {
+		name      string
+		fields    string
+		wantMax   int
+		wantQueue time.Duration
+	}{
+		{"no cap", "", 0, 0},
+		{"cap", "    max_concurrency: 2\n", 2, DefaultQueueTimeoutSeconds * time.Second},
+		{"cap and queue_timeout", "    max_concurrency: 2\n    queue_timeout: 5\n", 2, 5 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, "providers:\n  ollama:\n    url: http://127.0.0.1:11434\n    auth: none\n    format: openai\n"+tc.fields))
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			providers, err := cfg.BuildProviders()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p := providers[0]; p.MaxConcurrency != tc.wantMax || p.QueueTimeout != tc.wantQueue {
+				t.Errorf("MaxConcurrency, QueueTimeout = %d, %v; want %d, %v", p.MaxConcurrency, p.QueueTimeout, tc.wantMax, tc.wantQueue)
+			}
+		})
+	}
+}
+
 // TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
 // configured with auth none and no key line at all.
 func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
@@ -281,6 +312,8 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	// Unset, Ollama's url and timeout take the defaults written in the file.
 	unsetenv(t, "OLLAMA_BASE_URL")
 	unsetenv(t, "OLLAMA_TIMEOUT_SECONDS")
+	unsetenv(t, "OLLAMA_MAX_CONCURRENCY")
+	unsetenv(t, "OLLAMA_QUEUE_TIMEOUT_SECONDS")
 
 	path := filepath.Join("..", "..", "config.yaml")
 	cfg, err := Load(path)
@@ -311,6 +344,9 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	}
 	if !ollama.Free {
 		t.Error("ollama free = false, want true: a local model costs nothing")
+	}
+	if ollama.MaxConcurrency != 1 || ollama.QueueTimeoutSeconds != 30 {
+		t.Errorf("ollama max_concurrency, queue_timeout = %d, %d; want the defaults 1, 30", ollama.MaxConcurrency, ollama.QueueTimeoutSeconds)
 	}
 
 	t.Setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434")
@@ -381,6 +417,8 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"unknown format", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: groq\n"},
 		{"missing auth style", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    format: openai\n"},
 		{"negative timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    timeout: -5\n"},
+		{"negative max_concurrency", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    max_concurrency: -1\n"},
+		{"negative queue_timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    max_concurrency: 1\n    queue_timeout: -1\n"},
 		{"empty key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: \"\"\n    auth: bearer\n    format: openai\n"},
 		{"reserved name health", "providers:\n  health:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
 		{"reserved name admin", "providers:\n  admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},

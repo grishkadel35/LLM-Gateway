@@ -22,12 +22,17 @@ import (
 // second to a non-streaming generation of several minutes.
 var durationBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
 
+// waitBuckets span a wait for a concurrency slot: from none at all to the
+// default 30-second queue timeout, and past it for a longer one.
+var waitBuckets = []float64{0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
+
 // Metrics holds every metric the gateway exports.
 type Metrics struct {
 	registry *prometheus.Registry
 	requests *prometheus.CounterVec
 	duration *prometheus.HistogramVec
 	tokens   *prometheus.CounterVec
+	wait     *prometheus.HistogramVec
 }
 
 // New returns the gateway's metrics, on a registry of their own.
@@ -47,8 +52,13 @@ func New() *Metrics {
 			Name: "gateway_tokens_total",
 			Help: "Tokens the providers reported, by type. provider is the one that produced them, so after a fallback it is the fallback target.",
 		}, []string{"provider", "type"}),
+		wait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_concurrency_wait_seconds",
+			Help:    "Time requests waited for a concurrency slot on a provider with max_concurrency, whether or not one came free.",
+			Buckets: waitBuckets,
+		}, []string{"provider"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens)
+	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait)
 	return m
 }
 
@@ -99,6 +109,13 @@ func (m *Metrics) Tokens(provider string, u usage.Usage) {
 			m.tokens.WithLabelValues(provider, t.typ).Add(float64(t.n))
 		}
 	}
+}
+
+// ConcurrencyWait returns the function that observes each wait for one of
+// provider's concurrency slots.
+func (m *Metrics) ConcurrencyWait(provider string) func(time.Duration) {
+	wait := m.wait.WithLabelValues(provider)
+	return func(d time.Duration) { wait.Observe(d.Seconds()) }
 }
 
 // statusRecorder remembers the status a handler sent.

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/grishkadel/llm-gateway/internal/concurrency"
 	"github.com/grishkadel/llm-gateway/internal/provider"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -590,6 +591,39 @@ func TestMeteredStreamIsNotBuffered(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("usage callback never ran")
+	}
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestBusyProviderIs503: a request the concurrency limiter turned away gets
+// 503 provider_busy with Retry-After: 1, and leaves no usage row, since
+// nothing reached the provider.
+func TestBusyProviderIs503(t *testing.T) {
+	var got []usage.Result
+	p := New(testProvider(t, "http://127.0.0.1:1"), discardLogger(), func(_ context.Context, r usage.Result) { got = append(got, r) })
+	p.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, concurrency.ErrBusy })
+
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
+		t.Errorf("status %d, Retry-After %q; want 503, 1", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	var body struct {
+		Error struct{ Type, Provider string } `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Type != "provider_busy" || body.Error.Provider != "testprovider" {
+		t.Errorf("error = %+v, want provider_busy from testprovider", body.Error)
+	}
+	if len(got) != 0 {
+		t.Errorf("onUsage ran %d times, want none", len(got))
 	}
 }
 

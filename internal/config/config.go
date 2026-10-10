@@ -40,6 +40,9 @@ const (
 	// request limit: room for base64 images and PDFs, while a runaway client
 	// can't make the gateway buffer gigabytes.
 	DefaultMaxRequestBytes = 32 << 20
+	// DefaultQueueTimeoutSeconds bounds a request's wait for a concurrency
+	// slot, on a provider with max_concurrency and no queue_timeout.
+	DefaultQueueTimeoutSeconds = 30
 )
 
 // validName is what a provider name may contain. The name becomes a URL path
@@ -96,6 +99,11 @@ type ProviderConfig struct {
 	// Free marks a provider that costs nothing, such as a local Ollama: each
 	// usage row is priced at exactly 0, with its tokens still recorded.
 	Free bool `yaml:"free"`
+	// MaxConcurrency caps the requests in flight to this provider; 0, the
+	// default, means no cap. A request beyond it waits for a slot, for up to
+	// QueueTimeoutSeconds, and then gets 503.
+	MaxConcurrency      envInt `yaml:"max_concurrency"`
+	QueueTimeoutSeconds envInt `yaml:"queue_timeout"`
 }
 
 // Timeout returns the configured timeout as a time.Duration.
@@ -157,13 +165,16 @@ func Load(path string) (*Config, error) {
 // resolve fills in per-provider defaults and expands API keys from the
 // environment.
 //
-// Only named fields are expanded, never the whole file: keys here, url and
-// timeout as they are decoded (decodeEnv). Running os.ExpandEnv over the raw
-// YAML would also mangle any other value containing a `$`.
+// Only named fields are expanded, never the whole file: keys here, and fields
+// of the env types as they are decoded (decodeEnv). Running os.ExpandEnv over
+// the raw YAML would also mangle any other value containing a `$`.
 func (c *Config) resolve() error {
 	for name, pc := range c.Providers {
 		if pc.TimeoutSeconds == 0 {
 			pc.TimeoutSeconds = DefaultTimeoutSeconds
+		}
+		if pc.MaxConcurrency > 0 && pc.QueueTimeoutSeconds == 0 {
+			pc.QueueTimeoutSeconds = DefaultQueueTimeoutSeconds
 		}
 
 		if provider.AuthStyle(pc.Auth) == provider.AuthNone {
@@ -330,6 +341,13 @@ func (pc ProviderConfig) validate(name string) error {
 		return fmt.Errorf("provider %q: timeout must be greater than 0, got %d", name, pc.TimeoutSeconds)
 	}
 
+	if pc.MaxConcurrency < 0 {
+		return fmt.Errorf("provider %q: max_concurrency must be 0 (no cap) or more, got %d", name, pc.MaxConcurrency)
+	}
+	if pc.QueueTimeoutSeconds < 0 {
+		return fmt.Errorf("provider %q: queue_timeout must not be negative, got %d", name, pc.QueueTimeoutSeconds)
+	}
+
 	return nil
 }
 
@@ -362,13 +380,15 @@ func (c *Config) BuildProviders() ([]provider.Provider, error) {
 		}
 
 		providers = append(providers, provider.Provider{
-			Name:    name,
-			URL:     u,
-			Timeout: pc.Timeout(),
-			Key:     pc.Key,
-			Auth:    provider.AuthStyle(pc.Auth),
-			Format:  provider.Format(pc.Format),
-			Headers: pc.Headers,
+			Name:           name,
+			URL:            u,
+			Timeout:        pc.Timeout(),
+			Key:            pc.Key,
+			Auth:           provider.AuthStyle(pc.Auth),
+			Format:         provider.Format(pc.Format),
+			Headers:        pc.Headers,
+			MaxConcurrency: int(pc.MaxConcurrency),
+			QueueTimeout:   time.Duration(pc.QueueTimeoutSeconds) * time.Second,
 		})
 	}
 

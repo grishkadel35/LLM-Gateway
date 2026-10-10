@@ -6,10 +6,11 @@
 # environment references, expanded at startup; an unset variable is a startup
 # error, not a surprise 401 on the first request.
 #
-# A provider's url and timeout may be environment references too, and may
-# carry a default: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434} is the variable
-# when it is set and non-empty, the default otherwise. A key never takes a
-# default: that would be a literal key in git.
+# A provider's url, timeout, max_concurrency and queue_timeout may be
+# environment references too, and may carry a default:
+# ${OLLAMA_BASE_URL:-http://127.0.0.1:11434} is the variable when it is set
+# and non-empty, the default otherwise. A key never takes a default: that would
+# be a literal key in git.
 
 # Port the gateway itself listens on.
 port: 8080
@@ -77,3 +78,8 @@ providers:
     format: openai
     # Every usage row costs exactly 0; its tokens are still recorded.
     free: true
+    # A local model serves few requests at once. Beyond max_concurrency in
+    # flight, a request waits up to queue_timeout seconds for a slot, then gets
+    # 503 with Retry-After. max_concurrency 0, the default, means no cap.
+    max_concurrency: ${OLLAMA_MAX_CONCURRENCY:-1}
+    queue_timeout: ${OLLAMA_QUEUE_TIMEOUT_SECONDS:-30}

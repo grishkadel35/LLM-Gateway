@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/concurrency"
 	"github.com/grishkadel/llm-gateway/internal/provider"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -111,14 +112,30 @@ func modifyResponse(p provider.Provider, logger *slog.Logger, onUsage usage.Call
 const StatusClientClosedRequest = 499
 
 // errorHandler runs when we get no usable response from the upstream (DNS
-// failure, connection refused, timeout, or the client giving up first).
-// Without it, ReverseProxy logs to stderr and returns a bare 502 with an empty
-// body; clients deserve JSON.
+// failure, connection refused, timeout, the client giving up first, or no
+// concurrency slot free). Without it, ReverseProxy logs to stderr and returns
+// a bare 502 with an empty body; clients deserve JSON.
 //
-// Each case is also reported to onUsage: the provider may have received the
-// request and billed it, so it must leave a usage row, with unknown cost.
+// Each upstream failure is also reported to onUsage: the provider may have
+// received the request and billed it, so it must leave a usage row, with
+// unknown cost.
 func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// The request waited its whole queue timeout for a concurrency slot.
+		// Nothing reached the provider, so there is no usage row. The queue
+		// already did the waiting, so the client may retry at once.
+		if errors.Is(err, concurrency.ErrBusy) {
+			logger.Warn("provider busy: no concurrency slot within the queue timeout",
+				"provider", p.Name,
+				"method", r.Method,
+				"path", r.URL.Path,
+			)
+			w.Header().Set("Retry-After", "1")
+			apierror.Write(w, http.StatusServiceUnavailable, "provider_busy",
+				"the provider is at its concurrency limit; retry shortly", map[string]any{"provider": p.Name})
+			return
+		}
+
 		// The client went away, so nobody will read a response. It isn't an
 		// upstream failure either, so it doesn't belong at ERROR level.
 		if errors.Is(err, context.Canceled) {

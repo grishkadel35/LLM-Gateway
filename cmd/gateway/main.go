@@ -23,6 +23,7 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/admin"
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/concurrency"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
@@ -122,7 +123,13 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 				onUsage(ctx, name, r)
 			}
 		}
-		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(proxy.New(p, logger, meter))
+		rp := proxy.New(p, logger, meter)
+		// The limiter wraps the transport, so a slot is held only while the
+		// upstream is working on the request.
+		if p.MaxConcurrency > 0 {
+			rp.Transport = concurrency.Limit(rp.Transport, p.MaxConcurrency, p.QueueTimeout, m.ConcurrencyWait(p.Name))
+		}
+		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(rp)
 		metered := usage.RequireMetered(p.Format)(body)
 		// The request metrics go outermost, so requests the gateway refuses
 		// itself (401, 403, 413) are counted too.

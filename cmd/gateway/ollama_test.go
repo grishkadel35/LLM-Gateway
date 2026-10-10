@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,7 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
@@ -29,22 +32,45 @@ func ollamaFixture(t *testing.T, name string) []byte {
 // captured from the real thing.
 type fakeOllama struct {
 	server *httptest.Server
+	// arrivals receives a value as each chat request arrives.
+	arrivals chan struct{}
+	// release lets held chat requests finish; see ollamaKnobs.hold.
+	release func()
 }
 
-func newFakeOllama(t *testing.T) *fakeOllama {
+// ollamaKnobs set how a fakeOllama behaves. They are fixed before it starts
+// serving, so its handlers read them without locks.
+type ollamaKnobs struct {
+	// hold keeps each chat request waiting until release is called.
+	hold bool
+}
+
+func newFakeOllama(t *testing.T, knobs ollamaKnobs) *fakeOllama {
 	t.Helper()
 
 	chat := ollamaFixture(t, "chat.json")
-	f := &fakeOllama{}
+	held := make(chan struct{})
+	var once sync.Once
+	f := &fakeOllama{
+		arrivals: make(chan struct{}, 16),
+		release:  func() { once.Do(func() { close(held) }) },
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		f.arrivals <- struct{}{}
+		if knobs.hold {
+			<-held
+		}
 		// Like Ollama: a Content-Length (net/http adds it for a body this
 		// small) and no request ID.
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(chat)
 	})
 	f.server = httptest.NewServer(mux)
+	// Cleanups run last-registered first, so held requests are let go before
+	// Close, which waits for them.
 	t.Cleanup(f.server.Close)
+	t.Cleanup(f.release)
 	return f
 }
 
@@ -85,6 +111,32 @@ func chatRequest(route, model string) *http.Request {
 	return req
 }
 
+// serveAsync serves req on r in the background. The channel delivers the
+// response once it is done.
+func serveAsync(r http.Handler, req *http.Request) <-chan *httptest.ResponseRecorder {
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		done <- rec
+	}()
+	return done
+}
+
+// receive waits for a value from ch, and fails the test if none arrives in
+// 5 seconds.
+func receive[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
 // scrapeMetrics returns GET /metrics, which needs no key.
 func scrapeMetrics(t *testing.T, r http.Handler) string {
 	t.Helper()
@@ -100,7 +152,7 @@ func scrapeMetrics(t *testing.T, r http.Handler) string {
 // counted by the status the client got, refused ones included, with the
 // tokens the provider reported.
 func TestMetricsThroughGateway(t *testing.T) {
-	ollama := newFakeOllama(t)
+	ollama := newFakeOllama(t, ollamaKnobs{})
 	r := routerFor(t, fmt.Sprintf(ollamaConfig, ollama.server.URL), nil)
 
 	r.ServeHTTP(httptest.NewRecorder(), chatRequest("ollama", "qwen3.5:9b"))
@@ -123,5 +175,76 @@ func TestMetricsThroughGateway(t *testing.T) {
 	}
 	if strings.Contains(got, `type="cached_input"`) {
 		t.Error("a token type with no tokens got a series")
+	}
+}
+
+// TestConcurrencyCapQueuesRequests: with max_concurrency 1, a second request
+// reaches Ollama only once the first has finished, and both succeed.
+func TestConcurrencyCapQueuesRequests(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n", ollama.server.URL), nil)
+
+	first := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
+	receive(t, ollama.arrivals, "the first request at Ollama")
+	second := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
+
+	select {
+	case <-ollama.arrivals:
+		t.Fatal("the second request reached Ollama while the first held the only slot")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ollama.release()
+	for _, done := range []<-chan *httptest.ResponseRecorder{first, second} {
+		if rec := receive(t, done, "a response"); rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+		}
+	}
+	receive(t, ollama.arrivals, "the second request at Ollama")
+}
+
+// TestConcurrencyCapTimesOut: a request that gets no slot within
+// queue_timeout is answered 503 provider_busy with Retry-After: 1 and never
+// reaches Ollama, and every wait, granted or not, is observed.
+func TestConcurrencyCapTimesOut(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n    queue_timeout: 1\n", ollama.server.URL), nil)
+
+	first := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
+	receive(t, ollama.arrivals, "the first request at Ollama")
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
+		t.Errorf("status %d, Retry-After %q; want 503, 1", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	var body struct {
+		Error struct{ Type, Provider string } `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body %s: %v", rec.Body, err)
+	}
+	if body.Error.Type != "provider_busy" || body.Error.Provider != "ollama" {
+		t.Errorf("error = %+v, want provider_busy from ollama", body.Error)
+	}
+
+	ollama.release()
+	if rec := receive(t, first, "the first response"); rec.Code != http.StatusOK {
+		t.Errorf("first request: status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	select {
+	case <-ollama.arrivals:
+		t.Error("the refused request reached Ollama")
+	default:
+	}
+
+	got := scrapeMetrics(t, r)
+	for _, want := range []string{
+		`gateway_concurrency_wait_seconds_count{provider="ollama"} 2`,
+		`gateway_requests_total{provider="ollama",status="503"} 1`,
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Errorf("/metrics lacks %s", want)
+		}
 	}
 }
