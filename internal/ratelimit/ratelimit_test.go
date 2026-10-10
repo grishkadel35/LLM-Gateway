@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"crypto/rand"
+	"maps"
 	"math"
 	"sync"
 	"testing"
@@ -172,6 +173,45 @@ func TestOversizeRequestWaitsForAFullBucket(t *testing.T) {
 	}
 }
 
+// TestRefusalAtAnUnchangedLimitWritesNothing: at the limit the bucket was
+// written at, its stored balance, ts and expiry already say what a refusal's
+// write would, so the refusal leaves them alone and keeps working while Redis
+// rejects writes.
+func TestRefusalAtAnUnchangedLimitWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	l, rdb, tenant := newBucket(t)
+	// The bucket's fields, and when its key expires.
+	read := func() (map[string]string, time.Duration) {
+		t.Helper()
+		fields, err := rdb.HGetAll(ctx, key(tenant)).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		expiry, err := rdb.PExpireTime(ctx, key(tenant)).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fields, expiry
+	}
+
+	mustAllow(t, l, tenant, 100_000, 90_000)
+	fields, expiry := read()
+	time.Sleep(10 * time.Millisecond) // so that an expiry set now would fall later
+	// 20,000 tokens to refill: 12 s.
+	mustRefuse(t, l, tenant, 100_000, 30_000, 12*time.Second)
+
+	gotFields, gotExpiry := read()
+	// Go note: the maps package (since Go 1.21) has generic helpers that work
+	// on any map type. maps.Equal reports whether two maps hold the same keys
+	// with the same values.
+	if !maps.Equal(gotFields, fields) {
+		t.Errorf("bucket after the refusal = %v, want it unchanged, %v", gotFields, fields)
+	}
+	if gotExpiry != expiry {
+		t.Errorf("key expires at %v after the refusal, want it unchanged, %v (since the Unix epoch)", gotExpiry, expiry)
+	}
+}
+
 func TestRefusalAfterLoweringLimitPreservesDebt(t *testing.T) {
 	ctx := context.Background()
 	l, rdb, tenant := newBucket(t)
@@ -188,8 +228,11 @@ func TestRefusalAfterLoweringLimitPreservesDebt(t *testing.T) {
 	if want := 3060 * time.Second; ttl > want || ttl <= want-500*time.Millisecond {
 		t.Errorf("TTL after lowering limit = %v, want just under %v", ttl, want)
 	}
-	if got := balance(t, rdb, tenant); got <= -50_000 || got >= -49_999 {
-		t.Errorf("balance = %v, want -50000 plus refill without a charge", got)
+	// At 1,000/min a token refills every 60 ms, which a busy machine can take
+	// between two calls. Allow the second of refill that the exact wait above
+	// already allows.
+	if got := balance(t, rdb, tenant); got <= -50_000 || got >= -50_000+1_000.0/60 {
+		t.Errorf("balance = %v, want -50000 plus under a second of refill, without a charge", got)
 	}
 }
 
@@ -233,6 +276,99 @@ func TestAdjustOnAMissingKey(t *testing.T) {
 	}
 	if got := balance(t, rdb, tenant); got != 70_000 {
 		t.Errorf("balance = %v, want 70000", got)
+	}
+}
+
+// TestAdjustAfterLoweringLimitPreservesDebt: Adjust's caller passes the limit
+// it looked up when its request started. Once the limit is lowered, that's the
+// old one, and refilling at it would pay off debt the new limit hasn't.
+func TestAdjustAfterLoweringLimitPreservesDebt(t *testing.T) {
+	ctx := context.Background()
+	l, rdb, tenant := newBucket(t)
+	mustAllow(t, l, tenant, 100_000, 150_000)
+	// Lowered to 1,000/min: 51,000 tokens to refill.
+	mustRefuse(t, l, tenant, 1_000, 1_000, 3060*time.Second)
+
+	// A request admitted at the old limit ends, refunding 5,000.
+	if err := l.Adjust(ctx, tenant, 100_000, 5_000); err != nil {
+		t.Fatal(err)
+	}
+	// As in TestRefusalAfterLoweringLimitPreservesDebt, allow a second of
+	// refill at 1,000/min.
+	if got := balance(t, rdb, tenant); got <= -45_000 || got >= -45_000+1_000.0/60 {
+		t.Errorf("balance = %v, want -45000 plus under a second of refill at 1,000/min", got)
+	}
+	ttl, err := rdb.PTTL(ctx, key(tenant)).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 46,000 tokens to refill at 1,000/min.
+	if want := 2760 * time.Second; ttl > want || ttl <= want-500*time.Millisecond {
+		t.Errorf("TTL = %v, want just under %v", ttl, want)
+	}
+}
+
+// redisNow reads Redis's clock, which the scripts go by, in seconds.
+func redisNow(t *testing.T, rdb *redis.Client) float64 {
+	t.Helper()
+	now, err := rdb.Time(context.Background()).Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return float64(now.UnixMicro()) / 1e6
+}
+
+// TestAdjustRefillsAtTheBucketsLimit: a bucket stored at 60,000/min, empty 3 s
+// ago, has refilled 3,000 tokens, whatever limit Adjust's caller passes.
+func TestAdjustRefillsAtTheBucketsLimit(t *testing.T) {
+	ctx := context.Background()
+	l, rdb, tenant := newBucket(t)
+	if err := rdb.HSet(ctx, key(tenant), "tokens", 0, "ts", redisNow(t, rdb)-3, "limit", 60_000).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.Adjust(ctx, tenant, 6_000_000, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Plus under a second's refill, 1,000 tokens, for the calls in between.
+	if got := balance(t, rdb, tenant); got < 3_000 || got >= 4_000 {
+		t.Errorf("balance = %v, want 3000 plus under a second of refill at the bucket's 60,000/min", got)
+	}
+	if got := rdb.HGet(ctx, key(tenant), "limit").Val(); got != "60000" {
+		t.Errorf("limit = %q, want the bucket's own, 60000", got)
+	}
+}
+
+// TestKeyWithoutAStoredLimit: a key written before the scripts stored the
+// limit has none. Adjust settles it at the caller's limit, and a refusal, which
+// can't tell whether the limit changed, writes it.
+func TestKeyWithoutAStoredLimit(t *testing.T) {
+	ctx := context.Background()
+	rdb := redistest.New(t)
+	l := New(rdb)
+	// A bucket as the scripts wrote it before, empty 3 s ago.
+	legacy := func() string {
+		t.Helper()
+		tenant := newTenant(t, rdb)
+		if err := rdb.HSet(ctx, key(tenant), "tokens", 0, "ts", redisNow(t, rdb)-3).Err(); err != nil {
+			t.Fatal(err)
+		}
+		return tenant
+	}
+
+	tenant := legacy()
+	if err := l.Adjust(ctx, tenant, 60_000, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := balance(t, rdb, tenant); got < 3_000 || got >= 4_000 {
+		t.Errorf("after Adjust: balance = %v, want 3000 plus under a second of refill at the caller's 60,000/min", got)
+	}
+
+	tenant = legacy()
+	// 27,000 tokens to refill: 27 s.
+	mustRefuse(t, l, tenant, 60_000, 30_000, 27*time.Second)
+	if got := rdb.HGet(ctx, key(tenant), "limit").Val(); got != "60000" {
+		t.Errorf("after a refusal: limit = %q, want the caller's, 60000", got)
 	}
 }
 
@@ -299,7 +435,7 @@ func TestHugeCostIsClamped(t *testing.T) {
 
 	mustAllow(t, l, tenant, 1, math.MaxInt64)
 	if got := balance(t, rdb, tenant); got != 1-MaxCost {
-		t.Errorf("balance = %v, want 1 - MaxCost = %d", got, 1-MaxCost)
+		t.Errorf("balance = %v, want 1 - MaxCost = %d", got, int64(1-MaxCost))
 	}
 	if got, want := ttlSeconds(t, rdb, tenant), int64(60*MaxCost); got < want-1 || got > want {
 		t.Errorf("TTL = %d s, want %d", got, want)
@@ -328,7 +464,7 @@ func TestDebtStopsAtMaxCost(t *testing.T) {
 		}
 	}
 	if got := balance(t, rdb, tenant); got != -MaxCost {
-		t.Errorf("balance = %v, want -MaxCost = %d", got, -MaxCost)
+		t.Errorf("balance = %v, want -MaxCost = %d", got, int64(-MaxCost))
 	}
 	if got, want := ttlSeconds(t, rdb, tenant), int64(60*(1+MaxCost)); got < want-1 || got > want {
 		t.Errorf("TTL = %d s, want %d", got, want)
@@ -348,7 +484,7 @@ func TestFractionalBalanceSurvivesExactly(t *testing.T) {
 	want := start - 1_000
 	seed := func() {
 		t.Helper()
-		if err := rdb.HSet(ctx, key(tenant), "tokens", start, "ts", 9_999_999_999).Err(); err != nil {
+		if err := rdb.HSet(ctx, key(tenant), "tokens", start, "ts", int64(9_999_999_999)).Err(); err != nil {
 			t.Fatal(err)
 		}
 	}

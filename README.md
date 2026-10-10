@@ -30,7 +30,10 @@ next.
   one Lua script on Redis's clock, so concurrent requests can't spend the same
   tokens and replicas agree on time. A request bigger than a whole minute's
   limit gets in on a full bucket and leaves the tenant in debt. A bucket's key
-  expires only when it would be full again, so expiry never forgives debt.
+  expires only when it would be full again at its limit, so expiry never
+  forgives debt, with one exception: after a limit is lowered, an idle
+  tenant's key can still expire when its bucket would have been full at the
+  old limit.
 - **Token estimate per request.** Before forwarding, the gateway estimates a
   request's tokens from its body: one per 4 bytes of text (system prompt, tools
   and every other field included), plus a flat 1,600 per image, audio,
@@ -456,7 +459,7 @@ rotation even though it is working fine.
 | `make db-up`    | Start local Postgres and Redis         |
 | `make db-down`  | Stop local Postgres and Redis          |
 | `make migrate`  | Apply pending database migrations      |
-| `make test`     | Run all tests                          |
+| `make test`     | Run all tests (needs `make db-up`)     |
 | `make vet`      | Run `go vet` (catches suspicious code) |
 | `make fmt`      | Format all source files                |
 | `make tidy`     | Sync `go.mod` / `go.sum`               |

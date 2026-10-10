@@ -1,13 +1,15 @@
 -- Admit a request to a tenant's token bucket, or say how long it must wait.
 --
--- KEYS[1]  the bucket: a hash of tokens (the balance) and ts (when the
---          balance was last written, in seconds)
+-- KEYS[1]  the bucket: a hash of tokens (the balance), ts (when the balance
+--          was last written, in seconds) and limit (the limit it was last
+--          written and its expiry set at)
 -- ARGV[1]  limit: tokens per minute, which is also the bucket's capacity
 -- ARGV[2]  cost: the request's tokens
 --
 -- Returns 0 when the request is admitted and charged, otherwise the whole
--- seconds until the bucket could admit it. A refusal charges nothing, but
--- saves the refill and expiry at the current limit.
+-- seconds until the bucket could admit it. A refusal charges nothing, and
+-- writes nothing unless the limit changed: then it saves the refill and
+-- expiry at the new limit.
 
 local key = KEYS[1]
 local limit = tonumber(ARGV[1])
@@ -19,7 +21,7 @@ local clock = redis.call('TIME')
 local now = tonumber(clock[1]) + tonumber(clock[2]) / 1000000
 
 -- A missing key is a full bucket.
-local state = redis.call('HMGET', key, 'tokens', 'ts')
+local state = redis.call('HMGET', key, 'tokens', 'ts', 'limit')
 local tokens = tonumber(state[1]) or limit
 local ts = tonumber(state[2]) or now
 
@@ -35,6 +37,16 @@ if tokens < need then
   -- Redis truncates a number a script returns to an integer, so round up
   -- here. need > tokens, so the wait is at least 1.
   wait = math.ceil((need - tokens) * 60 / limit)
+  -- At the limit the bucket was written at, write nothing: nothing was
+  -- charged and the refill is linear, so the stored balance and ts give the
+  -- same refill from here on (or less, if the clock went back), and the
+  -- expiry still falls when the bucket is full. That keeps a refusal working
+  -- while Redis rejects writes. A changed limit must be written, or an expiry
+  -- set at the old one could fire while debt remains; so must a key from
+  -- before the scripts stored the limit, which has none.
+  if tonumber(state[3]) == limit then
+    return wait
+  end
 else
   -- Charge the full cost. The balance may go negative: debt, which holds back
   -- the next request until the refill has paid it off.
@@ -44,7 +56,7 @@ end
 -- Redis formats the numbers passed to redis.call itself: whole ones as
 -- integers, the rest with every digit needed to read back the same number.
 -- (Lua's tostring would keep only 14 digits.)
-redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+redis.call('HSET', key, 'tokens', tokens, 'ts', now, 'limit', limit)
 
 -- Expire when the bucket would be full again. A missing key reads as full,
 -- so expiring sooner would forgive debt. EXPIRE takes whole seconds, and 0

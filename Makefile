@@ -47,8 +47,11 @@ db-down:
 migrate:
 	DATABASE_URL='$(DATABASE_URL)' go run ./cmd/migrate
 
+# With -race, as CI runs them. The URLs point the Postgres and Redis tests at
+# the compose stack (make db-up); without them those tests skip and still
+# print ok.
 test:
-	go test ./...
+	DATABASE_URL='$(DATABASE_URL)' REDIS_URL='$(REDIS_URL)' go test -race ./...
 
 vet:
 	go vet ./...

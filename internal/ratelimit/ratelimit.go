@@ -12,9 +12,11 @@
 // scripts read Redis's clock, so replicas whose clocks disagree still refill
 // alike.
 //
-// A bucket's key expires when the bucket would be full again. A missing key
-// reads as a full bucket, so an idle tenant costs Redis nothing, and expiry
-// never forgives debt.
+// A bucket's key expires when the bucket would be full again at its limit. A
+// missing key reads as a full bucket, so an idle tenant costs Redis nothing,
+// and expiry never forgives debt, with one exception: after a limit is
+// lowered, an idle tenant's key can still expire when its bucket would have
+// been full at the old limit.
 package ratelimit
 
 import (
@@ -71,6 +73,11 @@ type Limiter struct {
 
 // New returns a Limiter that keeps its buckets in rdb, usually a
 // *redis.Client.
+//
+// rdb must not retry commands: in go-redis, set MaxRetries: -1 (0 means the
+// default, 3). The scripts aren't idempotent: after a lost reply (io.EOF,
+// ECONNRESET), a retry sends the EVALSHA again, which charges or refunds
+// twice.
 func New(rdb redis.Scripter) *Limiter {
 	return &Limiter{rdb: rdb}
 }
@@ -85,7 +92,8 @@ func key(tenantID string) string {
 // bucket, which holds up to limit tokens and refills at limit tokens per
 // minute. It reports whether the request may go ahead and, if not, how long
 // until the bucket could admit it: whole seconds, at least one. A refused
-// request is not charged.
+// request is not charged, and unless limit has changed, nothing is written.
+// The bucket keeps the latest Allow's limit, which Adjust settles at.
 //
 // A limit below 1 or a negative cost is an error and never reaches Redis: the
 // scripts divide by the limit.
@@ -113,14 +121,20 @@ func (l *Limiter) Allow(ctx context.Context, tenantID string, limit, cost int64)
 }
 
 // Adjust settles a charge once a request's real cost is known: a positive
-// delta refunds tokens, a negative one charges more. A refund never fills the
-// bucket past limit. A charge may take it into debt, but never deeper than
-// MaxCost, however many charges arrive, so any delta is safe.
+// delta refunds tokens, a negative one charges more. It settles at the
+// bucket's own limit, the latest Allow's, as the caller's may be out of date
+// by the time its request ends. limit is used only when the bucket has none:
+// its key is missing, or predates the stored limit. A refund never fills the
+// bucket past its limit. A charge may take it into debt, but never deeper
+// than MaxCost, however many charges arrive, so any delta is safe.
 //
 // As with Allow, a limit below 1 is an error and never reaches Redis.
 func (l *Limiter) Adjust(ctx context.Context, tenantID string, limit, delta int64) error {
 	if limit <= 0 {
 		return fmt.Errorf("ratelimit: limit must be positive, got %d", limit)
 	}
-	return adjustScript.Run(ctx, l.rdb, []string{key(tenantID)}, limit, delta, MaxCost).Err()
+	// Go note: Run takes its arguments as ...any, where an untyped constant
+	// becomes an int, too small for MaxCost on 32-bit platforms. int64(...)
+	// gives it a type that holds it everywhere.
+	return adjustScript.Run(ctx, l.rdb, []string{key(tenantID)}, limit, delta, int64(MaxCost)).Err()
 }
