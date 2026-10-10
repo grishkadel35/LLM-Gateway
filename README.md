@@ -25,6 +25,19 @@ next.
 
 ### What changed
 
+- **Local Ollama.** `config.yaml` now has an `ollama` provider: a model on this
+  machine, served at `/ollama/` and metered like the hosted ones. It is keyless
+  (`auth: none`; clients still need a gateway key) and `free: true`, so every
+  usage row costs 0 with its tokens still recorded. Provider settings such as
+  `url` and `timeout` accept `${VAR:-default}`. `max_concurrency` queues
+  requests for a busy provider and answers `503 provider_busy` when
+  `queue_timeout` runs out; a background check of `health_path` shows in
+  `/health`; and an optional `fallback` retries a failed non-streaming request
+  on another provider (Groq), off by default because it spends real money.
+  `GET /metrics` serves Prometheus metrics. A live check against Ollama 0.40.2
+  with `qwen3.5:9b` showed that it thinks by default, which is slow and counts
+  as output tokens, and that a model that isn't loaded takes about 30 s to
+  load. See [Running with Ollama](#running-with-ollama).
 - **Token bucket in Redis (not wired in yet).** `internal/ratelimit` keeps each
   tenant's tokens-per-minute bucket in Redis. Admission and refunds each run as
   one Lua script on Redis's clock, so concurrent requests can't spend the same
@@ -360,7 +373,7 @@ providers:
     url: https://api.openai.com
     timeout: 600                 # seconds to wait for response headers
     key: ${OPENAI_API_KEY}       # environment reference, never a literal
-    auth: bearer                 # bearer | x-api-key | x-goog-api-key
+    auth: bearer                 # bearer | x-api-key | x-goog-api-key | none
     format: openai               # openai | anthropic | gemini
 
   anthropic:
@@ -373,18 +386,33 @@ providers:
 ```
 
 `port`, `host`, `max_request_bytes` (default 32 MiB) and each provider's
-`timeout` are optional. `url`, `key`,
-`auth` and `format` are required per provider.
+`timeout` are optional, and so are the provider settings `free`,
+`max_concurrency`, `queue_timeout`, `health_path` and `fallback`, described in
+[Running with Ollama](#running-with-ollama). `url`, `auth` and `format` are
+required per provider, and so is `key` unless `auth` is `none`.
 
 `format` is the shape of the provider's API, which decides how the gateway
 reads token usage from its responses. It names a wire shape, not a company:
 Groq and other OpenAI-compatible providers are `openai`.
 
+`auth: none` is for an upstream that takes no key, such as a local Ollama. No
+credential is sent upstream, and `key` must be left out: it would be silently
+ignored, so it is a startup error. Whatever credential the client sends is still
+stripped, and clients still need a gateway key.
+
 **Keys are always environment references.** `config.yaml` is committed to git;
 a literal key there would be published, so `key` must be exactly one `${VAR}`
-and anything else is a startup error. Expansion happens only on the `key`
-field, so other values containing `$` are left alone. Unknown fields are
-startup errors too, so a typo can't silently fall back to a default.
+and anything else is a startup error. That includes `${VAR:-default}`: a default
+would be a literal key committed to git. Unknown fields are startup errors too,
+so a typo can't silently fall back to a default.
+
+A few other fields may be environment references, so a machine can override
+them without editing the file: `url`, `timeout`, `max_concurrency`,
+`queue_timeout` and `fallback.enabled`. Each takes a whole-value `${VAR}` or
+`${VAR:-default}`. As in the shell, an unset or empty variable uses the
+default; with no default, it is a startup error naming the variable and the
+line. Expansion happens only on these fields and on `key`, so other values
+containing `$` are left alone.
 
 Point `GATEWAY_CONFIG` at a different file to use one:
 
@@ -397,7 +425,9 @@ request time. Streaming completions hold the connection open for minutes, and a
 total-request cap would cut them off mid-generation. A non-streaming reply
 sends no headers until the whole generation is done, which is why the default
 is 600 seconds, the same as the official SDKs. A timeout returns `504`; an
-unreachable provider returns `502`.
+unreachable provider returns `502`; a request that waits longer than
+`queue_timeout` for a free slot returns `503` with error type `provider_busy`
+and `Retry-After: 1`, and that wait doesn't count against `timeout`.
 
 ### Adding a provider
 
@@ -415,11 +445,122 @@ Anything OpenAI-compatible is pure config. Groq is in the default file as proof
 Providers needing request signing rather than a static header — AWS Bedrock's
 SigV4, Vertex AI's OAuth — can't be expressed this way and would need code.
 
+## Running with Ollama
+
+Ollama runs models on your own machine: no API key and no per-token bill. The
+default `config.yaml` already has an `ollama` provider, so once Ollama is
+installed the gateway serves it at `/ollama/`, metered like any other provider.
+
+```sh
+brew install ollama
+brew services start ollama   # runs in the background, restarts at login
+ollama pull qwen3.5:9b       # 7.6 GB on disk
+```
+
+Ollama listens on `127.0.0.1:11434`, and `brew services stop ollama` stops it.
+The provider block:
+
+```yaml
+  ollama:
+    url: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434}
+    timeout: ${OLLAMA_TIMEOUT_SECONDS:-120}
+    auth: none
+    format: openai
+    # Every usage row costs exactly 0; its tokens are still recorded.
+    free: true
+    max_concurrency: ${OLLAMA_MAX_CONCURRENCY:-1}
+    queue_timeout: ${OLLAMA_QUEUE_TIMEOUT_SECONDS:-30}
+    health_path: /api/tags
+    fallback:
+      enabled: ${OLLAMA_FALLBACK_ENABLED:-false}
+      provider: groq
+      models:
+        "qwen3.5:9b": qwen/qwen3.8-27b
+```
+
+`auth: none` because Ollama takes no key (see [Configuration](#configuration));
+`free: true` because it costs nothing, though its tokens still belong in the
+usage rows. The environment variables are all optional, and
+[`.env.example`](.env.example) lists them:
+
+| Variable                       | Default                  | Meaning                                                           |
+| ------------------------------ | ------------------------ | ----------------------------------------------------------------- |
+| `OLLAMA_BASE_URL`              | `http://127.0.0.1:11434` | Where Ollama listens.                                             |
+| `OLLAMA_TIMEOUT_SECONDS`       | `120`                    | Seconds to wait for Ollama's response headers.                    |
+| `OLLAMA_MAX_CONCURRENCY`       | `1`                      | Requests sent to Ollama at once; `0` is unlimited.                |
+| `OLLAMA_QUEUE_TIMEOUT_SECONDS` | `30`                     | Seconds a request waits for a free slot before it gets a `503`.   |
+| `OLLAMA_FALLBACK_ENABLED`      | `false`                  | `true` retries failed requests on Groq, which costs real money.   |
+
+Call it like any provider, with a gateway key:
+
+```sh
+curl http://127.0.0.1:8080/ollama/v1/chat/completions \
+  -H "Authorization: Bearer gw_..." \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5:9b","reasoning_effort":"none","messages":[{"role":"user","content":"hi"}]}'
+```
+
+With the OpenAI SDK, set `base_url` to `http://127.0.0.1:8080/ollama/v1`, as in
+[Quick start](#quick-start).
+
+**Thinking.** qwen3.5 thinks before it answers by default. That is slower, and
+the thinking counts as output tokens: a one-word answer took 362 completion
+tokens with thinking and 1 without. `"reasoning_effort": "none"` in the request
+turns it off. With thinking on, the thinking text arrives in the message's
+`reasoning` field.
+
+**Cold start.** A request that finds the model unloaded loads it first, which
+took about 30 s on a 16 GB Mac. Ollama unloads an idle model after 5 minutes by
+default (its own `OLLAMA_KEEP_ALIVE`). A non-streaming reply sends no headers
+until it is done, so it has to finish within `timeout` (120 s by default), the
+load included.
+
+**Usage.** Ollama's streams carry token usage only when the request sets
+`stream_options.include_usage`, which the gateway always does, as for OpenAI and
+Groq. `cached_tokens` is part of `prompt_tokens`, as at OpenAI.
+
+**Concurrency.** `max_concurrency` caps how many requests go to a provider at
+once; `0`, the default when the field is left out, means unlimited. The
+`ollama` block allows 1: a local model has one machine to run on, so extra
+requests wait their turn instead of competing. Waiting requests are served in
+arrival order, and one that waits longer than `queue_timeout` seconds (default
+30) gets `503` with `{"error":{"type":"provider_busy",...}}` and
+`Retry-After: 1`. The wait doesn't count against `timeout`.
+[`gateway_concurrency_wait_seconds`](#metrics) shows how long requests wait.
+
+**Health.** Every 15 s the gateway sends a `GET` to `url` plus `health_path`
+(`/api/tags`, Ollama's list of installed models), with a 5 s timeout. The result
+appears in [`/health`](#endpoints) and as `gateway_provider_up`.
+
+**Fallback.** Off by default: `OLLAMA_FALLBACK_ENABLED=true` turns it on. A
+fallback **spends real money** at the target provider (Groq here), which is why
+it is opt-in. A non-streaming request whose model is listed under
+`fallback.models` is retried on `fallback.provider` when Ollama is unreachable,
+times out or answers 5xx; a streaming request is not. Only `"model"` is
+rewritten, to the name on the right (`qwen3.5:9b` becomes `qwen/qwen3.8-27b`).
+It never happens on a 4xx, a client disconnect or a queue timeout. Responses on
+a route with fallback enabled say who answered:
+
+- `X-Gateway-Provider: <provider that answered>`
+- `X-Gateway-Fallback: true|false`
+
+Each attempt leaves its own usage row under the same request ID: the failed
+Ollama attempt costs 0, and the Groq attempt is priced normally.
+
+**Docker.** The gateway has no compose service yet (Week 7). Once it runs in a
+container, set `OLLAMA_BASE_URL=http://host.docker.internal:11434` and add
+`extra_hosts: ["host.docker.internal:host-gateway"]` to its service. Under
+Colima (see [Database](#database)), containers can't reach services bound to
+the Mac's `127.0.0.1`, so Ollama has to listen beyond loopback (its own
+`OLLAMA_HOST` setting). Binding `0.0.0.0` exposes Ollama's unauthenticated API
+to the network: bind it to the Colima bridge address or firewall it.
+
 ## Endpoints
 
 | Path                              | Behavior                                                                                  |
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
-| `GET /health`                     | Returns `{"status":"ok"}`. Handled locally, no key needed.                                |
+| `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
+| `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
 | `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below). Prefix stripped, forwarded with the provider's key. |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
@@ -444,9 +585,21 @@ typo in a base URL can never silently send traffic — and spend — somewhere
 unintended.
 
 `/health` answers "is this process alive and serving?", which is what a load
-balancer or container orchestrator needs. It deliberately does not check the
-providers — otherwise one provider's outage would take the gateway out of
-rotation even though it is working fine.
+balancer or container orchestrator needs. It always answers `200` and never
+calls a provider itself — otherwise one provider's outage would take the gateway
+out of rotation even though it is working fine.
+
+What it adds is the last result of the gateway's background check of each
+provider that has a `health_path`:
+
+```json
+{"status":"ok","providers":{"ollama":{"status":"up","checked_at":"2026-10-10T16:30:00Z"}}}
+```
+
+A provider's `status` is `up` or `down`, or `unknown` before its first check has
+run; `checked_at` is an RFC 3339 time. A `down` provider is information for
+whoever reads the body or `gateway_provider_up`; it never changes the `200`.
+With no checked provider the body is exactly `{"status":"ok"}`.
 
 ## Make targets
 
@@ -472,9 +625,11 @@ rotation even though it is working fine.
 cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
-internal/proxy/           the httputil.ReverseProxy and its hooks
+internal/proxy/           the httputil.ReverseProxy, its hooks and the fallback
 internal/middleware/      request IDs, request logging, tenant key auth
 internal/health/          GET /health
+internal/concurrency/     per-provider request limit and its queue
+internal/metrics/         Prometheus metrics
 internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
 cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 internal/db/              Postgres schema: embedded goose migrations
@@ -522,3 +677,21 @@ sent its own `X-Request-ID`, it is logged as `client_request_id`.
 
 Plus one line per upstream response, recording which provider answered, the
 status, content length, and whether the response was streamed.
+
+### Metrics
+
+`GET /metrics` serves Prometheus text format and needs no key. The gateway binds
+to loopback by default, so only this machine can read it; Week 6 decides between
+admin auth and a separate port. No metric has a tenant or model label.
+
+| Metric                                       | Meaning                                                                                 |
+| -------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`, `403`, `413` and `503` included.             |
+| `gateway_request_duration_seconds{provider}` | Histogram of the whole response, streaming included.                                    |
+| `gateway_tokens_total{provider,type}`        | Tokens by `type`: `input`, `cached_input`, `cache_write`, `cache_write_1h` or `output`. |
+| `gateway_concurrency_wait_seconds{provider}` | Histogram of time spent waiting for a slot.                                             |
+| `gateway_provider_up{provider}`              | `1` or `0`, from the health check.                                                      |
+| `gateway_fallbacks_total{from,to,reason}`    | Fallbacks taken; `reason` is `unreachable`, `timeout` or `server_error`.                |
+
+Tokens are labelled with the provider that produced them, so a fallback's tokens
+count under `groq` while its request counts under `ollama`.
