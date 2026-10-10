@@ -309,6 +309,9 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	if ollama.URL != "http://127.0.0.1:11434" || ollama.TimeoutSeconds != 120 {
 		t.Errorf("ollama url, timeout = %q, %d; want the defaults http://127.0.0.1:11434, 120", ollama.URL, ollama.TimeoutSeconds)
 	}
+	if !ollama.Free {
+		t.Error("ollama free = false, want true: a local model costs nothing")
+	}
 
 	t.Setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434")
 	cfg, err = Load(path)

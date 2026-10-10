@@ -173,7 +173,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, logger), logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), logger)
 	if err != nil {
 		return err
 	}
@@ -290,8 +290,8 @@ func openDB(dsn string) (*sql.DB, error) {
 
 // recordUsage returns a usageFunc that turns each provider response into a
 // usage_logs row, priced, and queues it on w. It never blocks: w drops rather
-// than wait.
-func recordUsage(w *usage.Writer, logger *slog.Logger) usageFunc {
+// than wait. A provider marked free in providers costs 0 per row.
+func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, logger *slog.Logger) usageFunc {
 	return func(ctx context.Context, provider string, r usage.Result) {
 		t, key, ok := middleware.TenantFrom(ctx)
 		if !ok {
@@ -319,11 +319,14 @@ func recordUsage(w *usage.Writer, logger *slog.Logger) usageFunc {
 			CreatedAt:         req.Received,
 		}
 
-		// Cost is recorded only when the usage is known. A response cut short
-		// (or too large to parse) may be missing its usage, so its cost is
-		// NULL, never a guess and never 0. A complete response with no tokens,
-		// such as an upstream error, really did cost nothing.
+		// Cost is recorded only when it is known. For a free provider it
+		// always is: 0, even for a response cut short. Otherwise a response
+		// cut short (or too large to parse) may be missing its usage, so its
+		// cost is NULL, never a guess and never 0. A complete response with no
+		// tokens, such as an upstream error, really did cost nothing.
 		switch {
+		case providers[provider].Free:
+			row.CostMicros = new(int64)
 		case !r.Complete:
 			logger.Warn("usage incomplete; logged without cost",
 				"request_id", row.RequestID, "provider", provider, "model", r.Model)

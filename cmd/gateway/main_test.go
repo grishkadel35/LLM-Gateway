@@ -806,7 +806,7 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, logger), logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -926,7 +926,7 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, logger), logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,7 +994,8 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 // TestRecordUsageCost: cost is recorded only when the usage is known. A
 // response cut short, or too large to parse, has unknown usage, so its cost
 // is NULL, not 0; a complete response with no tokens (an upstream error)
-// really did cost nothing.
+// really did cost nothing. A free provider's rows cost 0, complete or not,
+// and every row keeps its tokens.
 func TestRecordUsageCost(t *testing.T) {
 	gpt4o := usage.Usage{Model: "gpt-4o", Input: 15, CachedInput: 5, Output: 10}
 	cases := []struct {
@@ -1009,6 +1010,8 @@ func TestRecordUsageCost(t *testing.T) {
 		{"complete, unpriced", "groq", usage.Result{Usage: usage.Usage{Model: "llama-3.3-70b-versatile", Input: 10}, Status: 200, Complete: true}, true, 0},
 		{"cut off before usage arrived", "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o"}, Status: 200}, true, 0},
 		{"cut off with partial usage", "anthropic", usage.Result{Usage: usage.Usage{Model: "claude-sonnet-4", Input: 15}, Status: 200}, true, 0},
+		{"free, complete", "ollama", usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15, Output: 10}, Status: 200, Complete: true}, false, 0},
+		{"free, cut off", "ollama", usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15}, Status: 200}, false, 0},
 	}
 
 	conn := dbtest.New(t)
@@ -1023,7 +1026,7 @@ func TestRecordUsageCost(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	record := recordUsage(writer, logger)
+	record := recordUsage(writer, map[string]config.ProviderConfig{"ollama": {Free: true}}, logger)
 
 	// recordUsage reads the tenant and request ID from the context, so each
 	// call runs inside the real middleware.
@@ -1045,8 +1048,12 @@ func TestRecordUsageCost(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var cost sql.NullInt64
-			if err := conn.QueryRow(`SELECT cost_micros FROM usage_logs WHERE request_id = $1`, ids[i]).Scan(&cost); err != nil {
+			var input int64
+			if err := conn.QueryRow(`SELECT cost_micros, input_tokens FROM usage_logs WHERE request_id = $1`, ids[i]).Scan(&cost, &input); err != nil {
 				t.Fatal(err)
+			}
+			if input != tc.result.Usage.Input {
+				t.Errorf("input_tokens = %d, want %d", input, tc.result.Usage.Input)
 			}
 			if tc.wantNull && cost.Valid {
 				t.Errorf("cost = %d, want NULL", cost.Int64)

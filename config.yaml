@@ -75,3 +75,5 @@ providers:
     timeout: ${OLLAMA_TIMEOUT_SECONDS:-120}
     auth: none
     format: openai
+    # Every usage row costs exactly 0; its tokens are still recorded.
+    free: true

@@ -93,6 +93,9 @@ type ProviderConfig struct {
 	// required: it decides how usage is read, and a guess would mis-meter.
 	Format  string            `yaml:"format"`
 	Headers map[string]string `yaml:"headers"`
+	// Free marks a provider that costs nothing, such as a local Ollama: each
+	// usage row is priced at exactly 0, with its tokens still recorded.
+	Free bool `yaml:"free"`
 }
 
 // Timeout returns the configured timeout as a time.Duration.
