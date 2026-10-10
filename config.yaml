@@ -6,11 +6,11 @@
 # environment references, expanded at startup; an unset variable is a startup
 # error, not a surprise 401 on the first request.
 #
-# A provider's url, timeout, max_concurrency and queue_timeout may be
-# environment references too, and may carry a default:
-# ${OLLAMA_BASE_URL:-http://127.0.0.1:11434} is the variable when it is set
-# and non-empty, the default otherwise. A key never takes a default: that would
-# be a literal key in git.
+# A provider's url, timeout, max_concurrency, queue_timeout and
+# fallback.enabled may be environment references too, and may carry a
+# default: ${OLLAMA_BASE_URL:-http://127.0.0.1:11434} is the variable when it
+# is set and non-empty, the default otherwise. A key never takes a default:
+# that would be a literal key in git.
 
 # Port the gateway itself listens on.
 port: 8080
@@ -85,3 +85,12 @@ providers:
     queue_timeout: ${OLLAMA_QUEUE_TIMEOUT_SECONDS:-30}
     # GET every 15 seconds; /health and gateway_provider_up report the result.
     health_path: /api/tags
+    # Off unless OLLAMA_FALLBACK_ENABLED is true. When Ollama is unreachable,
+    # times out or answers 5xx, a non-streaming request for a model listed
+    # here is retried on groq as the model it maps to. A streaming request, a
+    # 4xx or a full queue never falls back.
+    fallback:
+      enabled: ${OLLAMA_FALLBACK_ENABLED:-false}
+      provider: groq
+      models:
+        "qwen3.5:9b": qwen/qwen3.8-27b

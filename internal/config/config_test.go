@@ -280,6 +280,65 @@ func TestLoadConcurrencyCap(t *testing.T) {
 	}
 }
 
+// TestLoadFallback: a fallback is checked only when enabled, and must then
+// name another openai-format provider without a fallback of its own, and map
+// at least one model. enabled may be an environment reference.
+func TestLoadFallback(t *testing.T) {
+	const (
+		ollama = "providers:\n  ollama:\n    url: http://127.0.0.1:11434\n    auth: none\n    format: openai\n"
+		groq   = "  groq:\n    url: https://api.groq.com/openai\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"
+		claude = "  claude:\n    url: https://api.anthropic.com\n    key: ${TEST_KEY}\n    auth: x-api-key\n    format: anthropic\n"
+		mapped = "\n        \"qwen3.5:9b\": qwen/qwen3.8-27b"
+	)
+	// fallback is a provider's fallback block.
+	fallback := func(enabled, target, models string) string {
+		return "    fallback:\n      enabled: " + enabled + "\n      provider: " + target + "\n      models:" + models + "\n"
+	}
+
+	cases := []struct {
+		name        string
+		yaml        string
+		env         string // TEST_FALLBACK's value; "" leaves it unset
+		wantEnabled bool
+		wantErr     string // a substring of Load's error, for a config that fails
+	}{
+		{name: "on", yaml: ollama + fallback("true", "groq", mapped) + groq, wantEnabled: true},
+		{name: "on from the environment", yaml: ollama + fallback("${TEST_FALLBACK:-false}", "groq", mapped) + groq, env: "true", wantEnabled: true},
+		{name: "off by the environment's default", yaml: ollama + fallback("${TEST_FALLBACK:-false}", "groq", mapped) + groq},
+		{name: "off, so unchecked", yaml: ollama + fallback("false", "nowhere", " {}")},
+		{name: "unknown provider", yaml: ollama + fallback("true", "nowhere", mapped), wantErr: "not a configured provider"},
+		{name: "itself", yaml: ollama + fallback("true", "ollama", mapped), wantErr: "another provider"},
+		{name: "not openai", yaml: ollama + fallback("true", "claude", mapped) + claude, wantErr: "format openai"},
+		{name: "chained", yaml: ollama + fallback("true", "groq", mapped) + groq + fallback("true", "ollama", mapped), wantErr: "don't chain"},
+		{name: "no models", yaml: ollama + fallback("true", "groq", " {}") + groq, wantErr: "at least one model"},
+		{name: "empty model name", yaml: ollama + fallback("true", "groq", "\n        \"qwen3.5:9b\": \"\"") + groq, wantErr: "empty model"},
+	}
+
+	setTestKey(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			unsetenv(t, "TEST_FALLBACK")
+			if tc.env != "" {
+				t.Setenv("TEST_FALLBACK", tc.env)
+			}
+
+			cfg, err := Load(writeConfig(t, tc.yaml))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() = %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if got := bool(cfg.Providers["ollama"].Fallback.Enabled); got != tc.wantEnabled {
+				t.Errorf("fallback enabled = %v, want %v", got, tc.wantEnabled)
+			}
+		})
+	}
+}
+
 // TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
 // configured with auth none and no key line at all.
 func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
@@ -314,6 +373,7 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	unsetenv(t, "OLLAMA_TIMEOUT_SECONDS")
 	unsetenv(t, "OLLAMA_MAX_CONCURRENCY")
 	unsetenv(t, "OLLAMA_QUEUE_TIMEOUT_SECONDS")
+	unsetenv(t, "OLLAMA_FALLBACK_ENABLED")
 
 	path := filepath.Join("..", "..", "config.yaml")
 	cfg, err := Load(path)
@@ -351,14 +411,22 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	if ollama.HealthPath != "/api/tags" {
 		t.Errorf("ollama health_path = %q, want /api/tags", ollama.HealthPath)
 	}
+	if ollama.Fallback.Enabled {
+		t.Error("ollama's fallback is on, want it off unless OLLAMA_FALLBACK_ENABLED says so")
+	}
 
 	t.Setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434")
+	// Turned on, the committed fallback block must pass validation.
+	t.Setenv("OLLAMA_FALLBACK_ENABLED", "true")
 	cfg, err = Load(path)
 	if err != nil {
-		t.Fatalf("Load() with OLLAMA_BASE_URL set returned error: %v", err)
+		t.Fatalf("Load() with OLLAMA_BASE_URL and OLLAMA_FALLBACK_ENABLED set returned error: %v", err)
 	}
 	if got := cfg.Providers["ollama"].URL; got != "http://10.0.0.5:11434" {
 		t.Errorf("ollama url = %q, want OLLAMA_BASE_URL's %q", got, "http://10.0.0.5:11434")
+	}
+	if fb := cfg.Providers["ollama"].Fallback; !fb.Enabled || fb.Provider != "groq" || fb.Models["qwen3.5:9b"] != "qwen/qwen3.8-27b" {
+		t.Errorf("ollama fallback = %+v, want on, to groq, qwen3.5:9b as qwen/qwen3.8-27b", fb)
 	}
 }
 

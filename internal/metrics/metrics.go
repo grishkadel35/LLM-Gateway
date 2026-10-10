@@ -28,12 +28,13 @@ var waitBuckets = []float64{0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
 // Metrics holds every metric the gateway exports.
 type Metrics struct {
-	registry *prometheus.Registry
-	requests *prometheus.CounterVec
-	duration *prometheus.HistogramVec
-	tokens   *prometheus.CounterVec
-	wait     *prometheus.HistogramVec
-	up       *prometheus.GaugeVec
+	registry  *prometheus.Registry
+	requests  *prometheus.CounterVec
+	duration  *prometheus.HistogramVec
+	tokens    *prometheus.CounterVec
+	wait      *prometheus.HistogramVec
+	up        *prometheus.GaugeVec
+	fallbacks *prometheus.CounterVec
 }
 
 // New returns the gateway's metrics, on a registry of their own.
@@ -62,8 +63,12 @@ func New() *Metrics {
 			Name: "gateway_provider_up",
 			Help: "1 if the provider answered its latest health check with a 2xx, 0 if not. Only providers with a health_path are checked.",
 		}, []string{"provider"}),
+		fallbacks: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_fallbacks_total",
+			Help: "Requests handed from a failed provider to its fallback, by why it failed: unreachable, timeout or server_error.",
+		}, []string{"from", "to", "reason"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait, m.up)
+	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait, m.up, m.fallbacks)
 	return m
 }
 
@@ -130,6 +135,12 @@ func (m *Metrics) ProviderUp(provider string, up bool) {
 		v = 1
 	}
 	m.up.WithLabelValues(provider).Set(v)
+}
+
+// Fallback counts a request handed from provider from to its fallback to,
+// for reason.
+func (m *Metrics) Fallback(from, to, reason string) {
+	m.fallbacks.WithLabelValues(from, to, reason).Inc()
 }
 
 // statusRecorder remembers the status a handler sent.

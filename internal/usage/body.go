@@ -62,10 +62,10 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 // It reads the body once, up to maxBytes (413 request_too_large beyond
 // that), and decodes it into map[string]json.RawMessage, so unknown fields
 // and integers too large for a float64 pass through untouched. Every rewrite
-// goes through here: for now, only forcing stream_options.include_usage on for
-// OpenAI-format streams. When nothing is rewritten, the provider receives the
-// client's exact bytes. A body that isn't JSON is forwarded unchanged for the
-// provider to reject.
+// goes through this file: here, forcing stream_options.include_usage on for
+// OpenAI-format streams, and WithModel's model swap for a fallback. When
+// nothing is rewritten, the provider receives the client's exact bytes. A body
+// that isn't JSON is forwarded unchanged for the provider to reject.
 //
 // It also records the request's InputEstimate, OutputCap and Choices. They are
 // read from the client's bytes and never change the body.
@@ -146,6 +146,42 @@ func includeUsage(fields map[string]json.RawMessage) bool {
 	}
 	fields["stream_options"] = encoded
 	return true
+}
+
+// WithModel returns a copy of r that asks for model instead, for a fallback
+// that sends r to another provider. Only the body's "model" changes: every
+// other field passes through as the client sent it. The copy's context
+// carries its own Request with Model updated, so the retry's usage row is
+// priced for the model that served it; r's Request is left as it was.
+//
+// r must have come through ReadBody, which made its body replayable.
+func WithModel(r *http.Request, model string) (*http.Request, error) {
+	body, err := r.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(body)
+	if err != nil {
+		return nil, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		return nil, err
+	}
+	// Marshal can't fail on a string.
+	fields["model"], _ = json.Marshal(model)
+	if b, err = json.Marshal(fields); err != nil {
+		return nil, err
+	}
+
+	req := &Request{}
+	if original, ok := RequestFrom(r.Context()); ok {
+		*req = *original
+	}
+	req.Model = model
+	retry := r.WithContext(context.WithValue(r.Context(), requestKey{}, req))
+	setBody(retry, b)
+	return retry, nil
 }
 
 // setBody replaces r's body with b, which can be read any number of times.

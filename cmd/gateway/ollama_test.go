@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
+	"github.com/grishkadel/llm-gateway/internal/middleware"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // ollamaFixture reads one of the replies captured from Ollama 0.40.2.
@@ -43,6 +46,8 @@ type fakeOllama struct {
 type ollamaKnobs struct {
 	// hold keeps each chat request waiting until release is called.
 	hold bool
+	// status, when not 0, answers each chat request with it and an error.
+	status int
 }
 
 func newFakeOllama(t *testing.T, knobs ollamaKnobs) *fakeOllama {
@@ -64,6 +69,11 @@ func newFakeOllama(t *testing.T, knobs ollamaKnobs) *fakeOllama {
 		// Like Ollama: a Content-Length (net/http adds it for a body this
 		// small) and no request ID.
 		w.Header().Set("Content-Type", "application/json")
+		if knobs.status != 0 {
+			w.WriteHeader(knobs.status)
+			_, _ = io.WriteString(w, `{"error":{"message":"model runner failed","type":"api_error","param":null,"code":null}}`)
+			return
+		}
 		_, _ = w.Write(chat)
 	})
 	f.server = httptest.NewServer(mux)
@@ -242,6 +252,71 @@ func TestConcurrencyCapTimesOut(t *testing.T) {
 	for _, want := range []string{
 		`gateway_concurrency_wait_seconds_count{provider="ollama"} 2`,
 		`gateway_requests_total{provider="ollama",status="503"} 1`,
+	} {
+		if !strings.Contains(got, want+"\n") {
+			t.Errorf("/metrics lacks %s", want)
+		}
+	}
+}
+
+// TestFallbackThroughGateway: with Ollama answering 500, a request for a
+// mapped model is served by groq through the whole gateway. The client gets
+// groq's answer and the headers saying so; groq gets the mapped model under
+// its own key; each attempt leaves its usage under the one request ID; and
+// the fallback is counted.
+func TestFallbackThroughGateway(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{status: http.StatusInternalServerError})
+	groq := newFakeUpstream(t)
+	t.Setenv("TEST_GROQ_KEY", "sk-groq")
+
+	var calls []meteredCall
+	var ids []string
+	r := routerFor(t, fmt.Sprintf(`
+providers:
+  ollama:
+    url: %s
+    auth: none
+    format: openai
+    fallback:
+      enabled: true
+      provider: groq
+      models:
+        "qwen3.5:9b": qwen/qwen3.8-27b
+  groq:
+    url: %s/openai
+    key: ${TEST_GROQ_KEY}
+    auth: bearer
+    format: openai
+`, ollama.server.URL, groq.server.URL), func(ctx context.Context, provider string, r usage.Result) {
+		calls = append(calls, meteredCall{provider, r})
+		ids = append(ids, middleware.RequestIDFrom(ctx))
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Gateway-Provider") != "groq" || rec.Header().Get("X-Gateway-Fallback") != "true" {
+		t.Errorf("status %d, X-Gateway-Provider %q, X-Gateway-Fallback %q; want 200 from groq, true",
+			rec.Code, rec.Header().Get("X-Gateway-Provider"), rec.Header().Get("X-Gateway-Fallback"))
+	}
+	if groq.path != "/openai/v1/chat/completions" || groq.header.Get("Authorization") != "Bearer sk-groq" ||
+		!strings.Contains(groq.body, `"model":"qwen/qwen3.8-27b"`) {
+		t.Errorf("groq got %s with Authorization %q and body %s; want the mapped model under its own key",
+			groq.path, groq.header.Get("Authorization"), groq.body)
+	}
+	if len(calls) != 2 || calls[0].provider != "ollama" || calls[0].result.Status != http.StatusInternalServerError ||
+		calls[1].provider != "groq" || calls[1].result.Status != http.StatusOK {
+		t.Errorf("usage callbacks = %+v, want ollama's 500, then groq's 200", calls)
+	}
+	if len(ids) != 2 || ids[0] == "" || ids[0] != ids[1] {
+		t.Errorf("request IDs = %q, want one ID for both attempts", ids)
+	}
+
+	got := scrapeMetrics(t, r)
+	for _, want := range []string{
+		`gateway_fallbacks_total{from="ollama",reason="server_error",to="groq"} 1`,
+		// The route the client called, with the status it got.
+		`gateway_requests_total{provider="ollama",status="200"} 1`,
 	} {
 		if !strings.Contains(got, want+"\n") {
 			t.Errorf("/metrics lacks %s", want)

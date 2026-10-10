@@ -107,6 +107,20 @@ type ProviderConfig struct {
 	// HealthPath, when set, is a path on the provider that the gateway GETs
 	// every 15 seconds to check it is up, such as Ollama's /api/tags.
 	HealthPath string `yaml:"health_path"`
+	// Fallback is where requests this provider fails go instead.
+	Fallback FallbackConfig `yaml:"fallback"`
+}
+
+// FallbackConfig is a provider's fallback: when the provider is unreachable,
+// times out or answers 5xx, a non-streaming request for one of Models is
+// served by Provider instead, with its model replaced. See proxy.Fallback.
+type FallbackConfig struct {
+	Enabled envBool `yaml:"enabled"`
+	// Provider names the provider that serves the request instead.
+	Provider string `yaml:"provider"`
+	// Models maps each model a client may ask for to the model Provider
+	// serves in its place. A request for any other model never falls back.
+	Models map[string]string `yaml:"models"`
 }
 
 // Timeout returns the configured timeout as a time.Duration.
@@ -241,6 +255,10 @@ type envString string
 // see decodeEnv.
 type envInt int
 
+// envBool is a bool field that may be written as an environment reference;
+// see decodeEnv.
+type envBool bool
+
 // UnmarshalYAML decodes s with decodeEnv.
 //
 // Go note: implementing yaml.Unmarshaler hooks the decoding of each field of
@@ -251,6 +269,9 @@ func (s *envString) UnmarshalYAML(n *yaml.Node) error { return decodeEnv(n, (*st
 
 // UnmarshalYAML decodes i with decodeEnv.
 func (i *envInt) UnmarshalYAML(n *yaml.Node) error { return decodeEnv(n, (*int)(i)) }
+
+// UnmarshalYAML decodes b with decodeEnv.
+func (b *envBool) UnmarshalYAML(n *yaml.Node) error { return decodeEnv(n, (*bool)(b)) }
 
 // decodeEnv decodes n into out, expanding it first if it is one whole
 // environment reference: ${VAR}, or ${VAR:-default}, which as in the shell
@@ -304,6 +325,41 @@ func (c *Config) Validate() error {
 	for _, name := range c.ProviderNames() {
 		if err := c.Providers[name].validate(name); err != nil {
 			return err
+		}
+		if err := c.validateFallback(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateFallback checks the named provider's fallback, if it is enabled. A
+// disabled one is left alone, so the block can sit in config.yaml unused.
+func (c *Config) validateFallback(name string) error {
+	pc := c.Providers[name]
+	fb := pc.Fallback
+	if !fb.Enabled {
+		return nil
+	}
+
+	target, ok := c.Providers[fb.Provider]
+	switch {
+	case fb.Provider == name:
+		return fmt.Errorf("provider %q: fallback.provider must be another provider", name)
+	case !ok:
+		return fmt.Errorf("provider %q: fallback.provider %q is not a configured provider", name, fb.Provider)
+	case pc.Format != string(provider.FormatOpenAI) || target.Format != string(provider.FormatOpenAI):
+		// The fallback replays the client's body with only "model" changed,
+		// so both must speak the shape that keeps the model there.
+		return fmt.Errorf("provider %q: a fallback needs both providers to be format openai, got %s and %s", name, pc.Format, target.Format)
+	case bool(target.Fallback.Enabled):
+		return fmt.Errorf("provider %q: fallback.provider %q has a fallback of its own; fallbacks don't chain", name, fb.Provider)
+	case len(fb.Models) == 0:
+		return fmt.Errorf("provider %q: fallback.models must map at least one model", name)
+	}
+	for from, to := range fb.Models {
+		if from == "" || to == "" {
+			return fmt.Errorf("provider %q: fallback.models must not name an empty model", name)
 		}
 	}
 	return nil

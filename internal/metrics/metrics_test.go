@@ -117,3 +117,12 @@ func TestProviderUp(t *testing.T) {
 		}
 	}
 }
+
+// TestFallback: each fallback counts once, by route, target and reason.
+func TestFallback(t *testing.T) {
+	m := New()
+	m.Fallback("ollama", "groq", "timeout")
+	if got := testutil.ToFloat64(m.fallbacks.WithLabelValues("ollama", "groq", "timeout")); got != 1 {
+		t.Errorf("gateway_fallbacks_total = %v, want 1", got)
+	}
+}

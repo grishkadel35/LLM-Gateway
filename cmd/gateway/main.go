@@ -104,18 +104,10 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 
 	tenantAuth := middleware.Auth(store, logger)
 
+	// Every provider's proxy first, so a route can hand a failed request to
+	// its fallback's.
+	proxies := make(map[string]http.Handler, len(providers))
 	for _, p := range providers {
-		// A trailing slash makes this a subtree pattern: "/openai/" matches
-		// "/openai/v1/chat/completions". StripPrefix then removes "/openai"
-		// before the proxy's Rewrite joins what's left onto the provider's
-		// base URL — so routing and path rewriting need no custom code.
-		//
-		// Auth runs first: a request without a valid gateway key never reaches
-		// the proxy, so it can't spend the provider's key.
-		prefix := "/" + p.Name
-		// RequireMetered then refuses endpoints the gateway can't read usage
-		// from, and ReadBody takes ownership of the body. Both run after
-		// StripPrefix, so they see the provider-relative path.
 		name := p.Name
 		meter := func(ctx context.Context, r usage.Result) {
 			m.Tokens(name, r.Usage)
@@ -129,7 +121,28 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		if p.MaxConcurrency > 0 {
 			rp.Transport = concurrency.Limit(rp.Transport, p.MaxConcurrency, p.QueueTimeout, m.ConcurrencyWait(p.Name))
 		}
-		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(rp)
+		proxies[p.Name] = rp
+	}
+
+	for _, p := range providers {
+		// A trailing slash makes this a subtree pattern: "/openai/" matches
+		// "/openai/v1/chat/completions". StripPrefix then removes "/openai"
+		// before the proxy's Rewrite joins what's left onto the provider's
+		// base URL — so routing and path rewriting need no custom code.
+		//
+		// Auth runs first: a request without a valid gateway key never reaches
+		// the proxy, so it can't spend the provider's key.
+		prefix := "/" + p.Name
+		// RequireMetered then refuses endpoints the gateway can't read usage
+		// from, and ReadBody takes ownership of the body. Both run after
+		// StripPrefix, so they see the provider-relative path.
+		h := proxies[p.Name]
+		// A fallback retries on the target's plain proxy: the request has
+		// already passed auth and ReadBody, which serve the target as well.
+		if fb := cfg.Providers[p.Name].Fallback; fb.Enabled {
+			h = proxy.Fallback(p.Name, h, fb.Provider, proxies[fb.Provider], fb.Models, m.Fallback, logger)
+		}
+		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(h)
 		metered := usage.RequireMetered(p.Format)(body)
 		// The request metrics go outermost, so requests the gateway refuses
 		// itself (401, 403, 413) are counted too.

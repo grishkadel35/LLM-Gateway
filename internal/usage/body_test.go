@@ -1,10 +1,12 @@
 package usage
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -272,5 +274,61 @@ func TestReadBodyEstimatesClientBytes(t *testing.T) {
 	}
 	if want := ceilQuarter(len(body)); got.req.InputEstimate != want {
 		t.Errorf("InputEstimate = %d, want %d, counted from the client's %d bytes", got.req.InputEstimate, want, len(body))
+	}
+}
+
+// TestWithModel: a fallback's copy of the request asks for the new model and
+// changes nothing else. Every other field is the client's, the copy's
+// Request names the new model, and the original request and its Request are
+// as they were.
+func TestWithModel(t *testing.T) {
+	const body = `{"model":"qwen3.5:9b","temperature":0.2,"max_tokens":64,"seed":12345678901234567890,"messages":[{"role":"user","content":"<ping> & pong"}]}`
+
+	var r *http.Request
+	ReadBody(provider.FormatOpenAI, 1<<20)(http.HandlerFunc(func(_ http.ResponseWriter, req *http.Request) { r = req })).
+		ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+	retry, err := WithModel(r, "qwen/qwen3.8-27b")
+	if err != nil {
+		t.Fatalf("WithModel() returned error: %v", err)
+	}
+
+	b, err := io.ReadAll(retry.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ContentLength != int64(len(b)) {
+		t.Errorf("ContentLength = %d, body is %d bytes", retry.ContentLength, len(b))
+	}
+	// Compared decoded, numbers as written: re-encoding may escape < and &.
+	decode := func(b []byte) map[string]any {
+		var m map[string]any
+		d := json.NewDecoder(bytes.NewReader(b))
+		d.UseNumber()
+		if err := d.Decode(&m); err != nil {
+			t.Fatalf("decoding %s: %v", b, err)
+		}
+		return m
+	}
+	want := decode([]byte(body))
+	want["model"] = "qwen/qwen3.8-27b"
+	if got := decode(b); !reflect.DeepEqual(got, want) {
+		t.Errorf("retry body = %v, want %v", got, want)
+	}
+
+	req, _ := RequestFrom(retry.Context())
+	original, _ := RequestFrom(r.Context())
+	if req.Model != "qwen/qwen3.8-27b" || req.Path != original.Path || req.Received != original.Received {
+		t.Errorf("retry's Request = %+v, want the original's with the new model", req)
+	}
+	if original.Model != "qwen3.5:9b" {
+		t.Errorf("original Request's model = %q, want it unchanged", original.Model)
+	}
+	rc, err := r.GetBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := io.ReadAll(rc); string(b) != body {
+		t.Errorf("original body = %s, want the client's unchanged", b)
 	}
 }

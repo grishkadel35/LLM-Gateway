@@ -5,6 +5,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -102,6 +103,16 @@ func modifyResponse(p provider.Provider, logger *slog.Logger, onUsage usage.Call
 		if onUsage != nil {
 			usage.Meter(resp, p.Format, onUsage)
 		}
+
+		// A 5xx with a fallback armed: the fallback answers instead. The body
+		// is read here, through the meter, so this attempt's usage row is
+		// complete; errFallback then makes ReverseProxy close it, which frees
+		// any concurrency slot, and forward nothing.
+		if a := armedFrom(resp.Request.Context()); a != nil && resp.StatusCode >= 500 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
+			a.reason = reasonServerError
+			return errFallback
+		}
 		return nil
 	}
 }
@@ -121,9 +132,15 @@ const StatusClientClosedRequest = 499
 // unknown cost.
 func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
+		// modifyResponse handed the response to the fallback, metered.
+		if errors.Is(err, errFallback) {
+			return
+		}
+
 		// The request waited its whole queue timeout for a concurrency slot.
 		// Nothing reached the provider, so there is no usage row. The queue
-		// already did the waiting, so the client may retry at once.
+		// already did the waiting, so the client may retry at once. A busy
+		// provider is working, not failing, so this never falls back.
 		if errors.Is(err, concurrency.ErrBusy) {
 			logger.Warn("provider busy: no concurrency slot within the queue timeout",
 				"provider", p.Name,
@@ -151,13 +168,27 @@ func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callba
 			return
 		}
 
-		status, errType, message := http.StatusBadGateway, "upstream_unavailable", "the gateway could not reach the upstream provider"
+		status, errType, message, reason := http.StatusBadGateway, "upstream_unavailable", "the gateway could not reach the upstream provider", reasonUnreachable
 		if isTimeout(err) {
-			status, errType, message = http.StatusGatewayTimeout, "upstream_timeout", "the upstream provider did not respond in time"
+			status, errType, message, reason = http.StatusGatewayTimeout, "upstream_timeout", "the upstream provider did not respond in time", reasonTimeout
 		}
 
 		if onUsage != nil {
 			onUsage(r.Context(), usage.Unanswered(r.Context(), status))
+		}
+
+		// With a fallback armed, it answers instead: nothing is written here.
+		// r is the outbound request, but its context is the inbound one.
+		if a := armedFrom(r.Context()); a != nil {
+			a.reason = reason
+			logger.Warn("upstream request failed; falling back",
+				"provider", p.Name,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", status,
+				"error", err,
+			)
+			return
 		}
 
 		logger.Error("upstream request failed",
