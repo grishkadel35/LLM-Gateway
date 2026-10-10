@@ -21,7 +21,8 @@ host: 127.0.0.1
 #   OpenAI SDK   → base_url = "http://127.0.0.1:8080/openai/v1"
 #   Anthropic SDK→ base_url = "http://127.0.0.1:8080/anthropic"
 #
-# auth selects how the key is presented: bearer | x-api-key | x-goog-api-key
+# auth selects how the key is presented: bearer | x-api-key | x-goog-api-key,
+# or none for a keyless upstream, which then has no key line.
 # format is the API shape the provider speaks: openai | anthropic | gemini. It
 # decides how usage is read; OpenAI-compatible providers like Groq are openai.
 # timeout is how long to wait for the provider to start responding, in seconds.
@@ -59,4 +60,13 @@ providers:
     timeout: 600
     key: ${GROQ_API_KEY}
     auth: bearer
+    format: openai
+
+  # Ollama on this machine: keyless and local, though clients still need a
+  # gateway key. The timeout is a response-header timeout, so it has to cover
+  # a whole non-streaming generation, model load included.
+  ollama:
+    url: http://127.0.0.1:11434
+    timeout: 120
+    auth: none
     format: openai

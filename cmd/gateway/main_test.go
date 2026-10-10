@@ -87,7 +87,7 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 	return f
 }
 
-// newTestRouter wires four fake upstreams into a real config and builds the
+// newTestRouter wires five fake upstreams into a real config and builds the
 // gateway's route table from it, exactly as main() would, over fakeStore.
 func newTestRouter(t *testing.T) (http.Handler, map[string]*fakeUpstream) {
 	t.Helper()
@@ -102,6 +102,7 @@ func newTestRouterWith(t *testing.T, store tenantStore) (http.Handler, map[strin
 		"anthropic": newFakeUpstream(t),
 		"gemini":    newFakeUpstream(t),
 		"groq":      newFakeUpstream(t),
+		"ollama":    newFakeUpstream(t),
 	}
 
 	// Keys must be environment references; the values are what the upstreams
@@ -111,6 +112,7 @@ func newTestRouterWith(t *testing.T, store tenantStore) (http.Handler, map[strin
 	}
 
 	// Groq's real API lives under a base path; keep that shape in the fake.
+	// Ollama is keyless: auth none, and no key line.
 	yaml := fmt.Sprintf(`
 providers:
   openai:
@@ -135,8 +137,12 @@ providers:
     key: ${TEST_GROQ_KEY}
     auth: bearer
     format: openai
+  ollama:
+    url: %s
+    auth: none
+    format: openai
 `, ups["openai"].server.URL, ups["anthropic"].server.URL,
-		ups["gemini"].server.URL, ups["groq"].server.URL)
+		ups["gemini"].server.URL, ups["groq"].server.URL, ups["ollama"].server.URL)
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
@@ -171,6 +177,9 @@ func TestRoutingReachesTheRightProvider(t *testing.T) {
 		{"gemini", "/gemini/v1beta/models/x:generateContent", "/v1beta/models/x:generateContent", "X-Goog-Api-Key", "sk-gemini"},
 		// Groq keeps its base path: /groq/v1/... arrives as /openai/v1/...
 		{"groq", "/groq/v1/chat/completions", "/openai/v1/chat/completions", "Authorization", "Bearer sk-groq"},
+		// Ollama is keyless: the client's gateway key is stripped and nothing
+		// replaces it.
+		{"ollama", "/ollama/v1/chat/completions", "/v1/chat/completions", "Authorization", ""},
 	}
 
 	for _, tc := range cases {
@@ -211,21 +220,27 @@ func TestClientCredentialNeverReachesUpstream(t *testing.T) {
 	r, ups := newTestRouter(t)
 
 	// The gateway key in every credential header the gateway reads: it
-	// authenticates, and then none of the three copies may go upstream.
-	req := httptest.NewRequest(http.MethodPost, "/anthropic/v1/messages", nil)
-	req.Header.Set("Authorization", "Bearer "+testTenantKey)
-	req.Header.Set("X-Api-Key", testTenantKey)
-	req.Header.Set("X-Goog-Api-Key", testTenantKey)
+	// authenticates, and then none of the three copies may go upstream,
+	// whether the provider has a key of its own (anthropic) or none (ollama).
+	for _, p := range []struct{ name, path string }{
+		{"anthropic", "/anthropic/v1/messages"},
+		{"ollama", "/ollama/v1/chat/completions"},
+	} {
+		req := httptest.NewRequest(http.MethodPost, p.path, nil)
+		req.Header.Set("Authorization", "Bearer "+testTenantKey)
+		req.Header.Set("X-Api-Key", testTenantKey)
+		req.Header.Set("X-Goog-Api-Key", testTenantKey)
 
-	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
-	}
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want %d; body %s", p.name, rec.Code, http.StatusOK, rec.Body)
+		}
 
-	for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"} {
-		if got := ups["anthropic"].header.Get(h); strings.Contains(got, testTenantKey) {
-			t.Errorf("%s = %q leaked the client's credential upstream", h, got)
+		for _, h := range []string{"Authorization", "X-Api-Key", "X-Goog-Api-Key"} {
+			if got := ups[p.name].header.Get(h); strings.Contains(got, testTenantKey) {
+				t.Errorf("%s: %s = %q leaked the client's credential upstream", p.name, h, got)
+			}
 		}
 	}
 	if got := ups["anthropic"].header.Get("anthropic-version"); got != "2023-06-01" {
@@ -263,8 +278,8 @@ func TestUnknownProviderReturns404(t *testing.T) {
 	if body.Error.Type != "unknown_provider" {
 		t.Errorf("error.type = %q, want %q", body.Error.Type, "unknown_provider")
 	}
-	if len(body.Error.Providers) != 4 {
-		t.Errorf("error.providers = %v, want all four configured providers", body.Error.Providers)
+	if len(body.Error.Providers) != len(ups) {
+		t.Errorf("error.providers = %v, want all %d configured providers", body.Error.Providers, len(ups))
 	}
 
 	// Critically: no upstream was contacted. A typo must not spend money.
@@ -345,6 +360,8 @@ func TestProviderRoutesRequireTenantKey(t *testing.T) {
 		"/anthropic/v1/messages",
 		"/gemini/v1beta/models/x:generateContent",
 		"/groq/v1/chat/completions",
+		// Keyless upstream, but the gateway key is still required.
+		"/ollama/v1/chat/completions",
 	}
 
 	for _, tc := range cases {
@@ -554,7 +571,7 @@ func TestUnmeteredEndpointsAreRefused(t *testing.T) {
 // the provider receives include_usage, with a Content-Length that matches
 // the rewritten body.
 func TestStreamingOpenAIRequestAsksForUsage(t *testing.T) {
-	for _, name := range []string{"openai", "groq"} {
+	for _, name := range []string{"openai", "groq", "ollama"} {
 		t.Run(name, func(t *testing.T) {
 			r, ups := newTestRouter(t)
 			req := httptest.NewRequest(http.MethodPost, "/"+name+"/v1/chat/completions",

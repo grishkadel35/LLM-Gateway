@@ -30,10 +30,13 @@ const (
 	AuthAPIKey AuthStyle = "x-api-key"
 	// AuthGoogleKey sends "X-Goog-Api-Key: <key>" — Google Gemini.
 	AuthGoogleKey AuthStyle = "x-goog-api-key"
+	// AuthNone sends no key, for a keyless upstream such as a local Ollama.
+	// The client's credentials are still stripped.
+	AuthNone AuthStyle = "none"
 )
 
 // AuthStyles lists every supported style, for validation and error messages.
-var AuthStyles = []AuthStyle{AuthBearer, AuthAPIKey, AuthGoogleKey}
+var AuthStyles = []AuthStyle{AuthBearer, AuthAPIKey, AuthGoogleKey, AuthNone}
 
 // Valid reports whether a is a style the gateway knows how to apply.
 func (a AuthStyle) Valid() bool {
@@ -101,7 +104,8 @@ type Provider struct {
 	// Timeout bounds how long to wait for the provider to start responding.
 	Timeout time.Duration
 	// Key is the resolved API key — already expanded from its environment
-	// variable by the config package, never a literal in config.yaml.
+	// variable by the config package, never a literal in config.yaml. It is
+	// empty for AuthNone.
 	Key string
 	// Auth is how Key is presented to this provider.
 	Auth AuthStyle
@@ -145,6 +149,9 @@ func (p Provider) Apply(req *http.Request) {
 		h.Set("X-Api-Key", p.Key)
 	case AuthGoogleKey:
 		h.Set("X-Goog-Api-Key", p.Key)
+	case AuthNone:
+		// Nothing to set. The strip above still ran, so a keyless upstream
+		// never sees the client's gateway key either.
 	}
 
 	// Static headers are set after the credential so a provider can never

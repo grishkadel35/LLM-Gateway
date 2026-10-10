@@ -170,6 +170,26 @@ providers:
 	}
 }
 
+// TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
+// configured with auth none and no key line at all.
+func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+providers:
+  ollama:
+    url: http://127.0.0.1:11434
+    auth: none
+    format: openai
+`))
+	if err != nil {
+		t.Fatalf("Load() returned error: %v", err)
+	}
+
+	pc := cfg.Providers["ollama"]
+	if pc.Key != "" || provider.AuthStyle(pc.Auth) != provider.AuthNone {
+		t.Errorf("key, auth = %q, %q; want \"\", none", pc.Key, pc.Auth)
+	}
+}
+
 // TestLoadOnRepoConfig parses the config.yaml that ships with the repo, so a
 // typo in the committed file fails the test suite rather than startup.
 func TestLoadOnRepoConfig(t *testing.T) {
@@ -185,7 +205,7 @@ func TestLoadOnRepoConfig(t *testing.T) {
 		t.Fatalf("Load() on the repo's config.yaml returned error: %v", err)
 	}
 
-	want := []string{"anthropic", "gemini", "groq", "openai"}
+	want := []string{"anthropic", "gemini", "groq", "ollama", "openai"}
 	got := cfg.ProviderNames()
 	if len(got) != len(want) {
 		t.Fatalf("ProviderNames() = %v, want %v", got, want)
@@ -275,6 +295,8 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"literal key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: sk-literal\n    auth: bearer\n    format: openai\n"},
 		{"key with text around the reference", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}-suffix\n    auth: bearer\n    format: openai\n"},
 		{"key as bare $VAR", "providers:\n  openai:\n    url: https://api.openai.com\n    key: $TEST_KEY\n    auth: bearer\n    format: openai\n"},
+		// auth none would silently ignore the key.
+		{"key with auth none", "providers:\n  ollama:\n    url: http://127.0.0.1:11434\n    key: ${TEST_KEY}\n    auth: none\n    format: openai\n"},
 		// Unknown keys are typos; ignoring them would apply a default silently.
 		{"misspelled provider field", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    timout: 60\n"},
 		{"misspelled top-level field", "prot: 9090\n" + minimalProvider},

@@ -91,6 +91,27 @@ func TestApplyStripsQueryCredential(t *testing.T) {
 	}
 }
 
+// TestApplyAuthNoneSetsNoCredential: a keyless upstream gets no credential at
+// all, and the client's are still stripped from every header and the query.
+func TestApplyAuthNoneSetsNoCredential(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?key=gw_CLIENT-LEAK", nil)
+	req.Header.Set("Authorization", "Bearer gw_CLIENT-LEAK")
+	req.Header.Set("X-Api-Key", "gw_CLIENT-LEAK")
+	req.Header.Set("X-Goog-Api-Key", "gw_CLIENT-LEAK")
+
+	p := Provider{Name: "ollama", Auth: AuthNone}
+	p.Apply(req)
+
+	for _, header := range credentialHeaders {
+		if got := req.Header.Get(header); got != "" {
+			t.Errorf("%s = %q, want it absent", header, got)
+		}
+	}
+	if got := req.URL.RawQuery; got != "" {
+		t.Errorf("query = %q, want the key stripped", got)
+	}
+}
+
 // TestApplySetsStaticHeaders covers Anthropic's required anthropic-version.
 func TestApplySetsStaticHeaders(t *testing.T) {
 	p := Provider{
@@ -134,6 +155,9 @@ func TestAuthStyleValid(t *testing.T) {
 		if !a.Valid() {
 			t.Errorf("AuthStyle(%q).Valid() = false, want true", a)
 		}
+	}
+	if !AuthStyle("none").Valid() {
+		t.Error(`AuthStyle("none").Valid() = false, want true`)
 	}
 	for _, bad := range []AuthStyle{"", "basic", "Bearer", "api-key"} {
 		if bad.Valid() {

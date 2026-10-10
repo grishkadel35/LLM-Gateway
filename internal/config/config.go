@@ -82,7 +82,8 @@ type ProviderConfig struct {
 	TimeoutSeconds int `yaml:"timeout"`
 	// Key is written as an environment reference such as ${OPENAI_API_KEY}.
 	// Load expands it. config.yaml is committed to git, so a literal key must
-	// never be written here.
+	// never be written here. With auth none there is no key, so it must be
+	// absent.
 	Key  string `yaml:"key"`
 	Auth string `yaml:"auth"`
 	// Format is the provider's API shape (openai, anthropic, gemini). It is
@@ -158,11 +159,19 @@ func (c *Config) resolve() error {
 			pc.TimeoutSeconds = DefaultTimeoutSeconds
 		}
 
-		key, err := expandKey(name, pc.Key)
-		if err != nil {
-			return err
+		if provider.AuthStyle(pc.Auth) == provider.AuthNone {
+			// A key here would be silently ignored, so it's an error. Its
+			// value stays out of the message: it may be a real key.
+			if pc.Key != "" {
+				return fmt.Errorf("provider %q: auth none sends no key, so key must be absent", name)
+			}
+		} else {
+			key, err := expandKey(name, pc.Key)
+			if err != nil {
+				return err
+			}
+			pc.Key = key
 		}
-		pc.Key = key
 
 		// Go note: ranging over a map gives you a *copy* of each value, so
 		// mutating pc above changes nothing until we write it back.
