@@ -102,3 +102,18 @@ func TestTokens(t *testing.T) {
 		t.Errorf("%d token series, want 3: a zero must not create one", got)
 	}
 }
+
+// TestProviderUp: the gauge follows the latest health check.
+func TestProviderUp(t *testing.T) {
+	m := New()
+	for _, up := range []bool{true, false} {
+		m.ProviderUp("ollama", up)
+		want := 0.0
+		if up {
+			want = 1
+		}
+		if got := testutil.ToFloat64(m.up.WithLabelValues("ollama")); got != want {
+			t.Errorf("after up = %v: gateway_provider_up = %v, want %v", up, got, want)
+		}
+	}
+}

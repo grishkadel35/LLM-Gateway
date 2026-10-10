@@ -83,7 +83,7 @@ type stores struct {
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, m *metrics.Metrics, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -92,7 +92,7 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	// http.ServeMux is the standard library router. The most specific pattern
 	// wins, so "/health" beats "/openai/" beats the catch-all "/".
 	mux := http.NewServeMux()
-	mux.Handle("/health", health.Handler())
+	mux.Handle("/health", health.Handler(checker))
 	// Unauthenticated for now; roadmap Week 6 decides between admin auth and a
 	// separate port.
 	mux.Handle("/metrics", m.Handler())
@@ -188,7 +188,14 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		}
 	}()
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), metrics.New(), logger)
+	m := metrics.New()
+	providers, err := cfg.BuildProviders()
+	if err != nil {
+		return err
+	}
+	checker := health.NewChecker(providers, m.ProviderUp, logger)
+
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), m, checker, logger)
 	if err != nil {
 		return err
 	}
@@ -229,6 +236,10 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	// returns, no matter which return path is taken. It's Go's version of a
 	// `finally` block, and it's written next to the thing it cleans up.
 	defer stop()
+
+	// The provider checks run until ctx ends: at a shutdown signal, or when
+	// run returns because the server failed.
+	go checker.Run(ctx)
 
 	// select waits on several channel operations at once and proceeds with
 	// whichever is ready first.

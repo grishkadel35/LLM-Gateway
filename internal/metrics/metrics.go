@@ -33,6 +33,7 @@ type Metrics struct {
 	duration *prometheus.HistogramVec
 	tokens   *prometheus.CounterVec
 	wait     *prometheus.HistogramVec
+	up       *prometheus.GaugeVec
 }
 
 // New returns the gateway's metrics, on a registry of their own.
@@ -57,8 +58,12 @@ func New() *Metrics {
 			Help:    "Time requests waited for a concurrency slot on a provider with max_concurrency, whether or not one came free.",
 			Buckets: waitBuckets,
 		}, []string{"provider"}),
+		up: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_provider_up",
+			Help: "1 if the provider answered its latest health check with a 2xx, 0 if not. Only providers with a health_path are checked.",
+		}, []string{"provider"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait)
+	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait, m.up)
 	return m
 }
 
@@ -116,6 +121,15 @@ func (m *Metrics) Tokens(provider string, u usage.Usage) {
 func (m *Metrics) ConcurrencyWait(provider string) func(time.Duration) {
 	wait := m.wait.WithLabelValues(provider)
 	return func(d time.Duration) { wait.Observe(d.Seconds()) }
+}
+
+// ProviderUp records the result of provider's latest health check.
+func (m *Metrics) ProviderUp(provider string, up bool) {
+	v := 0.0
+	if up {
+		v = 1
+	}
+	m.up.WithLabelValues(provider).Set(v)
 }
 
 // statusRecorder remembers the status a handler sent.

@@ -83,3 +83,5 @@ providers:
     # 503 with Retry-After. max_concurrency 0, the default, means no cap.
     max_concurrency: ${OLLAMA_MAX_CONCURRENCY:-1}
     queue_timeout: ${OLLAMA_QUEUE_TIMEOUT_SECONDS:-30}
+    # GET every 15 seconds; /health and gateway_provider_up report the result.
+    health_path: /api/tags

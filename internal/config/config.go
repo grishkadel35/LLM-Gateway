@@ -104,6 +104,9 @@ type ProviderConfig struct {
 	// QueueTimeoutSeconds, and then gets 503.
 	MaxConcurrency      envInt `yaml:"max_concurrency"`
 	QueueTimeoutSeconds envInt `yaml:"queue_timeout"`
+	// HealthPath, when set, is a path on the provider that the gateway GETs
+	// every 15 seconds to check it is up, such as Ollama's /api/tags.
+	HealthPath string `yaml:"health_path"`
 }
 
 // Timeout returns the configured timeout as a time.Duration.
@@ -348,6 +351,10 @@ func (pc ProviderConfig) validate(name string) error {
 		return fmt.Errorf("provider %q: queue_timeout must not be negative, got %d", name, pc.QueueTimeoutSeconds)
 	}
 
+	if pc.HealthPath != "" && !strings.HasPrefix(pc.HealthPath, "/") {
+		return fmt.Errorf("provider %q: health_path must start with /, got %q", name, pc.HealthPath)
+	}
+
 	return nil
 }
 
@@ -389,6 +396,7 @@ func (c *Config) BuildProviders() ([]provider.Provider, error) {
 			Headers:        pc.Headers,
 			MaxConcurrency: int(pc.MaxConcurrency),
 			QueueTimeout:   time.Duration(pc.QueueTimeoutSeconds) * time.Second,
+			HealthPath:     pc.HealthPath,
 		})
 	}
 

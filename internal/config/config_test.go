@@ -348,6 +348,9 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	if ollama.MaxConcurrency != 1 || ollama.QueueTimeoutSeconds != 30 {
 		t.Errorf("ollama max_concurrency, queue_timeout = %d, %d; want the defaults 1, 30", ollama.MaxConcurrency, ollama.QueueTimeoutSeconds)
 	}
+	if ollama.HealthPath != "/api/tags" {
+		t.Errorf("ollama health_path = %q, want /api/tags", ollama.HealthPath)
+	}
 
 	t.Setenv("OLLAMA_BASE_URL", "http://10.0.0.5:11434")
 	cfg, err = Load(path)
@@ -419,6 +422,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"negative timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    timeout: -5\n"},
 		{"negative max_concurrency", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    max_concurrency: -1\n"},
 		{"negative queue_timeout", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    max_concurrency: 1\n    queue_timeout: -1\n"},
+		{"health_path without a leading slash", "providers:\n  openai:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n    health_path: v1/models\n"},
 		{"empty key", "providers:\n  openai:\n    url: https://api.openai.com\n    key: \"\"\n    auth: bearer\n    format: openai\n"},
 		{"reserved name health", "providers:\n  health:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
 		{"reserved name admin", "providers:\n  admin:\n    url: https://api.openai.com\n    key: ${TEST_KEY}\n    auth: bearer\n    format: openai\n"},
@@ -471,6 +475,7 @@ providers:
     format: anthropic
     headers:
       anthropic-version: "2023-06-01"
+    health_path: /v1/models
 `))
 	if err != nil {
 		t.Fatalf("Load() returned error: %v", err)
@@ -502,6 +507,9 @@ providers:
 	}
 	if ant.URL.Host != "api.anthropic.com" {
 		t.Errorf("anthropic URL.Host = %q, want %q", ant.URL.Host, "api.anthropic.com")
+	}
+	if ant.HealthPath != "/v1/models" {
+		t.Errorf("anthropic HealthPath = %q, want %q", ant.HealthPath, "/v1/models")
 	}
 	if ant.Key != "sk-ant" {
 		t.Errorf("anthropic Key = %q, want %q", ant.Key, "sk-ant")

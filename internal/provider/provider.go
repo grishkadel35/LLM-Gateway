@@ -118,6 +118,9 @@ type Provider struct {
 	// cap. A request beyond it waits up to QueueTimeout for a slot.
 	MaxConcurrency int
 	QueueTimeout   time.Duration
+	// HealthPath, when not empty, is the path on URL that health.Checker GETs
+	// to check the provider is up.
+	HealthPath string
 }
 
 // Apply swaps the client's credential for this provider's own, and adds any
