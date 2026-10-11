@@ -2,29 +2,42 @@
 
 A reverse proxy that sits between your applications and LLM providers. It routes
 each request to the right provider, presents that provider's API key in whatever
-header it expects, and logs the result. Rate limiting, response caching, and
-budget enforcement plug in later.
+header it expects, and logs the result. It enforces each tenant's
+tokens-per-minute limit; response caching and budget enforcement plug in later.
 
 Providers speak their own native APIs — the gateway never translates request or
 response bodies, so new provider features work the day they ship. Adding a
 provider is a block of YAML, not code.
 
 > **⚠️ Keep it on loopback for now.** Every provider route requires a tenant
-> key, but there is no TLS, rate limiting or budget enforcement yet, so the
-> gateway binds to `127.0.0.1` by default. Binding wider is your call to make
-> deliberately.
+> key, but there is no TLS or budget enforcement yet, so the gateway binds to
+> `127.0.0.1` by default. Binding wider is your call to make deliberately.
 
 ## Project status
 
-**Last updated:** 2026-10-05
+**Last updated:** 2026-10-10
 **Stage:** Weeks 1 and 2 of 8 complete, checkpoints closed. Every provider
 request is authenticated with a tenant key, and every request that reaches a
 provider, streamed or not, is recorded in Postgres with its tokens and cost,
 verified live against Groq and Gemini. Week 3 (token-aware rate limiting) is
-next.
+in progress: each tenant's tokens-per-minute limit is enforced. Next, each
+request's charge is corrected to the tokens the provider actually reported.
 
 ### What changed
 
+- **Rate limiting is on.** Every provider request is charged against its
+  tenant's tokens-per-minute bucket before it is forwarded. The charge is the
+  token estimate plus the output the client allowed: its own cap, or the
+  tenant's `default_max_tokens` for each choice when it set none. The output
+  part is capped at the tenant's limit. A tenant over its limit gets
+  `429 rate_limited` with `Retry-After` in whole seconds, and the provider is
+  never called. The body names the gateway, so a client can tell it from a
+  provider's own 429, and carries `retry_after_seconds`,
+  `limit_tokens_per_min` and `estimated_tokens`. If Redis fails or takes more
+  than 100 ms to answer, the request goes through and the gateway logs a
+  warning: rate limiting fails open. The gateway now needs `REDIS_URL` to
+  start, and pings Redis at startup. Set limits with SQL for now
+  (`tenants.rate_limit_tokens_per_min`).
 - **Local Ollama.** `config.yaml` now has an `ollama` provider: a model on this
   machine, served at `/ollama/` and metered like the hosted ones. It is keyless
   (`auth: none`; clients still need a gateway key) and `free: true`, so every
@@ -38,7 +51,7 @@ next.
   with `qwen3.5:9b` showed that it thinks by default, which is slow and counts
   as output tokens, and that a model that isn't loaded takes about 30 s to
   load. See [Running with Ollama](#running-with-ollama).
-- **Token bucket in Redis (not wired in yet).** `internal/ratelimit` keeps each
+- **Token bucket in Redis.** `internal/ratelimit` keeps each
   tenant's tokens-per-minute bucket in Redis. Admission and refunds each run as
   one Lua script on Redis's clock, so concurrent requests can't spend the same
   tokens and replicas agree on time. A request bigger than a whole minute's
@@ -246,8 +259,8 @@ make run
 ```
 
 A provider key that isn't set, a missing or weak admin key, or an unreachable
-database is a startup error, not a surprise on the first request. To run with
-fewer providers, delete the ones you don't need from `config.yaml`.
+database or Redis is a startup error, not a surprise on the first request. To
+run with fewer providers, delete the ones you don't need from `config.yaml`.
 
 Create a tenant with the admin key. The response holds the tenant's first
 gateway key (`key.plaintext`); it is shown once, so keep it:
@@ -561,7 +574,7 @@ to the network: bind it to the Colima bridge address or firewall it.
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
 | `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
-| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below). Prefix stripped, forwarded with the provider's key. |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise). Prefix stripped, forwarded with the provider's key. |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
@@ -626,7 +639,7 @@ cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy, its hooks and the fallback
-internal/middleware/      request IDs, request logging, tenant key auth
+internal/middleware/      request IDs, request logging, tenant key auth, rate limiting
 internal/health/          GET /health
 internal/concurrency/     per-provider request limit and its queue
 internal/metrics/         Prometheus metrics
@@ -660,9 +673,9 @@ client. That is where usage accounting and caching will read token counts.
 Returning an error from it causes `ErrorHandler` to run instead of the response
 being forwarded — that's the mechanism for rejecting a request over budget.
 
-Rate limiting and budget checks belong *before* the proxy, as middleware
-alongside `Logging` in `main.go`, so a rejected request never reaches the
-provider.
+Rate limiting runs *before* the proxy, as middleware after `ReadBody` in
+`main.go`, so a refused request never reaches the provider. Budget checks
+belong next to it.
 
 ## Observability
 

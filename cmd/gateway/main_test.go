@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,6 +19,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
@@ -24,6 +28,8 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
+	"github.com/grishkadel/llm-gateway/internal/provider"
+	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -36,14 +42,15 @@ const (
 )
 
 // fakeStore stands in for tenant.Store so routing tests need no Postgres. It
-// knows one tenant with one key.
+// knows one tenant, with the schema's default limits, and one key.
 type fakeStore struct{}
 
 func (fakeStore) Lookup(_ context.Context, key string) (tenant.Tenant, tenant.APIKey, error) {
 	if key != testTenantKey {
 		return tenant.Tenant{}, tenant.APIKey{}, tenant.ErrNotFound
 	}
-	return tenant.Tenant{ID: "tn_test"}, tenant.APIKey{ID: 1, TenantID: "tn_test"}, nil
+	return tenant.Tenant{ID: "tn_test", RateLimitTokensPerMin: 100_000, DefaultMaxTokens: 4096},
+		tenant.APIKey{ID: 1, TenantID: "tn_test"}, nil
 }
 
 func (fakeStore) Create(_ context.Context, name string) (tenant.Tenant, tenant.NewKey, error) {
@@ -89,13 +96,14 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 }
 
 // newTestRouter wires five fake upstreams into a real config and builds the
-// gateway's route table from it, exactly as main() would, over fakeStore.
+// gateway's route table from it, exactly as main() would, over fakeStore and
+// with no rate limiting.
 func newTestRouter(t *testing.T) (http.Handler, map[string]*fakeUpstream) {
 	t.Helper()
-	return newTestRouterWith(t, fakeStore{})
+	return newTestRouterWith(t, fakeStore{}, nil)
 }
 
-func newTestRouterWith(t *testing.T, store tenantStore) (http.Handler, map[string]*fakeUpstream) {
+func newTestRouterWith(t *testing.T, store tenantStore, limiter middleware.Limiter) (http.Handler, map[string]*fakeUpstream) {
 	t.Helper()
 
 	ups := map[string]*fakeUpstream{
@@ -155,7 +163,7 @@ providers:
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
 
-	r, err := router(cfg, store, testAdminKey, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, store, testAdminKey, nil, limiter, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -444,7 +452,7 @@ func TestKeyLifecycleThroughGateway(t *testing.T) {
 	if _, err := db.Migrate(context.Background(), conn); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
-	r, ups := newTestRouterWith(t, stores{tenant.NewStore(conn), usage.NewReports(conn)})
+	r, ups := newTestRouterWith(t, stores{tenant.NewStore(conn), usage.NewReports(conn)}, nil)
 
 	call := func(method, path, authorization, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -520,6 +528,67 @@ func TestOpenDBFailsFast(t *testing.T) {
 	if conn, err := openDB("postgres://gateway:gateway@127.0.0.1:1/gateway?sslmode=disable&connect_timeout=2"); err == nil {
 		conn.Close()
 		t.Error("openDB() on an unreachable database returned no error")
+	}
+}
+
+// TestOpenRedisFailsFast: a missing, malformed or unreachable Redis stops
+// startup with an error that says what to fix, and never quotes the URL,
+// whose password would then land in the log.
+func TestOpenRedisFailsFast(t *testing.T) {
+	cases := []struct{ name, url, want string }{
+		{"unset", "", "REDIS_URL is not set"},
+		// url.Parse fails on this one, and its error quotes the whole URL.
+		{"not a URL", "redis://:hunter2@127.0.0.1:port/0", "REDIS_URL is not a valid URL"},
+		{"wrong scheme", "postgres://:hunter2@127.0.0.1:6379/0", "REDIS_URL is not a valid Redis URL"},
+		{"unknown option", "redis://:hunter2@127.0.0.1:6379/0?retries=3", "REDIS_URL is not a valid Redis URL"},
+		// Port 1 on loopback: nothing listens there, so the ping fails at once.
+		{"unreachable", "redis://:hunter2@127.0.0.1:1/0", "connecting to Redis"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rdb, err := openRedis(tc.url)
+			if err == nil {
+				rdb.Close()
+				t.Fatal("openRedis() returned no error")
+			}
+			if !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "hunter2") {
+				t.Errorf("openRedis() = %q, want an error containing %q, without the password", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpenRedis: the options redisOptions forces still connect to a real
+// Redis.
+func TestOpenRedis(t *testing.T) {
+	u := os.Getenv("REDIS_URL")
+	if u == "" {
+		t.Skip("REDIS_URL not set; skipping Redis tests")
+	}
+	rdb, err := openRedis(u)
+	if err != nil {
+		t.Fatalf("openRedis() returned error: %v", err)
+	}
+	rdb.Close()
+}
+
+// TestRedisOptions: the client honours context deadlines and never retries a
+// command, whatever the URL says. The rate limit scripts aren't idempotent,
+// so a retry could charge twice.
+func TestRedisOptions(t *testing.T) {
+	for _, u := range []string{
+		"redis://127.0.0.1:6379/0",
+		// go-redis reads max_retries from the URL; it must not win.
+		"redis://127.0.0.1:6379/0?max_retries=3",
+	} {
+		opts, err := redisOptions(u)
+		if err != nil {
+			t.Fatalf("redisOptions(%q) returned error: %v", u, err)
+		}
+		if opts.MaxRetries != -1 || !opts.ContextTimeoutEnabled {
+			t.Errorf("redisOptions(%q): MaxRetries %d, ContextTimeoutEnabled %v; want -1, true",
+				u, opts.MaxRetries, opts.ContextTimeoutEnabled)
+		}
 	}
 }
 
@@ -609,6 +678,159 @@ func TestOversizedBodyIsRefused(t *testing.T) {
 	}
 }
 
+// fakeLimiter stands in for the Redis limiter: it answers every request the
+// same way, and records what it was asked.
+type fakeLimiter struct {
+	allowed bool
+	wait    time.Duration
+	calls   []allowCall
+}
+
+// allowCall is one Allow a fakeLimiter received.
+type allowCall struct {
+	tenantID    string
+	limit, cost int64
+}
+
+func (f *fakeLimiter) Allow(_ context.Context, tenantID string, limit, cost int64) (bool, time.Duration, error) {
+	f.calls = append(f.calls, allowCall{tenantID, limit, cost})
+	return f.allowed, f.wait, nil
+}
+
+// TestRateLimitThroughGateway: over the limit, the client gets the gateway's
+// 429 and the provider is never called; under it, the provider receives the
+// client's exact bytes. Either way the limiter is asked once, with the
+// tenant's own limit and the request's estimate.
+func TestRateLimitThroughGateway(t *testing.T) {
+	// No output cap, so the estimate is the body's tokens (a token per 4
+	// bytes) plus the tenant's default_max_tokens.
+	const body = `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	want := allowCall{"tn_test", 100_000, int64(len(body)+3)/4 + 4096}
+
+	send := func(t *testing.T, limiter *fakeLimiter) (*httptest.ResponseRecorder, map[string]*fakeUpstream) {
+		t.Helper()
+		r, ups := newTestRouterWith(t, fakeStore{}, limiter)
+		req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testTenantKey)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if len(limiter.calls) != 1 || limiter.calls[0] != want {
+			t.Errorf("Allow calls = %+v, want one: %+v", limiter.calls, want)
+		}
+		return rec, ups
+	}
+
+	t.Run("over the limit", func(t *testing.T) {
+		rec, ups := send(t, &fakeLimiter{wait: 12 * time.Second})
+
+		if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "12" {
+			t.Errorf("status %d, Retry-After %q; want 429, 12", rec.Code, rec.Header().Get("Retry-After"))
+		}
+		var got struct {
+			Error struct {
+				Type              string `json:"type"`
+				RetryAfterSeconds int64  `json:"retry_after_seconds"`
+				LimitTokensPerMin int64  `json:"limit_tokens_per_min"`
+				EstimatedTokens   int64  `json:"estimated_tokens"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("body %s: %v", rec.Body, err)
+		}
+		if e := got.Error; e.Type != "rate_limited" || e.RetryAfterSeconds != 12 || e.LimitTokensPerMin != 100_000 || e.EstimatedTokens != want.cost {
+			t.Errorf("error = %+v, want rate_limited, 12 s, limit 100000, estimate %d", e, want.cost)
+		}
+		for name, up := range ups {
+			if up.path != "" {
+				t.Errorf("a rate-limited request reached provider %q", name)
+			}
+		}
+	})
+
+	t.Run("under the limit", func(t *testing.T) {
+		rec, ups := send(t, &fakeLimiter{allowed: true})
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+		}
+		if ups["openai"].body != body {
+			t.Errorf("upstream body = %s, want the client's exact bytes %s", ups["openai"].body, body)
+		}
+	})
+}
+
+// hungRedis returns the address of a server that accepts connections and
+// never answers on them, like a Redis that has hung.
+func hungRedis(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return // the listener is closed
+			}
+			// Read whatever arrives, answer nothing, and hang up when the
+			// client does.
+			go func() {
+				_, _ = io.Copy(io.Discard, conn)
+				conn.Close()
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// TestRateLimitFailsOpenWhenRedisIsDown: with Redis hung or refusing
+// connections, a request is still admitted, with a Warn, in about Allow's
+// 100 ms timeout. That takes a client from redisOptions: without
+// ContextTimeoutEnabled, go-redis would wait out its own read timeout (5 s)
+// on the hung one.
+func TestRateLimitFailsOpenWhenRedisIsDown(t *testing.T) {
+	cases := []struct{ name, addr string }{
+		{"hung", hungRedis(t)},
+		// Port 1 on loopback: nothing listens there, so connecting is refused.
+		{"refusing connections", "127.0.0.1:1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts, err := redisOptions("redis://" + tc.addr + "/0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			rdb := redis.NewClient(opts)
+			t.Cleanup(func() { rdb.Close() })
+
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewJSONHandler(&logs, nil))
+			admitted := false
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { admitted = true })
+			// A provider route's order: Auth, ReadBody, then RateLimit.
+			h := middleware.Auth(fakeStore{}, logger)(usage.ReadBody(provider.FormatOpenAI, 1<<20)(
+				middleware.RateLimit(ratelimit.New(rdb), logger)(next)))
+
+			start := time.Now()
+			h.ServeHTTP(httptest.NewRecorder(), chatRequest("openai", "gpt-4o"))
+			elapsed := time.Since(start)
+
+			if !admitted {
+				t.Error("the request was not admitted")
+			}
+			if elapsed > time.Second {
+				t.Errorf("admitted after %v, want about 100 ms", elapsed)
+			}
+			var entry struct{ Level, Error string }
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil || entry.Level != "WARN" || entry.Error == "" {
+				t.Errorf("log = %q, want one WARN line with the error", logs.String())
+			}
+		})
+	}
+}
+
 // meteredCall is one usage callback the gateway made.
 type meteredCall struct {
 	provider string
@@ -674,7 +896,7 @@ func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
 		calls = append(calls, meteredCall{provider, r})
 	}
 
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -807,7 +1029,7 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), metrics.New(), nil, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -927,7 +1149,7 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), metrics.New(), nil, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

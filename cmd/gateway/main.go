@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	// Registers the "pgx" driver with database/sql.
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/grishkadel/llm-gateway/internal/admin"
 	"github.com/grishkadel/llm-gateway/internal/apierror"
@@ -30,6 +32,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
+	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -77,13 +80,14 @@ type stores struct {
 }
 
 // router builds the gateway's handler: one reverse proxy per configured
-// provider behind tenant auth, the admin API behind the admin key, /health,
-// /metrics, and a catch-all that rejects unknown prefixes, all behind the
-// request ID and logging middleware.
+// provider behind tenant auth and rate limiting, the admin API behind the
+// admin key, /health, /metrics, and a catch-all that rejects unknown
+// prefixes, all behind the request ID and logging middleware. A nil limiter
+// means no rate limiting.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -142,6 +146,12 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		if fb := cfg.Providers[p.Name].Fallback; fb.Enabled {
 			h = proxy.Fallback(p.Name, h, fb.Provider, proxies[fb.Provider], fb.Models, m.Fallback, logger)
 		}
+		// Rate limiting needs ReadBody's estimate, so it goes inside ReadBody.
+		// It wraps the fallback, so a request is charged once, whichever
+		// providers try it.
+		if limiter != nil {
+			h = middleware.RateLimit(limiter, logger)(h)
+		}
 		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(h)
 		metered := usage.RequireMetered(p.Format)(body)
 		// The request metrics go outermost, so requests the gateway refuses
@@ -187,6 +197,12 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
+	rdb, err := openRedis(os.Getenv("REDIS_URL"))
+	if err != nil {
+		return err
+	}
+	defer rdb.Close()
+
 	writer := usage.NewWriter(conn, logger)
 	// Deferred after conn.Close, so it runs first: by the time run returns,
 	// Shutdown has drained every request, so every usage row is queued.
@@ -208,7 +224,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	checker := health.NewChecker(providers, m.ProviderUp, logger)
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), m, checker, logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), m, checker, logger)
 	if err != nil {
 		return err
 	}
@@ -325,6 +341,52 @@ func openDB(dsn string) (*sql.DB, error) {
 		return nil, fmt.Errorf("connecting to the database: %w", err)
 	}
 	return conn, nil
+}
+
+// openRedis connects to Redis and pings it, so a missing or unreachable
+// Redis stops startup instead of leaving every request unlimited.
+func openRedis(redisURL string) (*redis.Client, error) {
+	opts, err := redisOptions(redisURL)
+	if err != nil {
+		return nil, err
+	}
+	rdb := redis.NewClient(opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		rdb.Close()
+		return nil, fmt.Errorf("connecting to Redis: %w", err)
+	}
+	return rdb, nil
+}
+
+// redisOptions parses REDIS_URL into the client options the rate limiter
+// needs, whatever the URL asks for:
+//   - ContextTimeoutEnabled, without which go-redis ignores context deadlines
+//     on the socket and waits out its own read timeout, so a hung Redis
+//     would hang every request.
+//   - MaxRetries -1, no retries: the rate limit scripts aren't idempotent,
+//     and a retry after a lost reply would charge or refund twice.
+//
+// Its errors never quote the URL, which can carry a password.
+func redisOptions(redisURL string) (*redis.Options, error) {
+	if redisURL == "" {
+		return nil, errors.New("REDIS_URL is not set, e.g. redis://127.0.0.1:6379/0")
+	}
+	opts, err := redis.ParseURL(redisURL)
+	if err != nil {
+		// url.Parse's errors quote the URL, password and all; go-redis's own
+		// name only the part that's wrong.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			return nil, errors.New("REDIS_URL is not a valid URL, e.g. redis://127.0.0.1:6379/0")
+		}
+		return nil, fmt.Errorf("REDIS_URL is not a valid Redis URL (%w), e.g. redis://127.0.0.1:6379/0", err)
+	}
+	opts.ContextTimeoutEnabled = true
+	opts.MaxRetries = -1
+	return opts, nil
 }
 
 // recordUsage returns a usageFunc that turns each provider response into a

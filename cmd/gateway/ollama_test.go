@@ -106,7 +106,7 @@ func routerFor(t *testing.T, yaml string, onUsage usageFunc) http.Handler {
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
