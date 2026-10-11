@@ -20,8 +20,9 @@ provider is a block of YAML, not code.
 request is authenticated with a tenant key, and every request that reaches a
 provider, streamed or not, is recorded in Postgres with its tokens and cost,
 verified live against Groq and Gemini. Week 3 (token-aware rate limiting) is
-in progress: each tenant's tokens-per-minute limit is enforced. Next, each
-request's charge is corrected to the tokens the provider actually reported.
+in progress: each tenant's tokens-per-minute limit is enforced, and each
+request's charge is corrected to the tokens the provider reported. The
+checkpoint tests through the gateway and a live check are next.
 
 ### What changed
 
@@ -33,11 +34,18 @@ request's charge is corrected to the tokens the provider actually reported.
   `429 rate_limited` with `Retry-After` in whole seconds, and the provider is
   never called. The body names the gateway, so a client can tell it from a
   provider's own 429, and carries `retry_after_seconds`,
-  `limit_tokens_per_min` and `estimated_tokens`. If Redis fails or takes more
-  than 100 ms to answer, the request goes through and the gateway logs a
-  warning: rate limiting fails open. The gateway now needs `REDIS_URL` to
-  start, and pings Redis at startup. Set limits with SQL for now
-  (`tenants.rate_limit_tokens_per_min`).
+  `limit_tokens_per_min` and `estimated_tokens`. When the response is over,
+  the charge is corrected to the tokens the provider reported: the unused
+  part comes back, and a request that used more pays the difference. A
+  response cut short (the client left, or the provider never answered)
+  refunds nothing, since its real cost is unknown, but tokens already seen
+  beyond the charge are still charged. A request that never reached a
+  provider (`503 provider_busy`) gets its whole charge back, and one that fell
+  back to another provider is settled once, by the provider that answered.
+  Each Redis call gives up after 100 ms; when Redis fails, the request goes
+  through and the gateway logs a warning: rate limiting fails open. The
+  gateway now needs `REDIS_URL` to start, and pings Redis at startup. Set
+  limits with SQL for now (`tenants.rate_limit_tokens_per_min`).
 - **Local Ollama.** `config.yaml` now has an `ollama` provider: a model on this
   machine, served at `/ollama/` and metered like the hosted ones. It is keyless
   (`auth: none`; clients still need a gateway key) and `free: true`, so every

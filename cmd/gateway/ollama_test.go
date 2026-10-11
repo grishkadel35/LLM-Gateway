@@ -94,8 +94,9 @@ providers:
     format: openai
 `
 
-// routerFor builds the gateway from a config file's text, over fakeStore.
-func routerFor(t *testing.T, yaml string, onUsage usageFunc) http.Handler {
+// routerFor builds the gateway from a config file's text, over fakeStore,
+// rate limited by limiter unless it is nil.
+func routerFor(t *testing.T, yaml string, onUsage usageFunc, limiter middleware.Limiter) http.Handler {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -106,7 +107,7 @@ func routerFor(t *testing.T, yaml string, onUsage usageFunc) http.Handler {
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, limiter, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -163,7 +164,7 @@ func scrapeMetrics(t *testing.T, r http.Handler) string {
 // tokens the provider reported.
 func TestMetricsThroughGateway(t *testing.T) {
 	ollama := newFakeOllama(t, ollamaKnobs{})
-	r := routerFor(t, fmt.Sprintf(ollamaConfig, ollama.server.URL), nil)
+	r := routerFor(t, fmt.Sprintf(ollamaConfig, ollama.server.URL), nil, nil)
 
 	r.ServeHTTP(httptest.NewRecorder(), chatRequest("ollama", "qwen3.5:9b"))
 	refused := chatRequest("ollama", "qwen3.5:9b")
@@ -192,7 +193,7 @@ func TestMetricsThroughGateway(t *testing.T) {
 // reaches Ollama only once the first has finished, and both succeed.
 func TestConcurrencyCapQueuesRequests(t *testing.T) {
 	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
-	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n", ollama.server.URL), nil)
+	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n", ollama.server.URL), nil, nil)
 
 	first := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
 	receive(t, ollama.arrivals, "the first request at Ollama")
@@ -218,7 +219,7 @@ func TestConcurrencyCapQueuesRequests(t *testing.T) {
 // reaches Ollama, and every wait, granted or not, is observed.
 func TestConcurrencyCapTimesOut(t *testing.T) {
 	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
-	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n    queue_timeout: 1\n", ollama.server.URL), nil)
+	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n    queue_timeout: 1\n", ollama.server.URL), nil, nil)
 
 	first := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
 	receive(t, ollama.arrivals, "the first request at Ollama")
@@ -290,7 +291,7 @@ providers:
 `, ollama.server.URL, groq.server.URL), func(ctx context.Context, provider string, r usage.Result) {
 		calls = append(calls, meteredCall{provider, r})
 		ids = append(ids, middleware.RequestIDFrom(ctx))
-	})
+	}, nil)
 
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))

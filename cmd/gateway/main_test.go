@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +32,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/provider"
+	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
@@ -679,11 +683,17 @@ func TestOversizedBodyIsRefused(t *testing.T) {
 }
 
 // fakeLimiter stands in for the Redis limiter: it answers every request the
-// same way, and records what it was asked.
+// same way, and records what it was asked. Behind an httptest.Server it is
+// called from the server's goroutines, hence the lock.
 type fakeLimiter struct {
-	allowed bool
-	wait    time.Duration
+	allowed   bool
+	wait      time.Duration
+	allowErr  error
+	adjustErr error
+
+	mu      sync.Mutex
 	calls   []allowCall
+	adjusts []adjustCall
 }
 
 // allowCall is one Allow a fakeLimiter received.
@@ -692,9 +702,34 @@ type allowCall struct {
 	limit, cost int64
 }
 
+// adjustCall is one Adjust a fakeLimiter received.
+type adjustCall struct {
+	tenantID     string
+	limit, delta int64
+	// ctxErr is its context's error when it arrived: nil unless already
+	// done.
+	ctxErr error
+}
+
 func (f *fakeLimiter) Allow(_ context.Context, tenantID string, limit, cost int64) (bool, time.Duration, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, allowCall{tenantID, limit, cost})
-	return f.allowed, f.wait, nil
+	return f.allowed, f.wait, f.allowErr
+}
+
+func (f *fakeLimiter) Adjust(ctx context.Context, tenantID string, limit, delta int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.adjusts = append(f.adjusts, adjustCall{tenantID, limit, delta, ctx.Err()})
+	return f.adjustErr
+}
+
+// recorded returns the calls so far.
+func (f *fakeLimiter) recorded() ([]allowCall, []adjustCall) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.calls), slices.Clone(f.adjusts)
 }
 
 // TestRateLimitThroughGateway: over the limit, the client gets the gateway's
@@ -714,8 +749,8 @@ func TestRateLimitThroughGateway(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer "+testTenantKey)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, req)
-		if len(limiter.calls) != 1 || limiter.calls[0] != want {
-			t.Errorf("Allow calls = %+v, want one: %+v", limiter.calls, want)
+		if calls, _ := limiter.recorded(); len(calls) != 1 || calls[0] != want {
+			t.Errorf("Allow calls = %+v, want one: %+v", calls, want)
 		}
 		return rec, ups
 	}
@@ -787,9 +822,9 @@ func hungRedis(t *testing.T) string {
 
 // TestRateLimitFailsOpenWhenRedisIsDown: with Redis hung or refusing
 // connections, a request is still admitted, with a Warn, in about Allow's
-// 100 ms timeout. That takes a client from redisOptions: without
-// ContextTimeoutEnabled, go-redis would wait out its own read timeout (5 s)
-// on the hung one.
+// 100 ms timeout, and its settlement fails the same way, with a second Warn.
+// That takes a client from redisOptions: without ContextTimeoutEnabled,
+// go-redis would wait out its own read timeout (5 s) on the hung one.
 func TestRateLimitFailsOpenWhenRedisIsDown(t *testing.T) {
 	cases := []struct{ name, addr string }{
 		{"hung", hungRedis(t)},
@@ -807,27 +842,349 @@ func TestRateLimitFailsOpenWhenRedisIsDown(t *testing.T) {
 
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logs, nil))
-			admitted := false
-			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { admitted = true })
+			start := time.Now()
+			var admitted time.Duration // when the request went on; 0 if it didn't
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { admitted = time.Since(start) })
 			// A provider route's order: Auth, ReadBody, then RateLimit.
 			h := middleware.Auth(fakeStore{}, logger)(usage.ReadBody(provider.FormatOpenAI, 1<<20)(
 				middleware.RateLimit(ratelimit.New(rdb), logger)(next)))
-
-			start := time.Now()
 			h.ServeHTTP(httptest.NewRecorder(), chatRequest("openai", "gpt-4o"))
-			elapsed := time.Since(start)
 
-			if !admitted {
-				t.Error("the request was not admitted")
+			if admitted == 0 || admitted > time.Second {
+				t.Errorf("admitted after %v, want about 100 ms", admitted)
 			}
-			if elapsed > time.Second {
-				t.Errorf("admitted after %v, want about 100 ms", elapsed)
+			var warns []string
+			for line := range bytes.Lines(logs.Bytes()) {
+				var entry struct{ Level, Msg, Error string }
+				if err := json.Unmarshal(line, &entry); err != nil || entry.Level != "WARN" || entry.Error == "" {
+					t.Errorf("log line %q, want a WARN with the error", line)
+				}
+				warns = append(warns, entry.Msg)
 			}
-			var entry struct{ Level, Error string }
-			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil || entry.Level != "WARN" || entry.Error == "" {
-				t.Errorf("log = %q, want one WARN line with the error", logs.String())
+			want := []string{"rate limit check failed; request admitted", "rate limit settlement failed"}
+			if !slices.Equal(warns, want) {
+				t.Errorf("WARN lines %q, want %q", warns, want)
 			}
 		})
+	}
+}
+
+// mockTokens is every token the mock reports for a chat completion: input,
+// cached input and output.
+const mockTokens = mockprovider.PromptTokens + mockprovider.OutputTokens
+
+// limitedMockRouter builds the gateway in front of the mock provider, rate
+// limited by limiter.
+func limitedMockRouter(t *testing.T, limiter middleware.Limiter, logger *slog.Logger) http.Handler {
+	t.Helper()
+	r, err := router(mockConfig(t), fakeStore{}, testAdminKey, nil, limiter, metrics.New(), nil, logger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	return r
+}
+
+// TestRateLimitSettlesThroughMock: once a complete response is over, the
+// bucket gets back the charge less every token the provider reported. The
+// mock reports 30, so a 4,116-token charge is settled with Adjust(+4,086). A
+// request admitted after Allow failed is settled the same way.
+func TestRateLimitSettlesThroughMock(t *testing.T) {
+	// 79 bytes: an input estimate of 20, plus default_max_tokens, 4,096.
+	const body = `{"model":"gpt-4o","messages":[{"role":"user","content":"hello, how are you?"}]}`
+	cases := []struct {
+		name     string
+		allowErr error
+	}{
+		{"charged", nil},
+		{"admitted after an Allow error", errors.New("redis: connection refused")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limiter := &fakeLimiter{allowed: tc.allowErr == nil, allowErr: tc.allowErr}
+			r := limitedMockRouter(t, limiter, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			req := httptest.NewRequest(http.MethodPost, "/openai/v1/chat/completions", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+			}
+
+			calls, adjusts := limiter.recorded()
+			if len(calls) != 1 || calls[0].cost != 4116 {
+				t.Errorf("Allow calls = %+v, want one charging 4116", calls)
+			}
+			if want := (adjustCall{"tn_test", 100_000, 4116 - mockTokens, nil}); len(adjusts) != 1 || adjusts[0] != want {
+				t.Errorf("Adjust calls = %+v, want one: %+v", adjusts, want)
+			}
+		})
+	}
+}
+
+// TestRateLimitRefundsProviderErrors: a provider that refuses the request
+// reports no tokens, so the whole charge comes back.
+func TestRateLimitRefundsProviderErrors(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadRequest} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ollama := newFakeOllama(t, ollamaKnobs{status: status})
+			limiter := &fakeLimiter{allowed: true}
+			r := routerFor(t, fmt.Sprintf(ollamaConfig, ollama.server.URL), nil, limiter)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+			if rec.Code != status {
+				t.Fatalf("status = %d, want %d", rec.Code, status)
+			}
+
+			calls, adjusts := limiter.recorded()
+			if len(calls) != 1 || len(adjusts) != 1 || adjusts[0].delta != calls[0].cost {
+				t.Errorf("Allow calls %+v, Adjust calls %+v; want the whole charge back", calls, adjusts)
+			}
+		})
+	}
+}
+
+// sseUpstream serves chat requests with one OpenAI-format stream chunk that
+// reports tokens of usage, then holds the stream open until the request
+// ends. It returns the server's URL.
+func sseUpstream(t *testing.T, tokens int64) string {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":%d,\"completion_tokens\":0}}\n\n", tokens)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	// Cleanups run last-registered first, so the handler is let go before
+	// Close, which waits for it.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv.URL
+}
+
+// TestRateLimitClientLeavesMidStream: a client that disconnects mid-stream
+// leaves the usage incomplete. Nothing is refunded, but tokens already seen
+// beyond the charge are charged, under a context the disconnect didn't
+// cancel. The gateway runs behind a real server, so ReverseProxy aborts the
+// stream with panic(http.ErrAbortHandler), as it would in production.
+func TestRateLimitClientLeavesMidStream(t *testing.T) {
+	// A small cap makes a small charge: the input estimate plus 5.
+	const body = `{"model":"m","stream":true,"max_tokens":5,"messages":[]}`
+	charged := int64(len(body)+3)/4 + 5
+	cases := []struct {
+		name string
+		seen int64 // the tokens the stream reports before the client leaves
+		want []adjustCall
+	}{
+		{"seen beyond the charge: the shortfall charged", 1000, []adjustCall{{"tn_test", 100_000, charged - 1000, nil}}},
+		{"seen within the charge: nothing back", 1, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limiter := &fakeLimiter{allowed: true}
+			r := routerFor(t, fmt.Sprintf(ollamaConfig, sseUpstream(t, tc.seen)), nil, limiter)
+			// done closes when the gateway is through with the request, abort
+			// included.
+			done := make(chan struct{})
+			gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				defer close(done)
+				r.ServeHTTP(w, req)
+			}))
+			t.Cleanup(gw.Close)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+"/ollama/v1/chat/completions", strings.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Authorization", "Bearer "+testTenantKey)
+			resp, err := gw.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The usage chunk went through the gateway's meter on its way here.
+			if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+				t.Fatalf("reading the stream: %v", err)
+			}
+			cancel()
+			resp.Body.Close()
+			receive(t, done, "the gateway to finish the request")
+
+			calls, adjusts := limiter.recorded()
+			if len(calls) != 1 || calls[0].cost != charged {
+				t.Errorf("Allow calls = %+v, want one charging %d", calls, charged)
+			}
+			if !slices.Equal(adjusts, tc.want) {
+				t.Errorf("Adjust calls = %+v, want %+v", adjusts, tc.want)
+			}
+		})
+	}
+}
+
+// TestRateLimitUnansweredRefundsNothing: a provider that never answered may
+// still have received the request and billed it, so the charge stands. That
+// is 502 when the provider is unreachable, 504 when it times out, and 499
+// when the client gives up first.
+func TestRateLimitUnansweredRefundsNothing(t *testing.T) {
+	check := func(t *testing.T, limiter *fakeLimiter, rec *httptest.ResponseRecorder, status int) {
+		t.Helper()
+		if rec.Code != status {
+			t.Errorf("status = %d, want %d", rec.Code, status)
+		}
+		if calls, adjusts := limiter.recorded(); len(calls) != 1 || len(adjusts) != 0 {
+			t.Errorf("Allow calls %+v, Adjust calls %+v; want one Allow and no Adjust", calls, adjusts)
+		}
+	}
+
+	t.Run("502", func(t *testing.T) {
+		limiter := &fakeLimiter{allowed: true}
+		// Port 1 on loopback: nothing listens there.
+		r := routerFor(t, fmt.Sprintf(ollamaConfig, "http://127.0.0.1:1"), nil, limiter)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+		check(t, limiter, rec, http.StatusBadGateway)
+	})
+
+	t.Run("504", func(t *testing.T) {
+		ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+		limiter := &fakeLimiter{allowed: true}
+		r := routerFor(t, fmt.Sprintf(ollamaConfig+"    timeout: 1\n", ollama.server.URL), nil, limiter)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+		check(t, limiter, rec, http.StatusGatewayTimeout)
+	})
+
+	t.Run("499", func(t *testing.T) {
+		ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+		limiter := &fakeLimiter{allowed: true}
+		r := routerFor(t, fmt.Sprintf(ollamaConfig, ollama.server.URL), nil, limiter)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := serveAsync(r, chatRequest("ollama", "qwen3.5:9b").WithContext(ctx))
+		receive(t, ollama.arrivals, "the request at Ollama")
+		cancel()
+		check(t, limiter, receive(t, done, "the response"), proxy.StatusClientClosedRequest)
+	})
+}
+
+// TestRateLimitNeverSettlesUnadmitted: a request the gateway refused, at the
+// rate limit or at auth, was never charged, so it is never settled.
+func TestRateLimitNeverSettlesUnadmitted(t *testing.T) {
+	limiter := &fakeLimiter{wait: time.Second} // refuses everything
+	r, _ := newTestRouterWith(t, fakeStore{}, limiter)
+
+	limited := httptest.NewRecorder()
+	r.ServeHTTP(limited, chatRequest("openai", "gpt-4o"))
+	unauthenticated := httptest.NewRecorder()
+	req := chatRequest("openai", "gpt-4o")
+	req.Header.Set("Authorization", "Bearer gw_not-a-key")
+	r.ServeHTTP(unauthenticated, req)
+
+	if limited.Code != http.StatusTooManyRequests || unauthenticated.Code != http.StatusUnauthorized {
+		t.Errorf("statuses %d and %d, want 429 and 401", limited.Code, unauthenticated.Code)
+	}
+	if calls, adjusts := limiter.recorded(); len(calls) != 1 || len(adjusts) != 0 {
+		t.Errorf("Allow calls %+v, Adjust calls %+v; want only the rate-limited request's Allow", calls, adjusts)
+	}
+}
+
+// TestRateLimitFallbackSettlesOnce: a request that falls back is charged
+// once and settled once, by the attempt that answered. Ollama's 500 reports
+// no tokens and the mock behind groq reports 30, so settling by the failed
+// attempt would refund the whole charge instead.
+func TestRateLimitFallbackSettlesOnce(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{status: http.StatusInternalServerError})
+	mock := httptest.NewServer(mockprovider.Handler())
+	t.Cleanup(mock.Close)
+	t.Setenv("TEST_GROQ_KEY", "sk-groq")
+
+	limiter := &fakeLimiter{allowed: true}
+	r := routerFor(t, fmt.Sprintf(`
+providers:
+  ollama:
+    url: %s
+    auth: none
+    format: openai
+    fallback:
+      enabled: true
+      provider: groq
+      models:
+        "qwen3.5:9b": qwen/qwen3.8-27b
+  groq:
+    url: %s/openai
+    key: ${TEST_GROQ_KEY}
+    auth: bearer
+    format: openai
+`, ollama.server.URL, mock.URL), nil, limiter)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Gateway-Fallback") != "true" {
+		t.Fatalf("status %d, X-Gateway-Fallback %q; want 200 from the fallback", rec.Code, rec.Header().Get("X-Gateway-Fallback"))
+	}
+
+	calls, adjusts := limiter.recorded()
+	if len(calls) != 1 || len(adjusts) != 1 || adjusts[0].delta != calls[0].cost-mockTokens {
+		t.Errorf("Allow calls %+v, Adjust calls %+v; want one of each, settling by groq's %d tokens", calls, adjusts, mockTokens)
+	}
+}
+
+// TestRateLimitRefundsBusyRequest: a request that got no concurrency slot
+// never reached the provider, and nothing reports usage for it, so the whole
+// charge comes back.
+func TestRateLimitRefundsBusyRequest(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+	limiter := &fakeLimiter{allowed: true}
+	r := routerFor(t, fmt.Sprintf(ollamaConfig+"    max_concurrency: 1\n    queue_timeout: 1\n", ollama.server.URL), nil, limiter)
+
+	first := serveAsync(r, chatRequest("ollama", "qwen3.5:9b"))
+	receive(t, ollama.arrivals, "the first request at Ollama")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	// The first request still holds its slot, so only the busy one has
+	// settled.
+	calls, adjusts := limiter.recorded()
+	if len(calls) != 2 || len(adjusts) != 1 || adjusts[0].delta != calls[1].cost {
+		t.Errorf("Allow calls %+v, Adjust calls %+v; want the busy request's whole charge back", calls, adjusts)
+	}
+	ollama.release()
+	receive(t, first, "the first response")
+}
+
+// TestRateLimitSettlementFailure: a failed Adjust is logged at Warn, with
+// what it was for, and the client still gets the provider's response.
+func TestRateLimitSettlementFailure(t *testing.T) {
+	var logs bytes.Buffer
+	limiter := &fakeLimiter{allowed: true, adjustErr: errors.New("redis: i/o timeout")}
+	r := limitedMockRouter(t, limiter, slog.New(slog.NewJSONHandler(&logs, nil)))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("openai", "gpt-4o"))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), mockprovider.Reply) {
+		t.Errorf("status %d, body %s; want the mock's reply", rec.Code, rec.Body)
+	}
+
+	calls, _ := limiter.recorded()
+	var warns []map[string]any
+	for line := range bytes.Lines(logs.Bytes()) {
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		if entry["level"] == "WARN" {
+			warns = append(warns, entry)
+		}
+	}
+	if len(warns) != 1 || len(calls) != 1 || warns[0]["request_id"] != rec.Header().Get("X-Request-ID") || warns[0]["tenant_id"] != "tn_test" ||
+		warns[0]["delta"] != float64(calls[0].cost-mockTokens) || warns[0]["error"] != "redis: i/o timeout" {
+		t.Errorf("WARN lines = %v, want one with the request ID, tenant, delta and error", warns)
 	}
 }
 

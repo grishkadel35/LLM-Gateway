@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,13 +20,15 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
-// fakeLimiter answers every Allow the same way, and records each one.
+// fakeLimiter answers every Allow the same way, and records each call.
 type fakeLimiter struct {
-	allowed bool
-	wait    time.Duration
-	err     error
+	allowed   bool
+	wait      time.Duration
+	err       error // Allow's
+	adjustErr error
 
-	calls []allowCall
+	calls   []allowCall
+	adjusts []adjustCall
 }
 
 // allowCall is one Allow a fakeLimiter received.
@@ -46,18 +49,36 @@ func (f *fakeLimiter) Allow(ctx context.Context, tenantID string, limit, cost in
 	return f.allowed, f.wait, f.err
 }
 
+// adjustCall is one Adjust a fakeLimiter received.
+type adjustCall struct {
+	tenantID     string
+	limit, delta int64
+	// ctxErr is its context's error when it arrived: nil unless already
+	// done.
+	ctxErr error
+}
+
+func (f *fakeLimiter) Adjust(ctx context.Context, tenantID string, limit, delta int64) error {
+	f.adjusts = append(f.adjusts, adjustCall{tenantID, limit, delta, ctx.Err()})
+	return f.adjustErr
+}
+
 // acme has the schema's default limits.
 var acme = tenant.Tenant{ID: "tn_acme", RateLimitTokensPerMin: 100_000, DefaultMaxTokens: 4096}
 
 // serveRateLimit sends body as tn's OpenAI-format request through RequestID,
 // ReadBody and RateLimit, in front of a handler that records whether it was
-// reached and the charge it saw. A zero tn sends it with no tenant at all.
-func serveRateLimit(t *testing.T, limiter Limiter, logger *slog.Logger, tn tenant.Tenant, body string) (rec *httptest.ResponseRecorder, reached bool, c *charge) {
+// reached and the charge it saw, and then reports each of reports, as a
+// provider's attempts would. A zero tn sends it with no tenant at all.
+func serveRateLimit(t *testing.T, limiter Limiter, logger *slog.Logger, tn tenant.Tenant, body string, reports ...usage.Result) (rec *httptest.ResponseRecorder, reached bool, c *charge) {
 	t.Helper()
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reached = true
 		c = chargeFrom(r.Context())
+		for _, report := range reports {
+			ReportUsage(r.Context(), report)
+		}
 	})
 	h := usage.ReadBody(provider.FormatOpenAI, 1<<20)(RateLimit(limiter, logger)(next))
 	if tn.ID != "" {
@@ -254,4 +275,82 @@ func TestRateLimitWithoutTenant(t *testing.T) {
 	if entry := logLine(t, &logs); entry["level"] != "ERROR" {
 		t.Errorf("log line = %v, want ERROR", entry)
 	}
+}
+
+// TestRateLimitSettles: once a request is over, its charge is settled by
+// the usage last reported for it, with one Adjust, or none when there is
+// nothing to correct.
+func TestRateLimitSettles(t *testing.T) {
+	const body = `{"model":"m","max_tokens":100,"messages":[]}`
+	charged := textTokens(body) + 100
+	complete := func(tokens int64) usage.Result {
+		return usage.Result{Usage: usage.Usage{Input: tokens}, Complete: true}
+	}
+	cutShort := func(tokens int64) usage.Result {
+		return usage.Result{Usage: usage.Usage{Input: tokens}}
+	}
+
+	cases := []struct {
+		name     string
+		allowErr error
+		reports  []usage.Result
+		want     []int64 // each Adjust's delta
+	}{
+		{"no report: all of it back", nil, nil, []int64{charged}},
+		{"complete: the unused part back", nil, []usage.Result{complete(30)}, []int64{charged - 30}},
+		{"complete, over the charge: the excess charged", nil, []usage.Result{complete(charged + 50)}, []int64{-50}},
+		{"complete, exactly the charge: no call", nil, []usage.Result{complete(charged)}, nil},
+		{"incomplete, under the charge: nothing back", nil, []usage.Result{cutShort(10)}, nil},
+		{"incomplete, over the charge: the shortfall charged", nil, []usage.Result{cutShort(charged + 50)}, []int64{-50}},
+		// A fallback: the failed attempt reports, then the one that answered.
+		{"the last report wins", nil, []usage.Result{complete(0), complete(30)}, []int64{charged - 30}},
+		{"admitted after an Allow error: settled the same", context.DeadlineExceeded, []usage.Result{complete(30)}, []int64{charged - 30}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			limiter := &fakeLimiter{allowed: tc.allowErr == nil, err: tc.allowErr}
+			serveRateLimit(t, limiter, slog.New(slog.NewTextHandler(io.Discard, nil)), acme, body, tc.reports...)
+
+			var got []int64
+			for _, a := range limiter.adjusts {
+				if a.tenantID != "tn_acme" || a.limit != 100_000 || a.ctxErr != nil {
+					t.Errorf("Adjust(%q, limit %d) with context error %v, want tn_acme, 100000, a live context", a.tenantID, a.limit, a.ctxErr)
+				}
+				got = append(got, a.delta)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("Adjust deltas = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRateLimitSettlesWhenAborted: a client that leaves mid-stream cancels
+// the request's context, and ReverseProxy then aborts with
+// panic(http.ErrAbortHandler). The charge is still settled, by the usage
+// reported as the body closed, under a context that isn't cancelled, and
+// the panic goes on up to net/http.
+func TestRateLimitSettlesWhenAborted(t *testing.T) {
+	const body = `{"model":"m","max_tokens":100,"messages":[]}`
+	limiter := &fakeLimiter{allowed: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		ReportUsage(r.Context(), usage.Result{Usage: usage.Usage{Input: 1000}})
+		panic(http.ErrAbortHandler)
+	})
+	h := asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 1<<20)(RateLimit(limiter, slog.New(slog.NewTextHandler(io.Discard, nil)))(next)))
+
+	defer func() {
+		if p := recover(); p != http.ErrAbortHandler {
+			t.Errorf("recovered %v, want http.ErrAbortHandler", p)
+		}
+		want := adjustCall{"tn_acme", 100_000, textTokens(body) + 100 - 1000, nil}
+		if len(limiter.adjusts) != 1 || limiter.adjusts[0] != want {
+			t.Errorf("Adjust calls = %+v, want one: %+v", limiter.adjusts, want)
+		}
+	}()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	t.Error("ServeHTTP returned; want the abort to go on up")
 }

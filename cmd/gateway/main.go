@@ -114,6 +114,8 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	for _, p := range providers {
 		name := p.Name
 		meter := func(ctx context.Context, r usage.Result) {
+			// For the rate limiter to settle the request's charge by.
+			middleware.ReportUsage(ctx, r)
 			m.Tokens(name, r.Usage)
 			if onUsage != nil {
 				onUsage(ctx, name, r)
