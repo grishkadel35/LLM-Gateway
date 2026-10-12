@@ -15,17 +15,23 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-10
-**Stage:** Weeks 1 and 2 of 8 complete, checkpoints closed. Every provider
-request is authenticated with a tenant key, and every request that reaches a
-provider, streamed or not, is recorded in Postgres with its tokens and cost,
-verified live against Groq and Gemini. Week 3 (token-aware rate limiting) is
-in progress: each tenant's tokens-per-minute limit is enforced, and each
-request's charge is corrected to the tokens the provider reported. The
-checkpoint tests through the gateway and a live check are next.
+**Last updated:** 2026-10-12
+**Stage:** Weeks 1 to 3 of 8 complete, checkpoints closed. Every provider
+request is authenticated with a tenant key and held to its tenant's
+tokens-per-minute limit, and every request that reaches a provider, streamed or
+not, is recorded in Postgres with its tokens and cost, verified live against
+Groq and Gemini. A tenant over its limit gets `429` with `Retry-After` before
+any provider is called, and each charge is corrected to the tokens the
+provider reported. Week 4 (response caching) is next.
 
 ### What changed
 
+- **Week 3 checkpoint closed.** Tests through the real router against a real
+  Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
+  back in by the refill and by its refunds, and never over-admitted by 50
+  simultaneous requests. A live check against Groq and Gemini passed. See
+  [Week 3 deliverables](#week-3-deliverables--token-aware-rate-limiting-) and
+  [The 429 contract](#the-429-contract).
 - **Rate limiting is on.** Every provider request is charged against its
   tenant's tokens-per-minute bucket before it is forwarded. The charge is the
   token estimate plus the output the client allowed: its own cap, or the
@@ -245,6 +251,74 @@ request with a bad key never reaches the provider. Usage is counted by
 wrapping the response body in `ModifyResponse`, so streaming responses are
 metered too; otherwise `stream: true` would bypass every future limit.
 
+### Week 3 deliverables — token-aware rate limiting ✅
+
+Goal: per-tenant limits in tokens per minute, enforced atomically in Redis.
+
+- [x] Redis in the dev stack and CI — `redis:8-alpine` in docker-compose, bound
+  to loopback with no volume (the buckets are disposable) and started by
+  `make db-up`, and a service container in CI
+- [x] `internal/ratelimit` — one token bucket per tenant in Redis, run as two
+  Lua scripts (`Allow`, `Adjust`) on Redis's own clock, so concurrent requests
+  can't spend the same tokens and replicas agree on the time. A request bigger
+  than a whole minute's limit gets in on a full bucket and leaves the tenant in
+  debt; a bucket's key expires when it would be full again
+- [x] Tenant limits valid by construction — migration `00002` puts
+  `CHECK (> 0)` on `rate_limit_tokens_per_min` and `default_max_tokens`
+- [x] The request estimate, computed where the body is read — one token per 4
+  bytes with media payloads left out, plus 1,600 per image, audio, document or
+  file part; the output cap the client set is read, never rewritten
+- [x] `internal/middleware/ratelimit.go` — charges the estimate plus the output
+  the request allows before the provider is called; over the limit is a
+  `429 rate_limited` with `Retry-After`; when Redis fails, the request is
+  admitted with a warning (fail open)
+- [x] Settlement from the usage callback — when a response ends, the charge is
+  corrected to the tokens the provider reported: the unused part comes back,
+  and an overshoot is charged
+- [x] Tests: the checkpoint through the real router, against a real Redis and
+  an upstream that holds its responses open — a 100,000 tokens/min tenant is
+  refused at the threshold and recovers after refill, and 50 simultaneous
+  requests of 10,000 tokens admit exactly 10
+
+This is the first week the gateway depends on Redis too: it adds `go-redis`,
+and `REDIS_URL` joins `DATABASE_URL` as a setting the gateway won't start
+without. `RateLimit` runs *after* `ReadBody`, which supplies the estimate, and
+*before* the proxy, so a refused request never reaches the provider. It wraps a
+route's fallback (Ollama → Groq), so a request is charged once and settled
+once, by the provider that answered. Settlement rides on the usage callback
+that already meters each response, so a streamed response is corrected when its
+stream ends.
+
+The Week 3 checkpoint is "a 100K tokens/min tenant is blocked at the right
+threshold, recovers after refill, and concurrent requests can't over-admit."
+Two tests in `cmd/gateway` check it through the real router, against a real
+Redis, in front of a provider that holds each request until the test lets it
+go, so no admitted request gives tokens back early. On a 100,000 tokens/min
+tenant, three 30,000-token requests get in and a fourth gets `429` with
+`Retry-After: 12`. Once the three end, each having used 1,000 tokens, the
+29,000 apiece they didn't use come back, and a fifth gets in at once. After a
+drain, a 1,700-token request is refused, then gets in 1.1 s later on the
+refill alone (100,000 a minute is about 1,667 a second). Of 50 requests of
+10,000 tokens sent at once, exactly 10 reach the provider and 40 get `429`.
+Both tests need `REDIS_URL` and skip without it.
+
+The gateway has also been exercised against live providers with rate limiting
+on (2026-10-12, built from `a36fa30`): Groq `openai/gpt-oss-120b` through the
+`openai` Python SDK (3.29) and Gemini `gemini-3.8-flash` through `google-genai`
+(2.29) still answer, streamed and not. Gemini answered some calls with its own
+`503` "high demand", direct calls without the gateway included, so that is its
+capacity, not the gateway's doing. A 503 carries no tokens, so its whole charge
+came back.
+
+With the tenant's limit lowered to 1,000 a minute in SQL, the first request got
+in on the full bucket and was charged 1,027: an input estimate of 27 tokens plus
+an output allowance clamped at the limit. It was settled to the 117 tokens it
+really used, and the bucket read 888, where the charge alone would have left it
+at −27. The next request, sent with `max_retries=0`, got `429 rate_limited` with
+`Retry-After: 7` (⌈(1,000 − 888) × 60 / 1,000⌉) and `estimated_tokens` 1,027.
+With the SDK's default retries it waited the 7 s and got 200, 7.42 s in all. The
+refused requests left no usage row.
+
 ## Quick start
 
 Start Postgres and Redis and create the schema (see [Database](#database)):
@@ -368,6 +442,11 @@ the compose database; pass `DATABASE_URL=postgres://...` to use another.
 Redis holds the rate-limit buckets (Week 3). It has no volume, because the
 buckets are disposable: losing them only refills every tenant. It has no
 password either, so binding to loopback is what keeps it private.
+
+The gateway finds it through `REDIS_URL`: `make run` and `make run-mock` point
+it at this one (pass `REDIS_URL=redis://...` to use another). The gateway pings
+it at startup, so a missing or unreachable Redis stops it there instead of
+leaving every tenant unlimited.
 
 The Postgres tests only run when `DATABASE_URL` is set, and each creates and
 drops its own throwaway database, so they never touch dev data. The Redis
@@ -582,7 +661,7 @@ to the network: bind it to the Colima bridge address or firewall it.
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
 | `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
-| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise). Prefix stripped, forwarded with the provider's key. |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)). Prefix stripped, forwarded with the provider's key. |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
@@ -621,6 +700,49 @@ A provider's `status` is `up` or `down`, or `unknown` before its first check has
 run; `checked_at` is an RFC 3339 time. A `down` provider is information for
 whoever reads the body or `gateway_provider_up`; it never changes the `200`.
 With no checked provider the body is exactly `{"status":"ok"}`.
+
+### The 429 contract
+
+Before a request is forwarded, the gateway charges its tenant's
+tokens-per-minute bucket an estimate: the input estimate plus the output the
+request allows, which is its own cap (`max_tokens`, `max_completion_tokens` or
+Gemini's `maxOutputTokens`) or, when it set none, the tenant's
+`default_max_tokens` for each choice. The bucket belongs to the tenant, so all
+of its keys, providers and models share it. When it can't cover the charge, the
+gateway answers `429` itself, with `Retry-After: 12` and a body like this one (a
+30,000-token request with 10,000 left in a 100,000-per-minute bucket). The body
+has this shape for every provider, and the provider is never called:
+
+```json
+{"error":{"estimated_tokens":30000,"limit_tokens_per_min":100000,"message":"this tenant is over the gateway's token rate limit; retry in 12 s","retry_after_seconds":12,"type":"rate_limited"}}
+```
+
+- **`Retry-After`** is in whole seconds, rounded up, and at least 1: how long
+  until the bucket could admit this request if the tenant sent nothing else
+  meanwhile. It is never more than 60 unless the tenant is in debt. Debt comes
+  from a request bigger than a whole minute's limit, which gets in on a full
+  bucket and is charged in full, and from settlement charging a request that
+  used more tokens than it was charged up front.
+- **Telling it from a provider's 429.** The gateway's 429 has `error.type`
+  `rate_limited`, a message that names the gateway's token rate limit, and
+  `retry_after_seconds`, `limit_tokens_per_min` and `estimated_tokens` beside
+  them. A provider's own 429 passes through with its own body.
+- **SDK retries.** The openai Python SDK treats a 429 as retryable: it waits
+  for `Retry-After` and retries twice by default, so a tenant a little over its
+  limit sees a short wait instead of an error. With `max_retries=0` the 429
+  surfaces as a `RateLimitError`, with `e.type == "rate_limited"` and the wait
+  in `e.response.headers["retry-after"]`. (openai 3.29 doesn't retry at all
+  when `Retry-After` is above two minutes, which only a tenant in debt gets.)
+- **The estimate is corrected afterwards.** `estimated_tokens` is a charge made
+  up front, not a bill. When the response ends, the gateway corrects the bucket
+  to the tokens the provider reported: the unused part comes back, and a request
+  that used more pays the difference, so the bucket soon reflects real usage. A
+  response cut short (the client left, the provider never answered) is not
+  refunded, since its real cost is unknown. A request that sets a tighter
+  `max_tokens` is cheaper to admit.
+
+A refused request leaves no usage row. The gateway logs it as one
+`request rate limited` line carrying the `X-Request-ID` the client got.
 
 ## Make targets
 
@@ -682,8 +804,10 @@ Returning an error from it causes `ErrorHandler` to run instead of the response
 being forwarded — that's the mechanism for rejecting a request over budget.
 
 Rate limiting runs *before* the proxy, as middleware after `ReadBody` in
-`main.go`, so a refused request never reaches the provider. Budget checks
-belong next to it.
+`main.go`, so a refused request never reaches the provider. It settles on the
+way back too: the usage callback, which fires as each response ends (or fails),
+reports that request's tokens to it (`middleware.ReportUsage`), and it corrects
+the bucket once the request is over. Budget checks belong next to it.
 
 ## Observability
 
@@ -707,7 +831,7 @@ admin auth and a separate port. No metric has a tenant or model label.
 
 | Metric                                       | Meaning                                                                                 |
 | -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`, `403`, `413` and `503` included.             |
+| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`, `403`, `413`, `429` and `503` included.      |
 | `gateway_request_duration_seconds{provider}` | Histogram of the whole response, streaming included.                                    |
 | `gateway_tokens_total{provider,type}`        | Tokens by `type`: `input`, `cached_input`, `cache_write`, `cache_write_1h` or `output`. |
 | `gateway_concurrency_wait_seconds{provider}` | Histogram of time spent waiting for a slot.                                             |

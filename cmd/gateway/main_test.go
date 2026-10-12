@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -1185,6 +1186,305 @@ func TestRateLimitSettlementFailure(t *testing.T) {
 	if len(warns) != 1 || len(calls) != 1 || warns[0]["request_id"] != rec.Header().Get("X-Request-ID") || warns[0]["tenant_id"] != "tn_test" ||
 		warns[0]["delta"] != float64(calls[0].cost-mockTokens) || warns[0]["error"] != "redis: i/o timeout" {
 		t.Errorf("WARN lines = %v, want one with the request ID, tenant, delta and error", warns)
+	}
+}
+
+// ownTenant is fakeStore with its tenant under an ID of its own. Every test
+// shares the one Redis, so a test that uses a real bucket needs a tenant no
+// other test has.
+type ownTenant struct {
+	fakeStore
+	id string
+}
+
+func (s ownTenant) Lookup(ctx context.Context, key string) (tenant.Tenant, tenant.APIKey, error) {
+	tn, k, err := s.fakeStore.Lookup(ctx, key)
+	tn.ID, k.TenantID = s.id, s.id
+	return tn, k, err
+}
+
+// lockedBuffer is a bytes.Buffer that is safe for concurrent use: the gateway
+// logs to it from the goroutines serving its requests.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// heldGateway is the gateway, rate limited by the real Redis limiter, in
+// front of a provider that holds each request until the test lets it go. A
+// charge is settled only once its response is over, so until then every
+// admitted request keeps its whole estimate out of the bucket.
+type heldGateway struct {
+	http.Handler
+	// arrivals receives a value as each request reaches the provider. It has
+	// room for more requests than any test here sends, so the provider never
+	// waits on it, even when the limiter lets through more than it should: a
+	// broken limiter fails the test instead of hanging it.
+	arrivals chan struct{}
+	// release lets one held request go for each value sent on it. Any still
+	// held when the test ends are let go then.
+	release chan struct{}
+}
+
+// newHeldGateway builds a heldGateway whose provider reports tokens used for
+// each request, for fakeStore's 100,000 tokens/min tenant under a fresh ID
+// (see ownTenant). It builds the gateway as main does, down to the Redis
+// client from openRedis. Without REDIS_URL the test is skipped.
+//
+// Rate limiting fails open: a limiter call that fails or takes over 100 ms
+// admits its request, with a Warn. On a slow machine that would pass for a
+// limiter that over-admits, so any Warn fails the test, saying so.
+func newHeldGateway(t *testing.T, tokens int64) *heldGateway {
+	t.Helper()
+
+	u := os.Getenv("REDIS_URL")
+	if u == "" {
+		t.Skip("REDIS_URL not set; skipping Redis tests")
+	}
+	rdb, err := openRedis(u)
+	if err != nil {
+		t.Fatalf("openRedis() returned error: %v", err)
+	}
+	t.Cleanup(func() { rdb.Close() })
+
+	g := &heldGateway{arrivals: make(chan struct{}, 64), release: make(chan struct{})}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.arrivals <- struct{}{}
+		<-g.release
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"model":"m","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":0}}`, tokens)
+	}))
+	// Cleanups run last-registered first, so held requests are let go before
+	// Close, which waits for them.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(g.release) })
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(ollamaConfig, srv.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load() returned error: %v", err)
+	}
+	// A fresh tenant's bucket starts full, and Redis drops it once it is
+	// full again.
+	store := ownTenant{id: "tn_test_" + rand.Text()}
+	var logs lockedBuffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	g.Handler, err = router(cfg, store, testAdminKey, nil, ratelimit.New(rdb), metrics.New(), nil, logger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	// Registered last, so it runs first: before a failed test's held requests
+	// are let go, whose settlements could fail as the client closes.
+	t.Cleanup(func() {
+		if warns := logs.String(); warns != "" {
+			t.Errorf("the gateway logged warnings (below). A limiter call that fails or takes over 100 ms "+
+				"admits its request unchecked, or loses its refund, so any failure above may be down to "+
+				"a slow machine, not the limiter:\n%s", warns)
+		}
+	})
+	return g
+}
+
+// admit sends req through the gateway and returns once the provider has it.
+// The channel delivers the response once the request is let go. The test
+// fails if the gateway answers the request instead.
+func (g *heldGateway) admit(t *testing.T, req *http.Request) <-chan *httptest.ResponseRecorder {
+	t.Helper()
+	done := serveAsync(g, req)
+	select {
+	case <-g.arrivals:
+	case rec := <-done:
+		t.Fatalf("status %d, Retry-After %q, want the request admitted; body %s",
+			rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the request at the provider")
+	}
+	return done
+}
+
+// refuse sends req through the gateway and returns its response, which must
+// be the gateway's 429, and the error in it. The test fails if the request
+// reaches the provider instead.
+func (g *heldGateway) refuse(t *testing.T, req *http.Request) (*httptest.ResponseRecorder, rateLimited) {
+	t.Helper()
+	done := serveAsync(g, req)
+	select {
+	case <-g.arrivals:
+		t.Fatal("the request reached the provider; want it refused")
+	case rec := <-done:
+		return rec, refusal(t, rec)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the response")
+	}
+	return nil, rateLimited{}
+}
+
+// rateLimited is the error in the body of the gateway's 429.
+type rateLimited struct {
+	Type              string `json:"type"`
+	RetryAfterSeconds int64  `json:"retry_after_seconds"`
+	LimitTokensPerMin int64  `json:"limit_tokens_per_min"`
+	EstimatedTokens   int64  `json:"estimated_tokens"`
+}
+
+// refusal returns the error in rec, failing the test unless rec is the
+// gateway's 429.
+func refusal(t *testing.T, rec *httptest.ResponseRecorder) rateLimited {
+	t.Helper()
+	var body struct {
+		Error rateLimited `json:"error"`
+	}
+	err := json.Unmarshal(rec.Body.Bytes(), &body)
+	if rec.Code != http.StatusTooManyRequests || err != nil || body.Error.Type != "rate_limited" {
+		t.Fatalf("status %d, want 429 rate_limited; body %s", rec.Code, rec.Body)
+	}
+	return body.Error
+}
+
+// chatCosting is a tenant's chat request on route ollama that the gateway
+// estimates at exactly cost tokens: 12 for the 48-byte body (a token per 4
+// bytes), and max_tokens for the rest. %7d pads max_tokens with spaces, which
+// JSON allows, so every body here is 48 bytes.
+//
+// The checkpoint's arithmetic needs exact costs. At 30,016 tokens instead of
+// 30,000, the fourth request's wait below would be 12.04 s: Retry-After 13
+// for its first 40 ms, then 12.
+func chatCosting(cost int64) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/ollama/v1/chat/completions",
+		strings.NewReader(fmt.Sprintf(`{"model":"m","max_tokens":%7d,"messages":[]}`, cost-12)))
+	req.Header.Set("Authorization", "Bearer "+testTenantKey)
+	return req
+}
+
+// TestRateLimitThresholdAndRefill: the Week 3 checkpoint's threshold and
+// refill, through the gateway with the real Redis limiter. A 100,000
+// tokens/min tenant is refused exactly where its bucket runs out, with the
+// Retry-After the arithmetic predicts, gets back what its requests didn't use
+// once they end, and once drained gets in again only as the bucket refills.
+// The gateway's 429s confirm each estimate the arithmetic rests on.
+func TestRateLimitThresholdAndRefill(t *testing.T) {
+	// Each request reports 1,000 tokens used.
+	g := newHeldGateway(t, 1000)
+
+	// Three 30,000s reach the provider, leaving 100,000 − 3 × 30,000 = 10,000.
+	var first []<-chan *httptest.ResponseRecorder
+	for range 3 {
+		first = append(first, g.admit(t, chatCosting(30_000)))
+	}
+
+	// A fourth is 20,000 short: (30,000 − 10,000) × 60 / 100,000 = 12 s of
+	// refill. The bucket has been refilling since the first charge, but that
+	// takes a whole second off only after a second, so rounded up it is 12.
+	rec, e := g.refuse(t, chatCosting(30_000))
+	if rec.Header().Get("Retry-After") != "12" || e != (rateLimited{"rate_limited", 12, 100_000, 30_000}) {
+		t.Errorf("Retry-After %q, error %+v; want 12, and rate_limited with 12 s, 100000/min and an estimate of 30000",
+			rec.Header().Get("Retry-After"), e)
+	}
+
+	// As each of the three ends, the 29,000 of its estimate it didn't use come
+	// back: 10,000 + 3 × 29,000 = 97,000, so a fifth 30,000 gets in at once. A
+	// response is delivered once ServeHTTP has returned, by when its charge
+	// has been settled.
+	for range 3 {
+		g.release <- struct{}{}
+	}
+	for _, done := range first {
+		if rec := receive(t, done, "a released response"); rec.Code != http.StatusOK {
+			t.Fatalf("released request: status %d, want 200; body %s", rec.Code, rec.Body)
+		}
+	}
+	fifth := g.admit(t, chatCosting(30_000))
+
+	// A drain takes the rest, 97,000 − 30,000 = 67,000, leaving only the refill
+	// since the first charge: under 1,700 tokens while the test has run under
+	// 1.02 s (100,000/min is 1,667 a second). The fifth and the drain stay
+	// held, so no refund adds to it. A 1,700-token request is refused now, and
+	// gets in 1.1 s later on the refill alone. Had the refunds returned whole
+	// estimates, the drain would have left 3,000, and it would get in now.
+	drain := g.admit(t, chatCosting(67_000))
+	if _, e := g.refuse(t, chatCosting(1_700)); e.EstimatedTokens != 1_700 {
+		t.Errorf("estimated_tokens = %d, want 1700", e.EstimatedTokens)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	refilled := g.admit(t, chatCosting(1_700))
+
+	// Let the rest go and wait for them, so their settlements are over before
+	// the test ends.
+	for range 3 {
+		g.release <- struct{}{}
+	}
+	for _, done := range []<-chan *httptest.ResponseRecorder{fifth, drain, refilled} {
+		receive(t, done, "a released response")
+	}
+}
+
+// TestRateLimitNoOverAdmission: the Week 3 checkpoint's concurrency half. Of
+// 50 requests estimated at 10,000 and sent at once through the gateway, with
+// the real Redis limiter, against a 100,000 bucket, exactly 10 reach the
+// provider and 40 get 429: Redis runs each check whole, so no two requests
+// can spend the same tokens. The admitted ones are held, so none gives tokens
+// back while the rest are checked.
+func TestRateLimitNoOverAdmission(t *testing.T) {
+	g := newHeldGateway(t, 1000)
+
+	// Go note: a receive from a closed channel never blocks, so closing start
+	// lets all 50 goroutines go at once.
+	start := make(chan struct{})
+	responses := make(chan *httptest.ResponseRecorder, 50)
+	for range 50 {
+		req := chatCosting(10_000)
+		go func() {
+			<-start
+			rec := httptest.NewRecorder()
+			g.ServeHTTP(rec, req)
+			responses <- rec
+		}()
+	}
+	close(start)
+
+	// Until the test lets them go, each request either reaches the provider
+	// or gets a response, never both.
+	admitted, refused := 0, 0
+	for admitted+refused < 50 {
+		select {
+		case <-g.arrivals:
+			admitted++
+		case rec := <-responses:
+			if e := refusal(t, rec); e.EstimatedTokens != 10_000 {
+				t.Fatalf("estimated_tokens = %d, want 10000", e.EstimatedTokens)
+			}
+			refused++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out with %d requests at the provider and %d refused, of 50", admitted, refused)
+		}
+	}
+	if admitted != 10 {
+		t.Errorf("%d of 50 simultaneous 10,000-token requests reached the provider and %d got 429; want exactly 10 and 40",
+			admitted, refused)
+	}
+
+	// Let the admitted ones go and wait for them, so their settlements are
+	// over before the test ends.
+	for range admitted {
+		g.release <- struct{}{}
+	}
+	for range admitted {
+		receive(t, responses, "a released response")
 	}
 }
 
