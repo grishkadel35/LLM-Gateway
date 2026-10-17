@@ -25,6 +25,7 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/admin"
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/cache"
 	"github.com/grishkadel/llm-gateway/internal/concurrency"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/health"
@@ -80,14 +81,15 @@ type stores struct {
 }
 
 // router builds the gateway's handler: one reverse proxy per configured
-// provider behind tenant auth and rate limiting, the admin API behind the
-// admin key, /health, /metrics, and a catch-all that rejects unknown
-// prefixes, all behind the request ID and logging middleware. A nil limiter
-// means no rate limiting.
+// provider behind tenant auth, the response cache and rate limiting, the
+// admin API behind the admin key, /health, /metrics, and a catch-all that
+// rejects unknown prefixes, all behind the request ID and logging middleware.
+// A nil limiter means no rate limiting, and a nil cacheStore no response
+// cache.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -114,8 +116,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	for _, p := range providers {
 		name := p.Name
 		meter := func(ctx context.Context, r usage.Result) {
-			// For the rate limiter to settle the request's charge by.
-			middleware.ReportUsage(ctx, r)
+			// For the rate limiter to settle the request's charge by, and
+			// the cache to decide by whether to store the response.
+			middleware.ReportUsage(ctx, name, r)
 			m.Tokens(name, r.Usage)
 			if onUsage != nil {
 				onUsage(ctx, name, r)
@@ -153,6 +156,11 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		// providers try it.
 		if limiter != nil {
 			h = middleware.RateLimit(limiter, logger)(h)
+		}
+		// The cache keys ReadBody's body, so it goes inside ReadBody too. It
+		// wraps the rate limit, so a hit is never charged.
+		if cacheStore != nil {
+			h = middleware.Cache(cacheStore, p.Name, logger)(h)
 		}
 		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(h)
 		metered := usage.RequireMetered(p.Format)(body)
@@ -226,7 +234,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	checker := health.NewChecker(providers, m.ProviderUp, logger)
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), m, checker, logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), m, checker, logger)
 	if err != nil {
 		return err
 	}

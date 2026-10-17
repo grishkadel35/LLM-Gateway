@@ -101,7 +101,9 @@ func rewrite(p provider.Provider) func(*httputil.ProxyRequest) {
 // response back to the client.
 //
 // It logs the response and wraps its body so usage is read as the bytes pass
-// through to the client. Response caching will plug in here too.
+// through to the client. Response caching isn't here but in middleware
+// (middleware.Cache): a hit must skip the rate limit, which runs before the
+// proxy.
 //
 // Go note: returning a non-nil error here makes ReverseProxy call ErrorHandler
 // instead of forwarding the response — that's how you'd reject or rewrite an

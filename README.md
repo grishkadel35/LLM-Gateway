@@ -15,7 +15,7 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-17
 **Stage:** Weeks 1 to 3 of 8 complete, checkpoints closed. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
@@ -26,25 +26,35 @@ provider reported. Week 4 (response caching) is under way.
 
 ### What changed
 
-- **Response cache groundwork (not wired in yet).** Week 4 serves repeated
-  requests from Redis. So far the body owner records whether a request asks
-  for temperature exactly 0, the requests the cache will take without being
-  asked: a top-level `temperature` number for OpenAI and Anthropic, and
-  `generationConfig.temperature` for Gemini, where a numeric string counts
-  too. The body is never changed for this. `config.yaml` has a `cache.ttl` in
-  seconds (default 3,600, at least 1), and the proxy now removes every
-  `X-Gateway-*` request header, such as `X-Gateway-Cache`, before forwarding,
-  so the client's instructions to the gateway never reach a provider.
+- **Response cache, wired in.** A repeated request is now answered from
+  Redis, and neither the rate limit nor the provider sees it. A
+  non-streaming request is eligible when it sets temperature to exactly 0 or
+  sends `X-Gateway-Cache: on`. `off` opts it out, and any other value gets
+  `400 invalid_request`. Every response that reaches the cache carries
+  `X-Gateway-Cache: hit`, `miss` or `bypass`, in place of any value a
+  provider sent. A miss's response is stored before it finishes, and only
+  when it is a complete 2xx from the route's own provider: never a stream, a
+  fallback's answer, or a body over 1 MiB. Redis failing never fails a
+  request: a failed lookup is a miss, logged with a Warn, and isn't stored.
+  A hit leaves no usage row yet; that comes next, at cost 0.
+- **How the cache keys and stores.** The body owner records whether a
+  request asks for temperature exactly 0: a top-level `temperature` number
+  for OpenAI and Anthropic, and `generationConfig.temperature` for Gemini,
+  where a numeric string counts too. The body is never changed for this.
+  `config.yaml` has a `cache.ttl` in seconds (default 3,600, at least 1), and
+  the proxy removes every `X-Gateway-*` request header, such as
+  `X-Gateway-Cache`, before forwarding, so the client's instructions to the
+  gateway never reach a provider.
   `internal/cache` names each request by a SHA-256 over its tenant, provider,
   path, query (without `key=`), Anthropic version headers, and its body as
   canonical JSON: whitespace and key order don't matter, while `1` and `1.0`
   stay different. A request that two different bodies or queries could
-  share, such as one whose body isn't a single valid JSON value, gets no key.
-  Nor does a request body over 4 MiB: building its key costs about six times
-  the body in memory, and the cache runs before the rate limiter.
-  Entries live in Redis, each written with its TTL in one `SET … EX`: a 2xx
-  status, Content-Type, model and body (at most 1 MiB), the body kept byte
-  for byte.
+  share, such as one whose body isn't a single valid JSON value, gets no key
+  and bypasses the cache. So does a request body over 4 MiB: building its key
+  costs about six times the body in memory, and the cache runs before the
+  rate limiter. Entries live in Redis, each written with its TTL in one
+  `SET … EX`: a 2xx status, Content-Type, model and body (at most 1 MiB), the
+  body kept byte for byte.
 - **Week 3 checkpoint closed.** Tests through the real router against a real
   Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
   back in by the refill and by its refunds, and never over-admitted by 50
@@ -818,7 +828,7 @@ details you don't want other projects depending on.
 
 `ModifyResponse` in [internal/proxy/proxy.go](internal/proxy/proxy.go) runs
 after the provider responds and before the response is copied back to the
-client. That is where usage accounting and caching will read token counts.
+client. That is where usage accounting reads token counts.
 Returning an error from it causes `ErrorHandler` to run instead of the response
 being forwarded — that's the mechanism for rejecting a request over budget.
 

@@ -77,7 +77,7 @@ func serveRateLimit(t *testing.T, limiter Limiter, logger *slog.Logger, tn tenan
 		reached = true
 		c = chargeFrom(r.Context())
 		for _, report := range reports {
-			ReportUsage(r.Context(), report)
+			ReportUsage(r.Context(), "openai", report)
 		}
 	})
 	h := usage.ReadBody(provider.FormatOpenAI, 1<<20)(RateLimit(limiter, logger)(next))
@@ -336,7 +336,7 @@ func TestRateLimitSettlesWhenAborted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cancel()
-		ReportUsage(r.Context(), usage.Result{Usage: usage.Usage{Input: 1000}})
+		ReportUsage(r.Context(), "openai", usage.Result{Usage: usage.Usage{Input: 1000}})
 		panic(http.ErrAbortHandler)
 	})
 	h := asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 1<<20)(RateLimit(limiter, slog.New(slog.NewTextHandler(io.Discard, nil)))(next)))
