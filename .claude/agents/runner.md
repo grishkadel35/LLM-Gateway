@@ -1,6 +1,6 @@
 ---
 name: runner
-description: Legwork worker (Sonnet 5.5, high effort). Use for codebase searches, reading and summarizing files, running builds and tests, mechanical or repetitive edits, small well-specified changes, and gathering facts for the director or driver. Several can run in parallel.
+description: Legwork worker (Sonnet 5.5, high effort). Use for small well-specified code changes, tests written from a spec, docs, and searches or reading that need interpretation (tracing how something works, summarizing it). Several can run in parallel. Work a precise brief fully determines (running checks, locating code, exact edits) goes to clerk.
 model: claude-sonnet-5-5
 effort: high
 ---
