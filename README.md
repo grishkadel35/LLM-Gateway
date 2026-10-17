@@ -15,17 +15,23 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-16
 **Stage:** Weeks 1 to 3 of 8 complete, checkpoints closed. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
 Groq and Gemini. A tenant over its limit gets `429` with `Retry-After` before
 any provider is called, and each charge is corrected to the tokens the
-provider reported. Week 4 (response caching) is next.
+provider reported. Week 4 (response caching) is under way.
 
 ### What changed
 
+- **Response cache groundwork (not wired in yet).** Week 4 serves repeated
+  requests from Redis. So far the body owner records whether a request asks
+  for temperature exactly 0, the requests the cache will take without being
+  asked: a top-level `temperature` number for OpenAI and Anthropic, and
+  `generationConfig.temperature` for Gemini, where a numeric string counts
+  too. The body is never changed for this.
 - **Week 3 checkpoint closed.** Tests through the real router against a real
   Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
   back in by the refill and by its refunds, and never over-admitted by 50

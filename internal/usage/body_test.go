@@ -277,6 +277,100 @@ func TestReadBodyEstimatesClientBytes(t *testing.T) {
 	}
 }
 
+// TestReadBodyRecordsZeroTemperature: the response cache serves only requests
+// that ask for temperature 0, so ReadBody records whether the client's body
+// sets exactly that, where its format keeps it. Reading it never rewrites the
+// body.
+func TestReadBodyRecordsZeroTemperature(t *testing.T) {
+	type target struct {
+		format provider.Format
+		path   string
+	}
+	openAI := target{provider.FormatOpenAI, "/v1/chat/completions"}
+	anthropic := target{provider.FormatAnthropic, "/v1/messages"}
+	gemini := target{provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent"}
+
+	type row struct {
+		name, body string
+		want       bool
+	}
+
+	// run serves every row's body to every target, and compares what ReadBody
+	// recorded with the row's want. The provider must get the client's bytes.
+	run := func(t *testing.T, targets []target, rows []row) {
+		for _, f := range targets {
+			for _, tc := range rows {
+				t.Run(string(f.format)+" "+tc.name, func(t *testing.T) {
+					rec, got := serveBody(t, f.format, limit, f.path, tc.body)
+					if !got.reached {
+						t.Fatalf("not forwarded: status %d, body %s", rec.Code, rec.Body)
+					}
+					if got.req.ZeroTemperature != tc.want {
+						t.Errorf("ZeroTemperature of %s = %v, want %v", tc.body, got.req.ZeroTemperature, tc.want)
+					}
+					if got.body != tc.body {
+						t.Errorf("forwarded body = %q, want the client's bytes %q", got.body, tc.body)
+					}
+				})
+			}
+		}
+	}
+
+	// OpenAI and Anthropic keep it at the top level and read it the same way.
+	run(t, []target{openAI, anthropic}, []row{
+		{"0", `{"temperature":0}`, true},
+		{"0.0", `{"temperature":0.0}`, true},
+		{"-0", `{"temperature":-0}`, true},
+		{"0e0", `{"temperature":0e0}`, true},
+		{"0.5", `{"temperature":0.5}`, false},
+		{"1", `{"temperature":1}`, false},
+		{"absent", `{"model":"m"}`, false},
+		// Decoding null into a float64 succeeds and leaves 0.
+		{"null", `{"temperature":null}`, false},
+		{`"0"`, `{"temperature":"0"}`, false},
+		{"false", `{"temperature":false}`, false},
+		// Another format's place for it doesn't count.
+		{"only in generationConfig", `{"generationConfig":{"temperature":0}}`, false},
+	})
+
+	// Gemini keeps it in the generation config, under either spelling of the
+	// config's name, and reads it as proto3 JSON: a number, or a string holding
+	// one.
+	run(t, []target{gemini}, []row{
+		{"generationConfig 0", `{"generationConfig":{"temperature":0}}`, true},
+		{"generation_config 0", `{"generation_config":{"temperature":0}}`, true},
+		{`generationConfig "0"`, `{"generationConfig":{"temperature":"0"}}`, true},
+		{`generation_config "0"`, `{"generation_config":{"temperature":"0"}}`, true},
+		{"0.0", `{"generationConfig":{"temperature":0.0}}`, true},
+		{`"-0"`, `{"generationConfig":{"temperature":"-0"}}`, true},
+		{"0.7", `{"generationConfig":{"temperature":0.7}}`, false},
+		{`"0.7"`, `{"generationConfig":{"temperature":"0.7"}}`, false},
+		{"no temperature", `{"generationConfig":{"maxOutputTokens":10}}`, false},
+		{"no config", `{"contents":[]}`, false},
+		{"top level", `{"temperature":0}`, false},
+		{"null", `{"generationConfig":{"temperature":null}}`, false},
+		{"false", `{"generationConfig":{"temperature":false}}`, false},
+		{`"abc"`, `{"generationConfig":{"temperature":"abc"}}`, false},
+		{`" 0"`, `{"generationConfig":{"temperature":" 0"}}`, false},
+		{"generationConfig is a number", `{"generationConfig":0}`, false},
+		{"generationConfig is an array", `{"generationConfig":[]}`, false},
+		{"generationConfig is a string", `{"generationConfig":"x"}`, false},
+		// generation_config counts only when generationConfig is absent, as in
+		// outputLimit.
+		{"generation_config beside generationConfig",
+			`{"generationConfig":{"maxOutputTokens":10},"generation_config":{"temperature":0}}`, false},
+	})
+
+	// A body that isn't a JSON object has nothing to read, however much it
+	// looks like temperature 0.
+	run(t, []target{openAI, anthropic, gemini}, []row{
+		{"malformed body", `{"temperature":0,"generationConfig":{"temperature":0}`, false},
+		{"empty body", ``, false},
+		{"array body", `[{"temperature":0}]`, false},
+		{"null body", `null`, false},
+	})
+}
+
 // TestWithModel: a fallback's copy of the request asks for the new model and
 // changes nothing else. Every other field is the client's, the copy's
 // Request names the new model, and the original request and its Request are

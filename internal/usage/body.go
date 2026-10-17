@@ -46,6 +46,12 @@ type Request struct {
 	// request that asks for several choices but sets no limit can still be
 	// charged for each of them.
 	Choices int64
+	// ZeroTemperature reports whether the client's body sets temperature to
+	// exactly 0, where its format keeps it. Anything else is false: no
+	// temperature, null, another number, a value the format's API doesn't read
+	// as a number, or a body that isn't a JSON object. The response cache reads
+	// it to decide whether a request is eligible.
+	ZeroTemperature bool
 }
 
 type requestKey struct{}
@@ -67,8 +73,9 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 // nothing is rewritten, the provider receives the client's exact bytes. A body
 // that isn't JSON is forwarded unchanged for the provider to reject.
 //
-// It also records the request's InputEstimate, OutputCap and Choices. They are
-// read from the client's bytes and never change the body.
+// It also records the request's InputEstimate, OutputCap, Choices and
+// ZeroTemperature. They are read from the client's bytes and never change the
+// body.
 //
 // It expects the provider-relative path, after StripPrefix: Gemini keeps the
 // model and the stream flag in the URL.
@@ -91,9 +98,10 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 			req := &Request{Path: r.URL.Path, Received: received}
 			var fields map[string]json.RawMessage
 			decoded := json.Unmarshal(body, &fields) == nil
-			// Before the rewrite below, so it sizes the client's request. fields
-			// is nil unless the body is a JSON object.
+			// Before the rewrite below, so they describe the client's request.
+			// fields is nil unless the body is a JSON object.
 			req.InputEstimate, req.OutputCap, req.Choices = estimate(format, body, fields)
+			req.ZeroTemperature = zeroTemperature(format, fields)
 			if decoded {
 				req.Model, req.Stream = modelAndStream(format, r.URL.Path, fields)
 				if format == provider.FormatOpenAI && req.Stream && includeUsage(fields) {
@@ -122,6 +130,34 @@ func modelAndStream(format provider.Format, path string, fields map[string]json.
 	_ = json.Unmarshal(fields["model"], &model)
 	_ = json.Unmarshal(fields["stream"], &stream)
 	return model, stream
+}
+
+// zeroTemperature reports whether the body sets temperature to exactly 0,
+// where the format keeps it: the top-level field for OpenAI and Anthropic, the
+// generation config's for Gemini. fields is the body decoded into its
+// top-level keys, nil when the body isn't a JSON object. It only reads the
+// body.
+func zeroTemperature(format provider.Format, fields map[string]json.RawMessage) bool {
+	switch format {
+	case provider.FormatOpenAI, provider.FormatAnthropic:
+		// Go note: json.Unmarshal of null into a float64 succeeds and leaves 0,
+		// which would read as a temperature of 0. Into a *float64, null leaves
+		// nil. A string or a bool is an error, as these APIs refuse them too.
+		var temperature *float64
+		return json.Unmarshal(fields["temperature"], &temperature) == nil &&
+			temperature != nil && *temperature == 0
+	case provider.FormatGemini:
+		// proto3 JSON, as positiveProto reads it: a number, or a string holding
+		// one. A bool, "abc" or " 0" is an error, and null leaves num empty,
+		// which ParseFloat refuses.
+		var num json.Number
+		if json.Unmarshal(geminiConfig(fields)["temperature"], &num) != nil {
+			return false
+		}
+		f, err := strconv.ParseFloat(string(num), 64)
+		return err == nil && f == 0
+	}
+	return false
 }
 
 // includeUsage sets stream_options.include_usage to true, keeping any other

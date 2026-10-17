@@ -274,12 +274,7 @@ func outputLimit(format provider.Format, fields map[string]json.RawMessage) (out
 		maxTokens = positive(fields, "max_tokens")
 	case provider.FormatGemini:
 		// Proto JSON accepts either spelling of each name.
-		raw := fields["generationConfig"]
-		if raw == nil {
-			raw = fields["generation_config"]
-		}
-		var config map[string]json.RawMessage
-		_ = json.Unmarshal(raw, &config) // anything but an object leaves it nil
+		config := geminiConfig(fields)
 		maxTokens = positiveProto(config, "maxOutputTokens", "max_output_tokens")
 		choices = positiveProto(config, "candidateCount", "candidate_count")
 	}
@@ -291,6 +286,22 @@ func outputLimit(format provider.Format, fields map[string]json.RawMessage) (out
 		return math.MaxInt64, choices // stop at the largest cap rather than wrap around to a negative one
 	}
 	return maxTokens * choices, choices
+}
+
+// geminiConfig returns the generation config of a Gemini request, the object
+// that holds settings such as maxOutputTokens and temperature, or nil when
+// there is none. Proto JSON accepts either spelling of its name, but
+// generation_config counts only when generationConfig is absent. A
+// generationConfig that isn't an object leaves the config nil. fields is the
+// body decoded into its top-level keys.
+func geminiConfig(fields map[string]json.RawMessage) map[string]json.RawMessage {
+	raw := fields["generationConfig"]
+	if raw == nil {
+		raw = fields["generation_config"]
+	}
+	var config map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &config) // anything but an object leaves it nil
+	return config
 }
 
 // positive returns the first of names that obj holds as a positive integer, or
