@@ -22,6 +22,14 @@ import (
 // one's.
 const keyVersion = "v1"
 
+// MaxRequestBody is the largest request body Key keys: 4 MiB. Decoding and
+// re-encoding a body costs about six times its size in memory (27 MB for a
+// 5 MB image), and the cache runs before the rate limiter, so without a cap a
+// tenant whose tokens are used up could still make the gateway pay that on
+// every request. 4 MiB still holds a text prompt of about a million tokens,
+// or a typical image. (MaxBody, by contrast, caps the response a Store keeps.)
+const MaxRequestBody = 4 << 20
+
 // Key returns the cache key of a request, or ok == false when the request
 // can't be cached. r is the request as the proxy will forward it, after
 // StripPrefix, and body is the body it will forward.
@@ -52,7 +60,14 @@ const keyVersion = "v1"
 //   - The body has invalid UTF-8, or a \u escape of half a surrogate pair.
 //     Decoding replaces either with U+FFFD, so two different bodies would
 //     decode alike.
+//
+// Nor is a request whose body is over MaxRequestBody, whatever it holds. That
+// check comes first, so such a body is never decoded.
 func Key(tenantID, providerName string, r *http.Request, body []byte) (key string, ok bool) {
+	if len(body) > MaxRequestBody {
+		return "", false
+	}
+
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
 		return "", false

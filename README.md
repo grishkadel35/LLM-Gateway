@@ -40,6 +40,8 @@ provider reported. Week 4 (response caching) is under way.
   canonical JSON: whitespace and key order don't matter, while `1` and `1.0`
   stay different. A request that two different bodies or queries could
   share, such as one whose body isn't a single valid JSON value, gets no key.
+  Nor does a request body over 4 MiB: building its key costs about six times
+  the body in memory, and the cache runs before the rate limiter.
   Entries live in Redis, each written with its TTL in one `SET … EX`: a 2xx
   status, Content-Type, model and body (at most 1 MiB), the body kept byte
   for byte.

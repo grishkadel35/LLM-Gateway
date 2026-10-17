@@ -321,6 +321,25 @@ func TestKeyCacheable(t *testing.T) {
 	}
 }
 
+// TestKeyBodySizeLimit: a body of MaxRequestBody bytes gets a key, and one
+// byte more doesn't, however valid it is.
+func TestKeyBodySizeLimit(t *testing.T) {
+	c := base()
+	c.body = jsonOfSize(MaxRequestBody)
+	if _, ok := c.key(); !ok {
+		t.Errorf("a body of MaxRequestBody (%d) bytes is not cacheable, want a key", MaxRequestBody)
+	}
+	c.body = jsonOfSize(MaxRequestBody + 1)
+	if _, ok := c.key(); ok {
+		t.Errorf("a body of MaxRequestBody+1 (%d) bytes got a key, want not cacheable", MaxRequestBody+1)
+	}
+}
+
+// jsonOfSize returns a JSON object of exactly n bytes, for n of at least 8.
+func jsonOfSize(n int) string {
+	return `{"a":"` + strings.Repeat("x", n-8) + `"}`
+}
+
 // chatBody returns a chat request of about size bytes: many short messages,
 // so decoding it builds thousands of small maps and strings.
 func chatBody(size int) []byte {
