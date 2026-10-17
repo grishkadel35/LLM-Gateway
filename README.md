@@ -35,6 +35,11 @@ provider reported. Week 4 (response caching) is under way.
   seconds (default 3,600, at least 1), and the proxy now removes every
   `X-Gateway-*` request header, such as `X-Gateway-Cache`, before forwarding,
   so the client's instructions to the gateway never reach a provider.
+  `internal/cache` names each request by a SHA-256 over its tenant, provider,
+  path, query (without `key=`), Anthropic version headers, and its body as
+  canonical JSON: whitespace and key order don't matter, while `1` and `1.0`
+  stay different. A request that two different bodies or queries could
+  share, such as one whose body isn't a single valid JSON value, gets no key.
 - **Week 3 checkpoint closed.** Tests through the real router against a real
   Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
   back in by the refill and by its refunds, and never over-admitted by 50
