@@ -11,7 +11,8 @@ import (
 	"time"
 )
 
-// Row is one usage_logs row: one request that reached a provider.
+// Row is one usage_logs row: one request that reached a provider, or one the
+// gateway answered from its response cache.
 type Row struct {
 	RequestID string
 	// ProviderRequestID is stored as NULL when "".

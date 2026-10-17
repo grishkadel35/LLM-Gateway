@@ -64,10 +64,23 @@ func timeLeft(ctx context.Context) time.Duration {
 // discard is a logger for tests that don't read the logs.
 var discard = slog.New(slog.NewTextHandler(io.Discard, nil))
 
+// ignoreUsage is a usage callback for tests that don't read Cache's reports.
+func ignoreUsage(context.Context, usage.Result) {}
+
+// providerHeaders is what router has a hit send on a route with a fallback.
+var providerHeaders = http.Header{"X-Gateway-Provider": {"ollama"}, "X-Gateway-Fallback": {"false"}}
+
 // withCache is next behind Cache on route ollama, as router wires it: after
-// RequestID, Auth (as acme) and ReadBody.
+// RequestID, Auth (as acme) and ReadBody. A hit sends no headers of its own,
+// and its usage report is dropped.
 func withCache(store CacheStore, logger *slog.Logger, next http.HandlerFunc) http.Handler {
-	return RequestID(asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 32<<20)(Cache(store, "ollama", logger)(next))))
+	return withCacheReporting(store, ignoreUsage, nil, logger, next)
+}
+
+// withCacheReporting is withCache with a hit's usage reported to onUsage, and
+// hitHeader sent with it.
+func withCacheReporting(store CacheStore, onUsage usage.Callback, hitHeader http.Header, logger *slog.Logger, next http.HandlerFunc) http.Handler {
+	return RequestID(asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 32<<20)(Cache(store, "ollama", onUsage, hitHeader, logger)(next))))
 }
 
 // cacheable is a chat body at temperature 0, which the cache takes.
@@ -306,22 +319,35 @@ func TestCacheNoStoreAfterAbort(t *testing.T) {
 }
 
 // TestCacheHit: a hit replays the entry's status, Content-Type (none if it has
-// none) and body, and nothing after Cache runs.
+// none) and body, with the hit headers Cache was given (none if nil), and
+// nothing after Cache runs. Once the body is written, the hit reports one
+// Result on the request's context: cached and complete, with the entry's
+// status and model and no tokens.
 func TestCacheHit(t *testing.T) {
 	cases := []struct {
 		name            string
 		entry           cache.Entry
+		hitHeader       http.Header
 		wantContentType []string
 	}{
-		{"with a Content-Type", cache.Entry{Status: http.StatusCreated, ContentType: "application/json", Body: []byte(`{"cached":true}`)}, []string{"application/json"}},
-		{"without one", cache.Entry{Status: http.StatusOK, Body: []byte("plain")}, nil},
+		{"with a Content-Type", cache.Entry{Status: http.StatusCreated, ContentType: "application/json", Model: "m-snapshot", Body: []byte(`{"cached":true}`)}, nil, []string{"application/json"}},
+		{"without one", cache.Entry{Status: http.StatusOK, Model: "m-snapshot", Body: []byte("plain")}, nil, nil},
+		{"with hit headers", cache.Entry{Status: http.StatusOK, ContentType: "application/json", Model: "m-snapshot", Body: []byte(`{"cached":true}`)}, providerHeaders, []string{"application/json"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &fakeCache{found: &tc.entry}
 			reached := false
 			rec := httptest.NewRecorder()
-			withCache(store, discard, func(http.ResponseWriter, *http.Request) { reached = true }).ServeHTTP(rec, chatPost(cacheable))
+			var reported []usage.Result
+			var ids []string
+			var written []int // the body bytes the client had at each report
+			onUsage := func(ctx context.Context, r usage.Result) {
+				reported = append(reported, r)
+				ids = append(ids, RequestIDFrom(ctx))
+				written = append(written, rec.Body.Len())
+			}
+			withCacheReporting(store, onUsage, tc.hitHeader, discard, func(http.ResponseWriter, *http.Request) { reached = true }).ServeHTTP(rec, chatPost(cacheable))
 
 			res := rec.Result()
 			if reached || len(store.sets) != 0 {
@@ -333,6 +359,52 @@ func TestCacheHit(t *testing.T) {
 			}
 			if got := res.Header.Values("Content-Type"); !slices.Equal(got, tc.wantContentType) {
 				t.Errorf("Content-Type = %q, want %q", got, tc.wantContentType)
+			}
+			for name := range providerHeaders {
+				if got, want := res.Header.Values(name), tc.hitHeader.Values(name); !slices.Equal(got, want) {
+					t.Errorf("%s = %q, want %q", name, got, want)
+				}
+			}
+
+			want := usage.Result{Usage: usage.Usage{Model: "m-snapshot"}, Status: tc.entry.Status, Complete: true, Cached: true}
+			if len(reported) != 1 || reported[0] != want {
+				t.Fatalf("reported %+v, want one %+v", reported, want)
+			}
+			if id := res.Header.Get(HeaderRequestID); ids[0] != id || written[0] != len(tc.entry.Body) {
+				t.Errorf("reported with request ID %q after %d body bytes, want %q after all %d", ids[0], written[0], id, len(tc.entry.Body))
+			}
+		})
+	}
+}
+
+// TestCacheReportsOnlyHits: a miss, after a lookup that worked or one that
+// failed, and a bypass report nothing to Cache's usage callback, since the
+// proxy's meter reports them, and send none of a hit's headers.
+func TestCacheReportsOnlyHits(t *testing.T) {
+	cases := []struct {
+		name  string
+		store *fakeCache
+		body  string
+		want  string
+	}{
+		{"miss", &fakeCache{}, cacheable, "miss"},
+		{"miss after a failed lookup", &fakeCache{getErr: errors.New("redis: i/o timeout")}, cacheable, "miss"},
+		{"bypass", &fakeCache{}, `{"model":"m","messages":[]}`, "bypass"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var reported []usage.Result
+			onUsage := func(_ context.Context, r usage.Result) { reported = append(reported, r) }
+			rec := httptest.NewRecorder()
+			withCacheReporting(tc.store, onUsage, providerHeaders, discard, answer("ollama", http.StatusOK, completeUsage)).ServeHTTP(rec, chatPost(tc.body))
+
+			if got := rec.Header().Get(HeaderCache); got != tc.want || len(reported) != 0 {
+				t.Errorf("%s %q, reported %+v; want %s, nothing reported", HeaderCache, got, reported, tc.want)
+			}
+			for name := range providerHeaders {
+				if got := rec.Header().Values(name); got != nil {
+					t.Errorf("%s = %q, want none", name, got)
+				}
 			}
 		})
 	}
@@ -382,7 +454,7 @@ func TestCacheSkipsALargeBody(t *testing.T) {
 				})
 			}
 			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-			h := asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 32<<20)(counting(Cache(&fakeCache{}, "ollama", discard)(next))))
+			h := asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 32<<20)(counting(Cache(&fakeCache{}, "ollama", ignoreUsage, nil, discard)(next))))
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, chatPost(tc.body))
 
@@ -401,7 +473,7 @@ func TestCacheWithoutTenant(t *testing.T) {
 	store := &fakeCache{}
 	reached := false
 	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
-	h := usage.ReadBody(provider.FormatOpenAI, 1<<20)(Cache(store, "ollama", slog.New(slog.NewJSONHandler(&logs, nil)))(next))
+	h := usage.ReadBody(provider.FormatOpenAI, 1<<20)(Cache(store, "ollama", ignoreUsage, nil, slog.New(slog.NewJSONHandler(&logs, nil)))(next))
 	h.ServeHTTP(httptest.NewRecorder(), chatPost(cacheable))
 
 	if !reached || len(store.gets) != 0 {

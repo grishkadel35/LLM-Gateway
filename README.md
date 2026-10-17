@@ -36,7 +36,10 @@ provider reported. Week 4 (response caching) is under way.
   when it is a complete 2xx from the route's own provider: never a stream, a
   fallback's answer, or a body over 1 MiB. Redis failing never fails a
   request: a failed lookup is a miss, logged with a Warn, and isn't stored.
-  A hit leaves no usage row yet; that comes next, at cost 0.
+  A hit leaves a usage row of its own, marked `cached`, with no tokens and
+  cost 0. On a route with a fallback, a hit carries `X-Gateway-Provider`
+  (the route's provider) and `X-Gateway-Fallback: false`, like every other
+  response there.
 - **How the cache keys and stores.** The body owner records whether a
   request asks for temperature exactly 0: a top-level `temperature` number
   for OpenAI and Anthropic, and `generationConfig.temperature` for Gemini,

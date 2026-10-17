@@ -63,7 +63,8 @@ func main() {
 }
 
 // usageFunc receives each provider response's usage, with the name of the
-// provider that served it.
+// provider that served it, and each cache hit's, with the name of its route's
+// provider.
 type usageFunc func(ctx context.Context, provider string, r usage.Result)
 
 // tenantStore is what the routes need from storage: key lookup for tenant
@@ -111,8 +112,10 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	tenantAuth := middleware.Auth(store, logger)
 
 	// Every provider's proxy first, so a route can hand a failed request to
-	// its fallback's.
+	// its fallback's. Each provider's meter is kept too, for its route's
+	// cache to report hits to.
 	proxies := make(map[string]http.Handler, len(providers))
+	meters := make(map[string]usage.Callback, len(providers))
 	for _, p := range providers {
 		name := p.Name
 		meter := func(ctx context.Context, r usage.Result) {
@@ -131,6 +134,7 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			rp.Transport = concurrency.Limit(rp.Transport, p.MaxConcurrency, p.QueueTimeout, m.ConcurrencyWait(p.Name))
 		}
 		proxies[p.Name] = rp
+		meters[p.Name] = meter
 	}
 
 	for _, p := range providers {
@@ -158,9 +162,18 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			h = middleware.RateLimit(limiter, logger)(h)
 		}
 		// The cache keys ReadBody's body, so it goes inside ReadBody too. It
-		// wraps the rate limit, so a hit is never charged.
+		// wraps the rate limit, so a hit is never charged. A hit reports to
+		// the route's meter for its usage row, and for nothing else:
+		// ReportUsage finds no charge or pending miss on its request, and it
+		// has no tokens to count.
 		if cacheStore != nil {
-			h = middleware.Cache(cacheStore, p.Name, logger)(h)
+			// A hit never reaches Fallback, so on a route with one it is given
+			// the headers Fallback puts on every other response.
+			var hitHeader http.Header
+			if cfg.Providers[p.Name].Fallback.Enabled {
+				hitHeader = http.Header{proxy.HeaderProvider: {p.Name}, proxy.HeaderFallback: {"false"}}
+			}
+			h = middleware.Cache(cacheStore, p.Name, meters[p.Name], hitHeader, logger)(h)
 		}
 		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(h)
 		metered := usage.RequireMetered(p.Format)(body)
@@ -399,9 +412,10 @@ func redisOptions(redisURL string) (*redis.Options, error) {
 	return opts, nil
 }
 
-// recordUsage returns a usageFunc that turns each provider response into a
-// usage_logs row, priced, and queues it on w. It never blocks: w drops rather
-// than wait. A provider marked free in providers costs 0 per row.
+// recordUsage returns a usageFunc that turns each provider response, and each
+// cache hit, into a usage_logs row, priced, and queues it on w. It never
+// blocks: w drops rather than wait. A cache hit costs 0, and so does every row
+// of a provider marked free in providers.
 func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, logger *slog.Logger) usageFunc {
 	return func(ctx context.Context, provider string, r usage.Result) {
 		t, key, ok := middleware.TenantFrom(ctx)
@@ -425,17 +439,21 @@ func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, lo
 			Endpoint:          req.Path,
 			Status:            r.Status,
 			Usage:             r.Usage,
+			Cached:            r.Cached,
 			Streamed:          r.Streamed,
 			LatencyMS:         time.Since(req.Received).Milliseconds(),
 			CreatedAt:         req.Received,
 		}
 
-		// Cost is recorded only when it is known. For a free provider it
-		// always is: 0, even for a response cut short. Otherwise a response
-		// cut short (or too large to parse) may be missing its usage, so its
-		// cost is NULL, never a guess and never 0. A complete response with no
-		// tokens, such as an upstream error, really did cost nothing.
+		// Cost is recorded only when it is known. For a cache hit it always
+		// is: 0, whatever its usage says, since no provider saw it. So it is
+		// for a free provider: 0, even for a response cut short. Otherwise a
+		// response cut short (or too large to parse) may be missing its usage,
+		// so its cost is NULL, never a guess and never 0. A complete response
+		// with no tokens, such as an upstream error, really did cost nothing.
 		switch {
+		case r.Cached:
+			row.CostMicros = new(int64)
 		case providers[provider].Free:
 			row.CostMicros = new(int64)
 		case !r.Complete:

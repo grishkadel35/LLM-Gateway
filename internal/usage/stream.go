@@ -29,11 +29,14 @@ type Result struct {
 	// ProviderRequestID is the provider's own ID for the request, which its
 	// support asks for. "" if it sent none.
 	ProviderRequestID string
+	// Cached reports that the gateway answered from its response cache, so
+	// no provider saw the request.
+	Cached bool
 }
 
 // Callback receives a response's Result. ctx is the request's context, which
-// carries the tenant and request ID. It runs on the proxy's goroutine, so it
-// must not block.
+// carries the tenant and request ID. It runs on the goroutine serving the
+// request, so it must not block.
 type Callback func(ctx context.Context, r Result)
 
 // maxBufferedBody bounds how much of a non-streaming body is kept for parsing

@@ -1875,7 +1875,8 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 // response cut short, or too large to parse, has unknown usage, so its cost
 // is NULL, not 0; a complete response with no tokens (an upstream error)
 // really did cost nothing. A free provider's rows cost 0, complete or not,
-// and every row keeps its tokens.
+// and so does a cache hit, whatever its usage says. Only a hit's row is
+// marked cached, and every row keeps its tokens.
 func TestRecordUsageCost(t *testing.T) {
 	gpt4o := usage.Usage{Model: "gpt-4o", Input: 15, CachedInput: 5, Output: 10}
 	cases := []struct {
@@ -1892,6 +1893,9 @@ func TestRecordUsageCost(t *testing.T) {
 		{"cut off with partial usage", "anthropic", usage.Result{Usage: usage.Usage{Model: "claude-sonnet-4", Input: 15}, Status: 200}, true, 0},
 		{"free, complete", "ollama", usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15, Output: 10}, Status: 200, Complete: true}, false, 0},
 		{"free, cut off", "ollama", usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15}, Status: 200}, false, 0},
+		{"cached, priced", "openai", usage.Result{Usage: gpt4o, Status: 200, Complete: true, Cached: true}, false, 0},
+		{"cached, unpriced", "groq", usage.Result{Usage: usage.Usage{Model: "llama-3.3-70b-versatile", Input: 10}, Status: 200, Complete: true, Cached: true}, false, 0},
+		{"cached, cut off", "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 15}, Status: 200, Cached: true}, false, 0},
 	}
 
 	conn := dbtest.New(t)
@@ -1929,11 +1933,12 @@ func TestRecordUsageCost(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var cost sql.NullInt64
 			var input int64
-			if err := conn.QueryRow(`SELECT cost_micros, input_tokens FROM usage_logs WHERE request_id = $1`, ids[i]).Scan(&cost, &input); err != nil {
+			var cached bool
+			if err := conn.QueryRow(`SELECT cost_micros, input_tokens, cached FROM usage_logs WHERE request_id = $1`, ids[i]).Scan(&cost, &input, &cached); err != nil {
 				t.Fatal(err)
 			}
-			if input != tc.result.Usage.Input {
-				t.Errorf("input_tokens = %d, want %d", input, tc.result.Usage.Input)
+			if input != tc.result.Usage.Input || cached != tc.result.Cached {
+				t.Errorf("input_tokens = %d, cached = %v; want %d, %v", input, cached, tc.result.Usage.Input, tc.result.Cached)
 			}
 			if tc.wantNull && cost.Valid {
 				t.Errorf("cost = %d, want NULL", cost.Int64)

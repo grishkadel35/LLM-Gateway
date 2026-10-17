@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -60,8 +61,11 @@ func pendingFrom(ctx context.Context) *pending {
 // a 400 invalid_request before anything else happens. An eligible request is
 // looked up under its cache.Key, unless Key refuses it (a body over
 // cache.MaxRequestBody, for one):
-//   - A hit replays the stored response. Nothing after Cache runs, so neither
-//     the rate limit nor the provider sees the request.
+//   - A hit replays the stored response, with hitHeader's headers too (none
+//     when it is nil), and then reports it to onUsage, the route's usage
+//     callback, as a Result with Cached set and no tokens. Nothing after
+//     Cache runs, so neither the rate limit nor the provider sees the
+//     request.
 //   - A miss goes on, and its response is copied as it goes to the client.
 //     Once the handler returns, the copy is stored if the usage reported for
 //     the request (ReportUsage) says it is complete, not streamed, and from
@@ -78,7 +82,7 @@ func pendingFrom(ctx context.Context) *pending {
 //
 // It needs the tenant from Auth and the body from ReadBody, so it runs after
 // both. It goes outside RateLimit, so a hit is never charged.
-func Cache(store CacheStore, provider string, logger *slog.Logger) func(http.Handler) http.Handler {
+func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader http.Header, logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			mode, ok := cacheMode(r.Header)
@@ -122,12 +126,17 @@ func Cache(store CacheStore, provider string, logger *slog.Logger) func(http.Han
 				next.ServeHTTP(newCacheWriter(w, "miss", false), r)
 				return
 			case found:
+				// A copy, so no two responses share hitHeader's values.
+				maps.Copy(w.Header(), hitHeader.Clone())
 				if e.ContentType != "" {
 					w.Header().Set("Content-Type", e.ContentType)
 				}
 				w.Header().Set(HeaderCache, "hit")
 				w.WriteHeader(e.Status)
 				_, _ = w.Write(e.Body)
+				// Once the body is written, so the row's latency covers it.
+				// Complete, since its usage is known: none.
+				onUsage(ctx, usage.Result{Usage: usage.Usage{Model: e.Model}, Status: e.Status, Complete: true, Cached: true})
 				return
 			}
 

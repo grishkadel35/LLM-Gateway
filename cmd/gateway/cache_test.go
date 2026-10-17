@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,9 +24,14 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/cache"
 	"github.com/grishkadel/llm-gateway/internal/config"
+	"github.com/grishkadel/llm-gateway/internal/db"
+	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
+	"github.com/grishkadel/llm-gateway/internal/pricing"
+	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // fakeCache stands in for the Redis cache, so routing tests need no Redis. It
@@ -593,5 +599,238 @@ func TestCacheStreamStillFlushes(t *testing.T) {
 	receive(t, done, "the gateway to finish the request")
 	if gets, sets := store.recorded(); gets != 0 || len(sets) != 0 {
 		t.Errorf("%d Get calls, Set calls %+v; want none of either", gets, sets)
+	}
+}
+
+// TestCacheHitUsageRow: of the same temperature-0 request twice, against
+// Postgres, the miss leaves its usual row, priced and not cached, and the hit
+// a row of its own: its own request ID and key, the route's provider, the
+// stored model and status, no tokens, cost 0, cached, not streamed, and no
+// provider request ID. The hit adds nothing to gateway_tokens_total, and the
+// usage report counts both requests at the miss's cost.
+func TestCacheHitUsageRow(t *testing.T) {
+	conn := dbtest.New(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
+	tn, key, err := store.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := usage.NewWriter(conn, discardLogger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, discardLogger), nil, &fakeCache{}, metrics.New(), nil, discardLogger)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// send sends the request as acme, and returns the X-Request-ID it got.
+	send := func(want string) string {
+		t.Helper()
+		req := openaiChat(zeroTemperature)
+		req.Header.Set("Authorization", "Bearer "+key.Plaintext)
+		rec := serve(r, req)
+		if rec.Code != http.StatusOK || verdict(rec) != want {
+			t.Fatalf("status %d, X-Gateway-Cache %q; want 200, %s; body %s", rec.Code, verdict(rec), want, rec.Body)
+		}
+		return rec.Header().Get("X-Request-ID")
+	}
+	// tokens returns the gateway_tokens_total samples on /metrics.
+	tokens := func() []string {
+		var samples []string
+		for line := range strings.Lines(scrapeMetrics(t, r)) {
+			if strings.HasPrefix(line, "gateway_tokens_total{") {
+				samples = append(samples, line)
+			}
+		}
+		return samples
+	}
+
+	missID := send("miss")
+	before := tokens()
+	hitID := send("hit")
+	if after := tokens(); len(before) == 0 || !slices.Equal(after, before) {
+		t.Errorf("gateway_tokens_total went from %q to %q across the hit; want the miss's tokens, unchanged", before, after)
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var n int
+	if err := conn.QueryRow(`SELECT count(*) FROM usage_logs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 || hitID == missID {
+		t.Fatalf("usage_logs has %d rows, for request IDs %s and %s; want 2, under two IDs", n, missID, hitID)
+	}
+
+	// row is the usage_logs columns the test reads.
+	type row struct {
+		TenantID, Provider, Model, Endpoint    string
+		KeyID                                  int64
+		Status                                 int
+		Input, CachedInput, CacheWrite, Output int64
+		Cost                                   sql.NullInt64
+		Cached, Streamed                       bool
+		ProviderRequestID                      sql.NullString
+	}
+	read := func(id string) row {
+		t.Helper()
+		var got row
+		err := conn.QueryRow(`
+			SELECT tenant_id, provider, model, endpoint, api_key_id, status, input_tokens, cached_input_tokens,
+			       cache_write_tokens, output_tokens, cost_micros, cached, streamed, provider_request_id
+			FROM usage_logs WHERE request_id = $1`, id,
+		).Scan(&got.TenantID, &got.Provider, &got.Model, &got.Endpoint, &got.KeyID, &got.Status, &got.Input,
+			&got.CachedInput, &got.CacheWrite, &got.Output, &got.Cost, &got.Cached, &got.Streamed, &got.ProviderRequestID)
+		if err != nil {
+			t.Fatalf("no row with request ID %s: %v", id, err)
+		}
+		return got
+	}
+
+	// The mock's usage: 15 input tokens, 5 cached and 10 output.
+	wantCost, ok := pricing.Cost("openai", usage.Usage{Model: "gpt-4o", Input: 15, CachedInput: 5, Output: 10}, "", time.Now())
+	if !ok || wantCost <= 0 {
+		t.Fatal("openai/gpt-4o should be priced")
+	}
+	want := row{TenantID: tn.ID, Provider: "openai", Model: "gpt-4o", Endpoint: "/v1/chat/completions", KeyID: key.ID,
+		Status: http.StatusOK, Input: 15, CachedInput: 5, Output: 10, Cost: sql.NullInt64{Int64: wantCost, Valid: true}}
+	if got := read(missID); got != want {
+		t.Errorf("the miss's row = %+v, want %+v", got, want)
+	}
+	// The hit's is the same, but for no tokens, cost 0 and cached.
+	want.Input, want.CachedInput, want.Output, want.Cost, want.Cached = 0, 0, 0, sql.NullInt64{Valid: true}, true
+	if got := read(hitID); got != want {
+		t.Errorf("the hit's row = %+v, want %+v", got, want)
+	}
+
+	// The usage report counts both requests, at the miss's cost.
+	req := httptest.NewRequest(http.MethodGet, "/admin/tenants/"+tn.ID+"/usage", nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminKey)
+	rec := serve(r, req)
+	var report struct {
+		Total usage.Totals `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &report); rec.Code != http.StatusOK || err != nil {
+		t.Fatalf("usage report: status %d, body %s", rec.Code, rec.Body)
+	}
+	if report.Total.Requests != 2 || report.Total.CostMicros != wantCost || report.Total.UnpricedRequests != 0 {
+		t.Errorf("report total = %+v, want 2 requests, %d micro-$, none unpriced", report.Total, wantCost)
+	}
+}
+
+// fallbackConfig is a config file with two providers, at the URLs it is
+// formatted with: ollama, which falls back to groq for qwen3.5:9b, and groq.
+const fallbackConfig = `
+providers:
+  ollama:
+    url: %s
+    auth: none
+    format: openai
+    fallback:
+      enabled: true
+      provider: groq
+      models:
+        "qwen3.5:9b": qwen/qwen3.8-27b
+  groq:
+    url: %s/openai
+    key: ${TEST_GROQ_KEY}
+    auth: bearer
+    format: openai
+`
+
+// fallbackRouter builds the gateway from fallbackConfig over fakeStore, with
+// responses cached in store.
+func fallbackRouter(t *testing.T, ollama, groq string, store middleware.CacheStore) http.Handler {
+	t.Helper()
+	t.Setenv("TEST_GROQ_KEY", "sk-groq")
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(fallbackConfig, ollama, groq)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load() returned error: %v", err)
+	}
+	r, err := router(cfg, fakeStore{}, testAdminKey, nil, nil, store, metrics.New(), nil, discardLogger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	return r
+}
+
+// qwenAtZero is a chat body at temperature 0 for the model ollama's fallback
+// maps.
+const qwenAtZero = `{"model":"qwen3.5:9b","temperature":0,"messages":[{"role":"user","content":"ping"}]}`
+
+// TestCacheNeverStoresAFallbacksAnswer: on a route with a fallback, when the
+// route's provider fails and the fallback answers, the client gets the
+// fallback's answer, but nothing is stored: the key names the route's
+// provider. So the same request is a miss again, and goes to the route's
+// provider again, as gateway_fallbacks_total shows.
+func TestCacheNeverStoresAFallbacksAnswer(t *testing.T) {
+	failing := newFakeOllama(t, ollamaKnobs{status: http.StatusInternalServerError})
+	cases := []struct{ name, ollama, reason string }{
+		{"ollama answers 500", failing.server.URL, "server_error"},
+		// Port 1 on loopback: nothing listens there.
+		{"ollama is unreachable", "http://127.0.0.1:1", "unreachable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			groq, groqCalls := countingUpstream(t, mockprovider.Handler().ServeHTTP)
+			store := &fakeCache{}
+			r := fallbackRouter(t, tc.ollama, groq, store)
+
+			for range 2 {
+				rec := serve(r, tenantPost("/ollama/v1/chat/completions", qwenAtZero))
+				if rec.Code != http.StatusOK || verdict(rec) != "miss" || rec.Header().Get("X-Gateway-Provider") != "groq" ||
+					rec.Header().Get("X-Gateway-Fallback") != "true" {
+					t.Errorf("status %d, X-Gateway-Cache %q, X-Gateway-Provider %q, X-Gateway-Fallback %q; want 200, miss, groq, true",
+						rec.Code, verdict(rec), rec.Header().Get("X-Gateway-Provider"), rec.Header().Get("X-Gateway-Fallback"))
+				}
+			}
+			if _, sets := store.recorded(); len(sets) != 0 {
+				t.Errorf("Set calls = %+v, want none", sets)
+			}
+			fallbacks := fmt.Sprintf(`gateway_fallbacks_total{from="ollama",reason=%q,to="groq"} 2`, tc.reason)
+			if !strings.Contains(scrapeMetrics(t, r), fallbacks+"\n") || groqCalls.Load() != 2 {
+				t.Errorf("groq got %d requests; want 2, each after ollama failed, with /metrics showing %s", groqCalls.Load(), fallbacks)
+			}
+		})
+	}
+}
+
+// TestCacheHitProviderHeaders: on a route with a fallback, an answer from the
+// route's own provider is stored, and the hit on it carries the headers every
+// other response on the route does, naming the route's provider. A hit on a
+// route without a fallback carries neither, like every other response there.
+// Each provider sees only its route's miss.
+func TestCacheHitProviderHeaders(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{})
+	groq, groqCalls := countingUpstream(t, mockprovider.Handler().ServeHTTP)
+	r := fallbackRouter(t, ollama.server.URL, groq, &fakeCache{})
+
+	cases := []struct {
+		route, body        string
+		provider, fallback []string // the two headers' values: nil for none
+	}{
+		{"ollama", qwenAtZero, []string{"ollama"}, []string{"false"}},
+		{"groq", zeroTemperature, nil, nil},
+	}
+	for _, tc := range cases {
+		for _, want := range []string{"miss", "hit"} {
+			rec := serve(r, tenantPost("/"+tc.route+"/v1/chat/completions", tc.body))
+			h := rec.Result().Header
+			if rec.Code != http.StatusOK || verdict(rec) != want || !slices.Equal(h.Values("X-Gateway-Provider"), tc.provider) ||
+				!slices.Equal(h.Values("X-Gateway-Fallback"), tc.fallback) {
+				t.Errorf("%s: status %d, X-Gateway-Cache %q, X-Gateway-Provider %q, X-Gateway-Fallback %q; want 200, %s, %q, %q",
+					tc.route, rec.Code, verdict(rec), h.Values("X-Gateway-Provider"), h.Values("X-Gateway-Fallback"), want, tc.provider, tc.fallback)
+			}
+		}
+	}
+	if n, m := len(ollama.arrivals), groqCalls.Load(); n != 1 || m != 1 {
+		t.Errorf("ollama got %d requests and groq %d, want 1 each", n, m)
 	}
 }
