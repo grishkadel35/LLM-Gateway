@@ -20,6 +20,14 @@ port: 8080
 # limiting yet, so binding wider is a deliberate choice, not a default.
 host: 127.0.0.1
 
+# How long, in seconds, the gateway serves a stored response before it asks
+# the provider again. The default is 3600 and the minimum is 1.
+#
+# A response is stored for a non-streaming request with temperature 0 or the
+# header X-Gateway-Cache: on. X-Gateway-Cache: off opts a request out.
+cache:
+  ttl: 3600
+
 # Each provider is reachable at /<name>/... — point your client's base URL at
 # the prefix and it speaks that provider's native API, unchanged. Adding a
 # provider is config only; no code changes.

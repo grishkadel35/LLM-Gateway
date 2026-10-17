@@ -43,6 +43,10 @@ const (
 	// DefaultQueueTimeoutSeconds bounds a request's wait for a concurrency
 	// slot, on a provider with max_concurrency and no queue_timeout.
 	DefaultQueueTimeoutSeconds = 30
+	// DefaultCacheTTLSeconds is an hour: long enough that a repeated request
+	// hits, short enough that a stale answer, such as one from a model alias
+	// that has since moved to a new snapshot, soon ages out.
+	DefaultCacheTTLSeconds = 3600
 )
 
 // validName is what a provider name may contain. The name becomes a URL path
@@ -73,6 +77,8 @@ type Config struct {
 	// ones get 413. The gateway buffers each body to meter and rewrite it.
 	MaxRequestBytes int64                     `yaml:"max_request_bytes"`
 	Providers       map[string]ProviderConfig `yaml:"providers"`
+	// Cache holds the response cache's settings.
+	Cache CacheConfig `yaml:"cache"`
 }
 
 // ProviderConfig is one entry under `providers:` in the YAML file.
@@ -131,6 +137,20 @@ func (pc ProviderConfig) Timeout() time.Duration {
 	return time.Duration(pc.TimeoutSeconds) * time.Second
 }
 
+// CacheConfig is the `cache:` block in the YAML file.
+type CacheConfig struct {
+	// TTLSeconds is how long the gateway serves a stored response before it asks
+	// the provider again. Like Port it is a plain int, so unlike a provider's
+	// timeout it takes no environment reference.
+	TTLSeconds int `yaml:"ttl"`
+}
+
+// TTL returns the configured TTL as a time.Duration, as Timeout does for a
+// provider.
+func (c CacheConfig) TTL() time.Duration {
+	return time.Duration(c.TTLSeconds) * time.Second
+}
+
 // Default returns a Config with the built-in defaults and no providers.
 func Default() *Config {
 	return &Config{
@@ -138,6 +158,7 @@ func Default() *Config {
 		Host:            DefaultHost,
 		MaxRequestBytes: DefaultMaxRequestBytes,
 		Providers:       map[string]ProviderConfig{},
+		Cache:           CacheConfig{TTLSeconds: DefaultCacheTTLSeconds},
 	}
 }
 
@@ -317,6 +338,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxRequestBytes <= 0 {
 		return fmt.Errorf("max_request_bytes must be greater than 0, got %d", c.MaxRequestBytes)
+	}
+	if c.Cache.TTLSeconds < 1 {
+		return fmt.Errorf("cache.ttl must be at least 1 second, got %d", c.Cache.TTLSeconds)
 	}
 	if len(c.Providers) == 0 {
 		return fmt.Errorf("at least one provider must be configured")

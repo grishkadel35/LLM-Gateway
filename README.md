@@ -31,7 +31,10 @@ provider reported. Week 4 (response caching) is under way.
   for temperature exactly 0, the requests the cache will take without being
   asked: a top-level `temperature` number for OpenAI and Anthropic, and
   `generationConfig.temperature` for Gemini, where a numeric string counts
-  too. The body is never changed for this.
+  too. The body is never changed for this. `config.yaml` has a `cache.ttl` in
+  seconds (default 3,600, at least 1), and the proxy now removes every
+  `X-Gateway-*` request header, such as `X-Gateway-Cache`, before forwarding,
+  so the client's instructions to the gateway never reach a provider.
 - **Week 3 checkpoint closed.** Tests through the real router against a real
   Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
   back in by the refill and by its refunds, and never over-admitted by 50

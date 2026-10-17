@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"strings"
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/apierror"
@@ -53,6 +54,23 @@ func rewrite(p provider.Provider) func(*httputil.ProxyRequest) {
 		// the Host header the upstream's. Providers route and TLS-verify on
 		// that, so it must not be "localhost:8080".
 		pr.SetURL(p.URL)
+
+		// X-Gateway-* request headers are the client's instructions to the
+		// gateway (X-Gateway-Cache today), not part of any provider's API, so
+		// none of them goes out, cache or no cache. This runs before Apply so a
+		// static header the provider's own config sets still goes out.
+		//
+		// The compare is on each raw map key, ignoring case: a header map can
+		// hold a key that isn't in canonical form, and Header.Del only removes
+		// the canonical spelling.
+		//
+		// Go note: deleting entries while ranging over a map is safe in Go,
+		// unlike changing a Python dict while iterating it.
+		for name := range pr.Out.Header {
+			if strings.HasPrefix(strings.ToLower(name), "x-gateway-") {
+				delete(pr.Out.Header, name)
+			}
+		}
 
 		// Swap whatever credential the client sent for this provider's own key,
 		// in the header shape this provider expects. Apply strips every known

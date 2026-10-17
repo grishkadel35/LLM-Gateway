@@ -191,6 +191,53 @@ func TestProxyDoesNotForwardClientIdentity(t *testing.T) {
 	}
 }
 
+// TestProxyDoesNotForwardGatewayHeaders checks no X-Gateway-* header reaches
+// the provider, in any casing, while every other client header does. They are
+// the client's instructions to the gateway (X-Gateway-Cache today), not part
+// of a provider's API.
+func TestProxyDoesNotForwardGatewayHeaders(t *testing.T) {
+	var got http.Header
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	p := newTestProxy(t, upstream.URL)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	req.Header.Set("X-Gateway-Cache", "on")
+	// Go note: Header.Set canonicalizes the key, so this assigns into the map
+	// directly to get a key that isn't in canonical form.
+	req.Header["x-gateway-cache"] = []string{"off"}
+	req.Header.Set("X-Gateway-Provider", "openai")
+	req.Header.Set("X-Gateway-Anything", "1")
+	other := map[string]string{
+		"X-Custom":       "kept",
+		"Anthropic-Beta": "tools-2024-04-04",
+		"Content-Type":   "application/json",
+	}
+	for name, value := range other {
+		req.Header.Set(name, value)
+	}
+
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	// The upstream's server canonicalizes whatever arrives, so this catches a
+	// leaked header whatever key it was sent under.
+	for name, values := range got {
+		if strings.HasPrefix(strings.ToLower(name), "x-gateway-") {
+			t.Errorf("upstream received %s: %q, want no X-Gateway-* header", name, values)
+		}
+	}
+	for name, want := range other {
+		if v := got.Get(name); v != want {
+			t.Errorf("%s = %q, want %q", name, v, want)
+		}
+	}
+}
+
 // TestProxyIgnoresConnectionHeaderNamingCredentials guards against a client
 // listing the gateway's own headers as hop-by-hop. "Connection: X-Api-Key"
 // tells a proxy to drop X-Api-Key; if that happened after the gateway set the

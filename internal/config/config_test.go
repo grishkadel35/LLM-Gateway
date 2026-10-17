@@ -339,6 +339,45 @@ func TestLoadFallback(t *testing.T) {
 	}
 }
 
+// TestLoadCacheTTL: cache.ttl is in seconds, defaults to an hour, and must be
+// at least 1. A TTL below that, or an unknown key under cache:, fails Load
+// with a message naming the field.
+func TestLoadCacheTTL(t *testing.T) {
+	cases := []struct {
+		name    string
+		cache   string        // the cache: block as written; "" for none
+		want    time.Duration // for a config that loads
+		wantErr string        // a substring of Load's error, for one that fails
+	}{
+		{name: "no cache block", want: time.Hour},
+		{name: "60 seconds", cache: "cache:\n  ttl: 60\n", want: 60 * time.Second},
+		{name: "the minimum", cache: "cache:\n  ttl: 1\n", want: time.Second},
+		{name: "zero", cache: "cache:\n  ttl: 0\n", wantErr: "cache.ttl must be at least 1 second, got 0"},
+		{name: "negative", cache: "cache:\n  ttl: -5\n", wantErr: "cache.ttl must be at least 1 second, got -5"},
+		// A typo is an error, not the default applied silently.
+		{name: "misspelled key", cache: "cache:\n  tll: 60\n", wantErr: "field tll not found in type config.CacheConfig"},
+	}
+
+	setTestKey(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, tc.cache+minimalProvider))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() = %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if got := cfg.Cache.TTL(); got != tc.want {
+				t.Errorf("Cache.TTL() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
 // configured with auth none and no key line at all.
 func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
@@ -390,6 +429,11 @@ func TestLoadOnRepoConfig(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("ProviderNames()[%d] = %q, want %q", i, got[i], want[i])
 		}
+	}
+
+	// The committed cache block spells out the default.
+	if got := cfg.Cache.TTL(); got != time.Hour {
+		t.Errorf("cache ttl = %v, want 1h", got)
 	}
 
 	// Groq's base path is what makes it a useful test case; don't let it be
