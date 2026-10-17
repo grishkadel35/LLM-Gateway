@@ -40,6 +40,9 @@ provider reported. Week 4 (response caching) is under way.
   canonical JSON: whitespace and key order don't matter, while `1` and `1.0`
   stay different. A request that two different bodies or queries could
   share, such as one whose body isn't a single valid JSON value, gets no key.
+  Entries live in Redis, each written with its TTL in one `SET … EX`: a 2xx
+  status, Content-Type, model and body (at most 1 MiB), the body kept byte
+  for byte.
 - **Week 3 checkpoint closed.** Tests through the real router against a real
   Redis show a 100,000 tokens/min tenant refused exactly at its threshold, let
   back in by the refill and by its refunds, and never over-admitted by 50
