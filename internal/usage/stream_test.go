@@ -136,6 +136,38 @@ func TestMeterAnthropicRequestID(t *testing.T) {
 	}
 }
 
+// TestMeterGeminiRequestID: Gemini sends no request ID header, so its ID is the
+// responseId in the body, streamed or not. A header, if one did arrive, wins.
+func TestMeterGeminiRequestID(t *testing.T) {
+	chunk := `{"candidates":[{"content":{"parts":[{"text":"w"}]}}],"usageMetadata":{"promptTokenCount":3},` +
+		`"modelVersion":"gemini-3.8-flash","responseId":"` + geminiResponseID + `"}`
+	cases := []struct {
+		name, contentType, body, header string
+		streamed                        bool
+		want                            string
+	}{
+		{"json", "application/json", chunk, "", false, geminiResponseID},
+		{"sse", "text/event-stream", "data: " + chunk + "\n\ndata: " + chunk + "\n\n", "", true, geminiResponseID},
+		{"header wins", "application/json", chunk, "req_header_1", false, "req_header_1"},
+	}
+	for _, tc := range cases {
+		resp := response(http.StatusOK, tc.contentType, strings.NewReader(tc.body))
+		resp.Header.Del("X-Request-Id")
+		if tc.header != "" {
+			resp.Header.Set("X-Request-Id", tc.header)
+		}
+		calls := meter(resp, provider.FormatGemini)
+		_, _ = io.ReadAll(resp.Body)
+
+		if len(*calls) != 1 {
+			t.Fatalf("%s: callback ran %d times, want once", tc.name, len(*calls))
+		}
+		if res := (*calls)[0]; res.ProviderRequestID != tc.want || res.Streamed != tc.streamed {
+			t.Errorf("%s: provider request ID %q, streamed %v; want %q, %v", tc.name, res.ProviderRequestID, res.Streamed, tc.want, tc.streamed)
+		}
+	}
+}
+
 // TestMeterFallsBackToRequestedModel: error responses rarely name a model,
 // and Gemini keeps it in the URL; the requested model fills the gap.
 func TestMeterFallsBackToRequestedModel(t *testing.T) {

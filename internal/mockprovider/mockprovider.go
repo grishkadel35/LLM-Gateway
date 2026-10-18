@@ -41,6 +41,11 @@ const (
 	ThoughtsTokens = 7
 )
 
+// GeminiResponseID is the responseId every Gemini response carries, on every
+// chunk of a stream too. The real API sends no request ID header, so this body
+// field is the only ID Gemini gives for a request (verified live 2026-10-17).
+const GeminiResponseID = "mock"
+
 // Handler serves all three providers' APIs from one server. Their paths don't
 // collide, so the gateway can point every provider at the same address.
 func Handler() http.Handler {

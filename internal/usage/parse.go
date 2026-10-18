@@ -45,6 +45,10 @@ type parser interface {
 	// body handles a complete, non-SSE response body.
 	body(b []byte)
 	usage() Usage
+	// requestID is the provider's ID for the request when the body carries it,
+	// "" otherwise. Providers that send it in a response header report none
+	// here: Meter reads the header.
+	requestID() string
 }
 
 // newParser returns the parser for format, or nil if there is none.
@@ -104,6 +108,9 @@ func (p *openAIParser) event(data []byte) {
 func (p *openAIParser) body(b []byte) { p.event(b) }
 
 func (p *openAIParser) usage() Usage { return p.u }
+
+// OpenAI and Groq send the request ID as the x-request-id header.
+func (p *openAIParser) requestID() string { return "" }
 
 // anthropicParser reads Anthropic's Messages shape. input_tokens already
 // excludes cache reads and writes, so it is Input as is.
@@ -193,6 +200,9 @@ func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
 
 func (p *anthropicParser) usage() Usage { return p.u }
 
+// Anthropic sends the request ID as the request-id header.
+func (p *anthropicParser) requestID() string { return "" }
+
 // geminiParser reads Gemini's generateContent shape. promptTokenCount
 // includes cache reads, so they are subtracted for Input. Tool use (code
 // execution, grounding) adds input reported in toolUsePromptTokenCount,
@@ -203,12 +213,18 @@ func (p *anthropicParser) usage() Usage { return p.u }
 //
 // Every streamed chunk carries usageMetadata as a running total, so the last
 // one wins. Without ?alt=sse the stream is one JSON array of chunks.
+//
+// Gemini sends no request ID header. Its body carries one instead, responseId,
+// the same on every chunk (verified live 2026-10-17); an error body has none.
+// The last one seen is the request ID.
 type geminiParser struct {
-	u Usage
+	u  Usage
+	id string
 }
 
 type geminiChunk struct {
 	ModelVersion  string `json:"modelVersion"`
+	ResponseID    string `json:"responseId"`
 	UsageMetadata *struct {
 		PromptTokenCount        int64 `json:"promptTokenCount"`
 		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
@@ -243,6 +259,9 @@ func (p *geminiParser) chunk(c geminiChunk) {
 	if c.ModelVersion != "" {
 		p.u.Model = c.ModelVersion
 	}
+	if c.ResponseID != "" {
+		p.id = c.ResponseID
+	}
 	if m := c.UsageMetadata; m != nil {
 		p.u.Input = m.PromptTokenCount - m.CachedContentTokenCount + m.ToolUsePromptTokenCount
 		p.u.CachedInput = m.CachedContentTokenCount
@@ -251,3 +270,5 @@ func (p *geminiParser) chunk(c geminiChunk) {
 }
 
 func (p *geminiParser) usage() Usage { return p.u }
+
+func (p *geminiParser) requestID() string { return p.id }

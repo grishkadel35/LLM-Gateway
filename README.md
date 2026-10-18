@@ -29,6 +29,11 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **Gemini rows get a provider request ID.** Gemini sends no request-ID
+  header, so `provider_request_id` was always empty on its usage rows. The
+  gateway now takes the `responseId` that every Gemini response body carries,
+  streamed or not. OpenAI and Groq still supply theirs as `x-request-id`, and
+  Anthropic as `request-id`.
 - **Week 4 checkpoint closed.** Tests through the real router, against a real
   Postgres and Redis, show that on each of the four mock routes the same
   temperature-0 request sent twice makes one provider call, gets a

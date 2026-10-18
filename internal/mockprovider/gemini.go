@@ -49,7 +49,7 @@ func gemini(w http.ResponseWriter, r *http.Request) {
 				"totalTokenCount":         PromptTokens + outputSoFar + ThoughtsTokens,
 			},
 			"modelVersion": model,
-			"responseId":   "mock",
+			"responseId":   GeminiResponseID,
 		}
 	}
 

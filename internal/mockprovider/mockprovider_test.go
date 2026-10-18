@@ -342,6 +342,7 @@ type geminiChunk struct {
 		TotalTokenCount         int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 	ModelVersion string `json:"modelVersion"`
+	ResponseID   string `json:"responseId"`
 }
 
 // checkGeminiChunks checks a whole Gemini response (one chunk, or a stream):
@@ -355,6 +356,10 @@ func checkGeminiChunks(t *testing.T, chunks []geminiChunk) {
 	for _, c := range chunks {
 		if c.ModelVersion != "gemini-x" {
 			t.Errorf("modelVersion = %q, want the model from the path", c.ModelVersion)
+		}
+		// Gemini sends no request ID header; every chunk carries this one.
+		if c.ResponseID != GeminiResponseID {
+			t.Errorf("responseId = %q, want %q on every chunk", c.ResponseID, GeminiResponseID)
 		}
 		for _, p := range c.Candidates[0].Content.Parts {
 			text.WriteString(p.Text)

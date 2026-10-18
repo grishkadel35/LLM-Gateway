@@ -27,7 +27,9 @@ type Result struct {
 	// response's real cost is unknown.
 	Complete bool
 	// ProviderRequestID is the provider's own ID for the request, which its
-	// support asks for. "" if it sent none.
+	// support asks for. OpenAI and Groq send it as the x-request-id header,
+	// Anthropic as request-id, and Gemini in the body as responseId. "" if it
+	// sent none.
 	ProviderRequestID string
 	// Cached reports that the gateway answered from its response cache, so
 	// no provider saw the request.
@@ -54,9 +56,12 @@ const maxBufferedBody = 32 << 20
 // When the response doesn't name its model (error responses rarely do), the
 // model the request asked for is reported instead.
 func Meter(resp *http.Response, format provider.Format, done Callback) {
-	providerID := resp.Header.Get("X-Request-Id") // OpenAI, Groq
+	// OpenAI and Groq send the provider's ID for the request as x-request-id,
+	// Anthropic as request-id, and Gemini in the body as responseId, which
+	// finish uses when no header supplied one.
+	providerID := resp.Header.Get("X-Request-Id")
 	if providerID == "" {
-		providerID = resp.Header.Get("Request-Id") // Anthropic
+		providerID = resp.Header.Get("Request-Id")
 	}
 
 	ctx := resp.Request.Context()
@@ -202,6 +207,9 @@ func (m *meteredBody) finish(complete bool) {
 				m.parser.body(m.buf)
 			}
 			m.result.Usage = m.parser.usage()
+			if m.result.ProviderRequestID == "" {
+				m.result.ProviderRequestID = m.parser.requestID()
+			}
 		}
 		if m.result.Model == "" {
 			m.result.Model = m.req.Model

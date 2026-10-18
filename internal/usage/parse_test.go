@@ -31,6 +31,31 @@ func parseEvents(t *testing.T, format provider.Format, events ...string) Usage {
 	return p.usage()
 }
 
+// bodyRequestID runs a complete non-streaming body through the format's
+// parser and returns the provider request ID it read from the body.
+func bodyRequestID(t *testing.T, format provider.Format, body string) string {
+	t.Helper()
+	p := newParser(format)
+	if p == nil {
+		t.Fatalf("no parser for format %q", format)
+	}
+	p.body([]byte(body))
+	return p.requestID()
+}
+
+// eventsRequestID is bodyRequestID for SSE data payloads.
+func eventsRequestID(t *testing.T, format provider.Format, events ...string) string {
+	t.Helper()
+	p := newParser(format)
+	if p == nil {
+		t.Fatalf("no parser for format %q", format)
+	}
+	for _, e := range events {
+		p.event([]byte(e))
+	}
+	return p.requestID()
+}
+
 // OpenAI's prompt_tokens includes cache reads; Usage.Input excludes them, so
 // every format means the same thing by it: tokens billed at the input rate.
 func TestOpenAIBody(t *testing.T) {
@@ -202,11 +227,16 @@ func TestGeminiWithoutThoughts(t *testing.T) {
 	}
 }
 
+// geminiResponseID is the responseId Gemini puts in the body of a response, the
+// same on every streamed chunk (verified live 2026-10-17). It sends no request
+// ID header.
+const geminiResponseID = "NxrUat6QM-XCytMPmIzNwQc"
+
 // geminiStreamChunk is one streamed response with candidates so far.
 func geminiStreamChunk(candidates int) string {
 	return `{"candidates":[{"content":{"parts":[{"text":"w"}]}}],"usageMetadata":{"promptTokenCount":20,` +
 		`"cachedContentTokenCount":5,"candidatesTokenCount":` + strconv.Itoa(candidates) +
-		`,"thoughtsTokenCount":7},"modelVersion":"gemini-3.8-flash"}`
+		`,"thoughtsTokenCount":7},"modelVersion":"gemini-3.8-flash","responseId":"` + geminiResponseID + `"}`
 }
 
 // Every streamed chunk carries usageMetadata as a running total: the last
@@ -278,5 +308,69 @@ func TestGeminiToolUseIsInput(t *testing.T) {
 	want := Usage{Model: "gemini-3.8-flash", Input: 45 + 93, Output: 48 + 24}
 	if got != want {
 		t.Errorf("usage = %+v, want %+v", got, want)
+	}
+}
+
+// Gemini's request ID is the responseId in the body, on a plain response and
+// on every chunk of a stream: SSE, or one JSON array without ?alt=sse.
+func TestGeminiRequestID(t *testing.T) {
+	plain := `{
+		"candidates":[{"content":{"parts":[{"text":"hi"}],"role":"model"},"finishReason":"STOP"}],
+		"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":10,"totalTokenCount":30},
+		"modelVersion":"gemini-3.8-flash","responseId":"` + geminiResponseID + `"}`
+	array := "[" + geminiStreamChunk(1) + ",\n" + geminiStreamChunk(2) + ",\n" + geminiStreamChunk(10) + "]\n"
+
+	for name, got := range map[string]string{
+		"body":       bodyRequestID(t, provider.FormatGemini, plain),
+		"sse":        eventsRequestID(t, provider.FormatGemini, geminiStreamChunk(1), geminiStreamChunk(2), geminiStreamChunk(10)),
+		"json array": bodyRequestID(t, provider.FormatGemini, array),
+	} {
+		if got != geminiResponseID {
+			t.Errorf("%s: request ID = %q, want %q", name, got, geminiResponseID)
+		}
+	}
+}
+
+// The last responseId seen wins, as modelVersion does, and a chunk without one
+// doesn't erase it.
+func TestGeminiRequestIDKeepsLastSeen(t *testing.T) {
+	got := eventsRequestID(t, provider.FormatGemini,
+		`{"responseId":"first"}`,
+		`{"responseId":"last"}`,
+		`{"usageMetadata":{"promptTokenCount":3}}`,
+	)
+
+	if got != "last" {
+		t.Errorf("request ID = %q, want last", got)
+	}
+}
+
+// An error body, or anything that isn't a response, carries no ID.
+func TestGeminiNoRequestID(t *testing.T) {
+	for _, body := range []string{
+		`{"error":{"code":503,"message":"The model is overloaded. Please try again later.","status":"UNAVAILABLE"}}`,
+		`[{"error":{"code":429}}]`,
+		`[`,
+		``,
+	} {
+		if got := bodyRequestID(t, provider.FormatGemini, body); got != "" {
+			t.Errorf("body %q: request ID = %q, want none", body, got)
+		}
+	}
+}
+
+// OpenAI, Groq and Anthropic send the request ID in a response header, which
+// Meter reads. The id in their bodies names the completion or message, not the
+// request, so their parsers report none.
+func TestOpenAIAndAnthropicHaveNoBodyRequestID(t *testing.T) {
+	for name, got := range map[string]string{
+		"openai body":      bodyRequestID(t, provider.FormatOpenAI, `{"id":"chatcmpl-1","model":"gpt-4o","choices":[],"usage":{"prompt_tokens":20,"completion_tokens":10}}`),
+		"openai stream":    eventsRequestID(t, provider.FormatOpenAI, `{"id":"chatcmpl-1","model":"gpt-4o","choices":[{"delta":{"content":"hi"}}]}`, `[DONE]`),
+		"anthropic body":   bodyRequestID(t, provider.FormatAnthropic, `{"id":"msg_1","type":"message","model":"claude-sonnet-4","usage":{"input_tokens":15,"output_tokens":10}}`),
+		"anthropic stream": eventsRequestID(t, provider.FormatAnthropic, anthropicStart),
+	} {
+		if got != "" {
+			t.Errorf("%s: request ID = %q, want none", name, got)
+		}
 	}
 }
