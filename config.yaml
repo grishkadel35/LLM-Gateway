@@ -16,8 +16,8 @@
 port: 8080
 
 # Address to bind to. Loopback by default and on purpose: the gateway holds
-# real provider keys. Tenant keys guard them, but there is no TLS or rate
-# limiting yet, so binding wider is a deliberate choice, not a default.
+# real provider keys. Tenant keys guard them, but there is no TLS or budget
+# enforcement yet, so binding wider is a deliberate choice, not a default.
 host: 127.0.0.1
 
 # How long, in seconds, the gateway serves a stored response before it asks
