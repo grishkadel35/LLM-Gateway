@@ -1423,13 +1423,18 @@ func TestRateLimitThresholdAndRefill(t *testing.T) {
 	// since the first charge: under 1,700 tokens while the test has run under
 	// 1.02 s (100,000/min is 1,667 a second). The fifth and the drain stay
 	// held, so no refund adds to it. A 1,700-token request is refused now, and
-	// gets in 1.1 s later on the refill alone. Had the refunds returned whole
+	// gets in 1.5 s later on the refill alone. Had the refunds returned whole
 	// estimates, the drain would have left 3,000, and it would get in now.
+	//
+	// 1.02 s of refill would do, but the bucket runs on Redis's clock, which a
+	// VM may step back: under Colima it jumps back about 0.13 s every 20 s,
+	// which failed a 1.1 s wait about 1 run in 20. 1.5 s rides out a step of
+	// up to 0.48 s.
 	drain := g.admit(t, chatCosting(67_000))
 	if _, e := g.refuse(t, chatCosting(1_700)); e.EstimatedTokens != 1_700 {
 		t.Errorf("estimated_tokens = %d, want 1700", e.EstimatedTokens)
 	}
-	time.Sleep(1100 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond)
 	refilled := g.admit(t, chatCosting(1_700))
 
 	// Let the rest go and wait for them, so their settlements are over before

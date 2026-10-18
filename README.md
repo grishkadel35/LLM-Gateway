@@ -341,10 +341,11 @@ go, so no admitted request gives tokens back early. On a 100,000 tokens/min
 tenant, three 30,000-token requests get in and a fourth gets `429` with
 `Retry-After: 12`. Once the three end, each having used 1,000 tokens, the
 29,000 apiece they didn't use come back, and a fifth gets in at once. After a
-drain, a 1,700-token request is refused, then gets in 1.1 s later on the
-refill alone (100,000 a minute is about 1,667 a second). Of 50 requests of
-10,000 tokens sent at once, exactly 10 reach the provider and 40 get `429`.
-Both tests need `REDIS_URL` and skip without it.
+drain, a 1,700-token request is refused, then gets in 1.5 s later on the
+refill alone (100,000 a minute is about 1,667 a second, so 1.02 s would do;
+the rest rides out a step back of Redis's clock, which Colima's VM makes about
+every 20 s). Of 50 requests of 10,000 tokens sent at once, exactly 10 reach
+the provider and 40 get `429`. Both tests need `REDIS_URL` and skip without it.
 
 The gateway has also been exercised against live providers with rate limiting
 on (2026-10-12, built from `a36fa30`): Groq `openai/gpt-oss-120b` through the
