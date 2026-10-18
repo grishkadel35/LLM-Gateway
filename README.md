@@ -3,7 +3,8 @@
 A reverse proxy that sits between your applications and LLM providers. It routes
 each request to the right provider, presents that provider's API key in whatever
 header it expects, and logs the result. It enforces each tenant's
-tokens-per-minute limit; response caching and budget enforcement plug in later.
+tokens-per-minute limit and answers repeated requests from a response cache;
+budget enforcement plugs in later.
 
 Providers speak their own native APIs — the gateway never translates request or
 response bodies, so new provider features work the day they ship. Adding a
@@ -16,16 +17,27 @@ provider is a block of YAML, not code.
 ## Project status
 
 **Last updated:** 2026-10-17
-**Stage:** Weeks 1 to 3 of 8 complete, checkpoints closed. Every provider
+**Stage:** Weeks 1 to 4 of 8 complete, checkpoints closed. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
 Groq and Gemini. A tenant over its limit gets `429` with `Retry-After` before
 any provider is called, and each charge is corrected to the tokens the
-provider reported. Week 4 (response caching) is under way.
+provider reported. A repeated non-streaming request that sets temperature 0 or
+sends `X-Gateway-Cache: on` is answered from Redis, without a charge and without
+calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **Week 4 checkpoint closed.** Tests through the real router, against a real
+  Postgres and Redis, show that on each of the four mock routes the same
+  temperature-0 request sent twice makes one provider call, gets a
+  byte-identical `hit` the second time, and charges the tenant once; that the
+  median of 20 hits takes 0.67–0.72 ms under `-race`; and that two tenants
+  never get each other's entries. A live check against Groq and Gemini passed:
+  a hit came back in about 1.1 ms through the real server. See
+  [Week 4 deliverables](#week-4-deliverables--response-caching-) and
+  [The cache contract](#the-cache-contract).
 - **Response cache, wired in.** A repeated request is now answered from
   Redis, and neither the rate limit nor the provider sees it. A
   non-streaming request is eligible when it sets temperature to exactly 0 or
@@ -351,6 +363,114 @@ at −27. The next request, sent with `max_retries=0`, got `429 rate_limited` wi
 With the SDK's default retries it waited the 7 s and got 200, 7.42 s in all. The
 refused requests left no usage row.
 
+### Week 4 deliverables — response caching ✅
+
+Goal: a repeated request is answered from Redis, without calling the provider or
+charging the tenant.
+
+- [x] The exact-match key — `cache.Key` is a SHA-256 over the tenant, the
+  provider, the escaped path, the query (without `key=`), the
+  `anthropic-version` and `anthropic-beta` headers, and the body as canonical
+  JSON, its parts kept apart so no two requests can run together into one key.
+  Whitespace and key order don't matter, and a number keeps its spelling, so `1`
+  and `1.0` get different keys: that can cost a hit, never serve a wrong one. A
+  request that can't be keyed safely (a body that isn't one JSON value, invalid
+  UTF-8, a query that doesn't parse, a body over 4 MiB) bypasses the cache
+- [x] Per-tenant scoping — the tenant is in the hash and in the entry's Redis
+  key (`cache:{<tenant_id>}:<hex>`), so one tenant never reads another's
+  entries. A tenant's API keys share its entries
+- [x] Eligibility and the header — a non-streaming request is cached when it
+  sets temperature to exactly 0 or sends `X-Gateway-Cache: on`. `off` opts a
+  request out, and any other value gets `400 invalid_request`. The proxy removes
+  every `X-Gateway-*` request header before forwarding, so none reaches a
+  provider
+- [x] The TTL — `cache.ttl` in `config.yaml`, in seconds (default 3,600, at
+  least 1). Each entry is written with its TTL in one `SET … EX`, so none is
+  ever stored without an expiry
+- [x] The store rules — only a complete 2xx answer from the route's own provider
+  is stored, never a stream, a fallback's answer, a response with a
+  `Content-Encoding`, or a body over 1 MiB. It is stored before the response
+  finishes. An entry holds the status, Content-Type, model and body, and no
+  provider headers
+- [x] Before the rate limit, with hit rows at cost 0 — `middleware.Cache` runs
+  between `ReadBody` and `RateLimit`, so a hit is never rate limited or charged.
+  It leaves a usage row of its own, marked `cached`, with no tokens and cost 0
+- [x] `X-Gateway-Cache: hit|miss|bypass` on every response that reaches the
+  cache, set as the headers go out, so it replaces a provider's own value and
+  survives a 1xx
+- [x] Tests — the key; the store, against a real Redis; the middleware and the
+  routes, over a fake cache; and the checkpoint, through the real router against
+  a real Postgres and Redis
+- [ ] Semantic cache (stretch) — deferred: it needs pgvector, an embedding model
+  and a measured false-positive rate before it may answer anyone, and a wrong
+  semantic hit is a wrong answer, which the exact cache never gives
+
+The cache runs after `ReadBody` and before `RateLimit`. It needs the tenant from
+Auth and the body from `ReadBody`, and a hit must never touch the rate limit's
+bucket or, from Week 5, the budget. The order on a provider route is Auth →
+StripPrefix → RequireMetered → ReadBody → Cache → RateLimit → (Fallback) →
+proxy. For the same reason it is middleware rather than a hook in
+`ModifyResponse`, which runs inside the proxy, after `RateLimit` has charged the
+request. Like the rate limiter, it comes in two pieces: `internal/cache` owns
+the key and Redis, and `middleware.Cache` is the HTTP side, over a small
+interface (`Get` and `Set`), so routing tests need no Redis. A miss learns how
+its response ended from the usage callback (`middleware.ReportUsage`) that
+already meters it, and is stored once the handler returns normally, so a
+response the proxy aborts is never stored.
+
+The Week 4 checkpoint is "the same request twice → one provider call, the second
+response in under 5 ms, the tenant charged once." Three tests in `cmd/gateway`
+check it through the real router, built from the parts `main` uses: the tenant
+store and usage writer on Postgres, and the cache and the rate limiter on Redis,
+on the client `openRedis` builds. They sit in front of the mock provider,
+wrapped to count the requests that reach it, and need `DATABASE_URL` and
+`REDIS_URL`: without them they skip.
+
+`TestCacheCheckpoint` sends the same temperature-0 request twice on each mock
+route (openai, groq, anthropic, gemini). The provider gets one request per
+route, and the second response is a `hit` with the first's status, Content-Type
+and body, byte for byte. A counting wrapper over the real limiter sees one
+`Allow` per route, and `usage_logs` holds 8 rows: each route's miss, priced at
+the price in force when the test runs, and its hit, marked `cached`, with no
+tokens and cost 0. `TestCacheHitLatency` times 20 hits through the router, each
+around `ServeHTTP`, and their median must be under 5 ms; under `-race` it
+measured 0.67–0.72 ms across 15 runs at `-cpu 1,2,4`.
+`TestCacheKeepsTenantsApart` has two tenants send the same request, taking
+turns. Each misses once and then hits its own entry, never the other's: the
+upstream numbers its answers, so a tenant served the other's entry would get the
+other's number, and Redis holds exactly one entry under each tenant's
+`cache:{<tenant ID>}:` prefix.
+
+Any Warn fails the tests, with a message saying why: the cache and the limiter
+fail open after 100 ms, so a slow Redis would otherwise look like a cache that
+never hits. They passed 30 of 30 runs with `-race`
+across `-cpu 1,2,4`, and they fail when the middleware skips the lookup, so
+every request misses: each route's provider then gets 2 requests and the limiter
+2 `Allow` calls, the second row is priced and not cached, no repeat is a hit,
+and each tenant gets a fresh answer (3 and 4).
+
+The gateway has also been exercised against live providers with the response
+cache on (2026-10-17, built from `fe497d7`, which holds all of the cache code):
+Groq `openai/gpt-oss-120b` through the `openai` Python SDK (3.34) and Gemini
+`gemini-3.8-flash` through `google-genai` (2.31). On both, the same
+temperature-0 request sent twice got `miss`, then `hit` with the same answer:
+Groq's hit body was byte-identical to the miss's (671 bytes), and Gemini's
+parsed to the same response. `X-Gateway-Cache: on` at the default temperature
+got `miss`, then `hit`. `off` on a temperature-0 request already stored got
+`bypass` both times: the provider answered both, and both were priced. A
+temperature-0 stream got `bypass` both times, priced and marked streamed. On
+Groq, `X-Gateway-Cache: yes` got `400 invalid_request`, with no cache header and
+no usage row. The usage rows for those requests came to 16, 8 per provider: 12
+priced, 4 of them streams, and 4 hits, each `cached`, with no tokens, cost 0 and
+no provider request ID. A hand-written curl body for the same Groq request hit
+the entry the SDK had stored.
+
+Hit latency through the real server, by curl, had a median of 1.14 ms on Groq
+(0.96–2.06 ms) and 1.11 ms on Gemini (1.02–1.82 ms), over 20 hits each. For
+comparison, calls the provider answered took 0.31–0.45 s on Groq and 2.6–7.8 s
+on Gemini (non-streamed misses and bypasses, from `latency_ms`). Gemini answered
+every call this time, with no 503s, and the gateway logged no Warn.
+
 ## Quick start
 
 Start Postgres and Redis and create the schema (see [Database](#database)):
@@ -471,9 +591,12 @@ Migrations live in `internal/db/migrations` and are embedded into the binary,
 so a build always carries the schema its code expects. `make migrate` targets
 the compose database; pass `DATABASE_URL=postgres://...` to use another.
 
-Redis holds the rate-limit buckets (Week 3). It has no volume, because the
-buckets are disposable: losing them only refills every tenant. It has no
-password either, so binding to loopback is what keeps it private.
+Redis holds the rate-limit buckets (Week 3) and the cached responses (Week 4).
+It has no volume, because both are disposable: losing the buckets only refills
+every tenant, and losing a cached response only makes the next identical request
+a miss. It has no password either, so binding to loopback is what keeps it
+private, which matters more now that cached answers sit in it unencrypted until
+their TTL ends.
 
 The gateway finds it through `REDIS_URL`: `make run` and `make run-mock` point
 it at this one (pass `REDIS_URL=redis://...` to use another). The gateway pings
@@ -499,6 +622,9 @@ Without them, `go test ./...` skips those tests and needs nothing running.
 ```yaml
 port: 8080          # port the gateway listens on
 host: 127.0.0.1     # bind address — loopback by default; see the note at the top
+
+cache:
+  ttl: 3600         # seconds to serve a stored response
 
 providers:
   openai:
@@ -560,6 +686,14 @@ is 600 seconds, the same as the official SDKs. A timeout returns `504`; an
 unreachable provider returns `502`; a request that waits longer than
 `queue_timeout` for a free slot returns `503` with error type `provider_busy`
 and `Retry-After: 1`, and that wait doesn't count against `timeout`.
+
+`cache.ttl` is how long, in seconds, the gateway serves a stored response
+before it asks the provider again. The default is 3,600 and the minimum is 1,
+and the whole `cache:` block may be left out. A response is stored for a
+non-streaming request with temperature 0 or the header `X-Gateway-Cache: on`;
+`X-Gateway-Cache: off` opts a request out. A typo under `cache:`, or a `ttl`
+below 1, is a startup error. [The cache contract](#the-cache-contract) has the
+details.
 
 ### Adding a provider
 
@@ -693,7 +827,7 @@ to the network: bind it to the Colima bridge address or firewall it.
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
 | `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
-| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)). Prefix stripped, forwarded with the provider's key. |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit or the provider (see [The cache contract](#the-cache-contract)). |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
@@ -776,6 +910,75 @@ has this shape for every provider, and the provider is never called:
 A refused request leaves no usage row. The gateway logs it as one
 `request rate limited` line carrying the `X-Request-ID` the client got.
 
+### The cache contract
+
+The gateway keeps some responses in Redis and answers an identical request from
+there, without calling the provider. Entries belong to a tenant: no other tenant
+can read one.
+
+- **Which requests are cached.** A request is eligible when it isn't a stream
+  and either sets `temperature` to exactly 0 (at the top level for OpenAI-format
+  and Anthropic requests, in `generationConfig` for Gemini) or sends
+  `X-Gateway-Cache: on`, unless it sends `off`. Everything else is a bypass: it
+  goes straight on, with no lookup and no store. That covers a stream
+  (`"stream": true`, or Gemini's `streamGenerateContent`), whether or not it
+  sends `on`; a request with no temperature, or one other than 0, and no `on`; a
+  request with `off`; a request the cache can't key safely (a body that isn't
+  exactly one JSON value or isn't valid UTF-8, or a query string that doesn't
+  parse); and a request body over 4 MiB.
+- **`X-Gateway-Cache` in a request** is `on` or `off`, in any case, sent once.
+  `on` makes a non-streaming request eligible at any temperature. `off` keeps it
+  out of the cache, whatever its temperature. Any other value, or the header
+  sent twice, gets `400 invalid_request` and goes no further, so a typo like
+  `true` can't silently do nothing. The header never reaches a provider: the
+  gateway removes it, like every `X-Gateway-*` request header.
+- **`X-Gateway-Cache` in a response** is `hit`, `miss` or `bypass`, on every
+  response that reaches the cache, in place of any value a provider sent. It
+  says what the cache did, not how the request turned out. After a lookup that
+  finds nothing, or fails, every response says `miss`, a `429` from the rate
+  limit or a `503 provider_busy` included. A bypassed request says `bypass`
+  whatever comes back. A request refused before the cache (`401`, `403`, `413`,
+  or `400` for a body that can't be read) or by it (`400` for a bad
+  `X-Gateway-Cache`) carries no cache header.
+- **What counts as the same request.** The tenant, the provider route, the
+  path, the query string (without `key=`), the `anthropic-version` and
+  `anthropic-beta` headers, and the body; no other header counts. Whitespace,
+  the order of an object's keys at any depth, and how a string is escaped don't
+  matter. A number counts as written, so `1` and `1.0` are different requests:
+  that can cost a hit, but never serves a wrong answer. All of a tenant's API
+  keys share its entries.
+- **What is stored.** A miss is stored when its response is a complete 2xx from
+  the route's own provider. Never stored: a stream, a fallback's answer, a
+  response with a `Content-Encoding`, or a body over 1 MiB. An entry holds the
+  status, the Content-Type and the body, exactly as the client got them, and no
+  provider headers.
+- **A hit** replays the status, the Content-Type and the body, with
+  `X-Gateway-Cache: hit`. It carries its own `X-Request-ID` and none of the
+  provider's headers, whose request IDs, rate-limit headers and cookies would be
+  stale or wrong. On a route with a fallback enabled it adds
+  `X-Gateway-Provider` (the route's provider) and `X-Gateway-Fallback: false`,
+  as every other response there does.
+- **What a hit costs, and how long it lasts.** A hit never reaches the rate
+  limit, so it is served even when the tenant's bucket is empty. It leaves a
+  usage row with `cached` true, no tokens and cost 0, which the usage report
+  counts as a request. Entries live for `cache.ttl` (3,600 seconds by default)
+  from the moment they are stored, and a hit doesn't extend that. There is no
+  way to flush a tenant's entries, and a hit carries no `Age` header.
+- **Opting out.** Send `X-Gateway-Cache: off`. A "regenerate" button that
+  resends a temperature-0 request would otherwise get the same answer back for
+  the whole TTL, and so would an eval that runs one prompt several times.
+- **Concurrent requests.** There is no request coalescing. Two identical
+  requests that miss at once both reach the provider and both are charged, and
+  the later store wins.
+- **When Redis is down,** the cache fails open. A lookup that fails, or takes
+  more than 100 ms, makes the request a `miss` that goes to the provider as it
+  would without a cache; the gateway logs a Warn, and the response isn't stored.
+  A store that fails is a Warn too, and changes nothing the client sees.
+- **Not prompt caching.** This is the gateway's own response cache, and a hit
+  never reaches the provider. The providers' prompt caching is another thing: it
+  still runs the model, bills the input tokens it has seen before at a discount,
+  and is metered as before (`cached_input_tokens` and `cache_write_tokens`).
+
 ## Make targets
 
 | Command         | What it does                           |
@@ -801,7 +1004,7 @@ cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy, its hooks and the fallback
-internal/middleware/      request IDs, request logging, tenant key auth, rate limiting
+internal/middleware/      request IDs, request logging, tenant key auth, response cache, rate limiting
 internal/health/          GET /health
 internal/concurrency/     per-provider request limit and its queue
 internal/metrics/         Prometheus metrics
@@ -811,6 +1014,7 @@ internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
 internal/ratelimit/       per-tenant token bucket in Redis (Lua scripts)
+internal/cache/           exact-match response cache: the request key, entries in Redis
 internal/redistest/       Redis client for tests
 internal/admin/           admin API: create tenants, issue and revoke keys
 internal/apierror/        the one JSON error shape every response uses
@@ -840,6 +1044,14 @@ Rate limiting runs *before* the proxy, as middleware after `ReadBody` in
 way back too: the usage callback, which fires as each response ends (or fails),
 reports that request's tokens to it (`middleware.ReportUsage`), and it corrects
 the bucket once the request is over. Budget checks belong next to it.
+
+The response cache runs before rate limiting, as middleware between `ReadBody`
+and `RateLimit` in `main.go`
+([internal/middleware/cache.go](internal/middleware/cache.go)), not in
+`ModifyResponse`: a hit has to skip the rate limit, which runs before the proxy.
+A miss learns how its response ended from the same usage callback
+(`middleware.ReportUsage`), and is stored once the request is over. Week 5's
+budget check goes inside the cache too, so a hit is never charged.
 
 ## Observability
 

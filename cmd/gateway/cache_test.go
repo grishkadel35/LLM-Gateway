@@ -22,6 +22,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/grishkadel/llm-gateway/internal/cache"
 	"github.com/grishkadel/llm-gateway/internal/config"
 	"github.com/grishkadel/llm-gateway/internal/db"
@@ -30,6 +32,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
+	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -832,5 +835,293 @@ func TestCacheHitProviderHeaders(t *testing.T) {
 	}
 	if n, m := len(ollama.arrivals), groqCalls.Load(); n != 1 || m != 1 {
 		t.Errorf("ollama got %d requests and groq %d, want 1 each", n, m)
+	}
+}
+
+// countingLimiter is the real limiter, counting the Allow calls it passes on.
+type countingLimiter struct {
+	middleware.Limiter
+	allows atomic.Int64
+}
+
+func (l *countingLimiter) Allow(ctx context.Context, tenantID string, limit, cost int64) (bool, time.Duration, error) {
+	l.allows.Add(1)
+	return l.Limiter.Allow(ctx, tenantID, limit, cost)
+}
+
+// cacheGateway is the gateway with main's parts: tenants and usage rows in
+// Postgres, and the response cache and the rate limiter in Redis, on the
+// client openRedis builds.
+type cacheGateway struct {
+	http.Handler
+	conn    *sql.DB
+	store   stores
+	writer  *usage.Writer
+	rdb     *redis.Client
+	limiter *countingLimiter
+}
+
+// newCacheGateway builds a cacheGateway on a fresh database, with the mock's
+// four routes pointed at upstream. Without DATABASE_URL or REDIS_URL the test
+// is skipped. The usage writer is closed as the test ends, unless the test
+// has closed it already to read usage_logs.
+//
+// The cache and the limiter fail open: a Redis call that fails or takes over
+// 100 ms makes a lookup a miss, whose response isn't stored, or admits a
+// request unchecked, with a Warn. On a slow machine that would pass for a
+// cache that never hits, so any Warn fails the test, saying so.
+func newCacheGateway(t *testing.T, upstream string) *cacheGateway {
+	t.Helper()
+
+	// Redis first, so that without REDIS_URL no database is made.
+	rdb := gatewayRedis(t)
+	conn := dbtest.New(t)
+	if _, err := db.Migrate(context.Background(), conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+
+	var logs lockedBuffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	t.Cleanup(func() {
+		if warns := logs.String(); warns != "" {
+			t.Errorf("the gateway logged warnings (below). The cache and the limiter fail open: a Redis call "+
+				"that fails or takes over 100 ms makes a lookup a miss, whose response isn't stored, or admits "+
+				"a request unchecked. So any failure above may be down to a slow machine, not the cache:\n%s", warns)
+		}
+	})
+
+	g := &cacheGateway{
+		conn:    conn,
+		store:   stores{tenant.NewStore(conn), usage.NewReports(conn)},
+		writer:  usage.NewWriter(conn, logger),
+		rdb:     rdb,
+		limiter: &countingLimiter{Limiter: ratelimit.New(rdb)},
+	}
+	// Registered after the check above, so it runs first: whatever the writer
+	// logs as it drains is checked too.
+	t.Cleanup(func() { g.writer.Close(context.Background()) })
+
+	// An entry lasts a minute: far longer than any test here takes, and the
+	// shared Redis is rid of it soon after.
+	r, err := router(mockConfigAt(t, upstream), g.store, testAdminKey, recordUsage(g.writer, nil, logger),
+		g.limiter, cache.New(rdb, time.Minute), metrics.New(), nil, logger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	g.Handler = r
+	return g
+}
+
+// newTenant creates a tenant named name, and returns it with its key. Its ID
+// is random, so its keys in the shared Redis are its own.
+func (g *cacheGateway) newTenant(t *testing.T, name string) (tenant.Tenant, tenant.NewKey) {
+	t.Helper()
+	tn, key, err := g.store.Create(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tn, key
+}
+
+// postAs is tenantPost with key, a tenant's gateway key, in place of
+// testTenantKey.
+func postAs(key, path, body string) *http.Request {
+	req := tenantPost(path, body)
+	req.Header.Set("Authorization", "Bearer "+key)
+	return req
+}
+
+// TestCacheCheckpoint is the Week 4 checkpoint, through the gateway with
+// main's parts, on each mock route: the same temperature-0 request twice
+// makes one provider call, and the second response is a hit, with the
+// first's status, Content-Type and body, byte for byte. The tenant is charged
+// once: the limiter gets one Allow, and usage_logs holds the miss's row,
+// priced, and the hit's, cached, at cost 0 with no tokens.
+func TestCacheCheckpoint(t *testing.T) {
+	upstream, calls := countingUpstream(t, mockprovider.Handler().ServeHTTP)
+	g := newCacheGateway(t, upstream)
+	tn, key := g.newTenant(t, "acme")
+
+	in, cached := int64(mockprovider.PromptTokens-mockprovider.CachedPromptTokens), int64(mockprovider.CachedPromptTokens)
+	out := int64(mockprovider.OutputTokens)
+	cases := []struct {
+		provider, model, path, body string
+		output                      int64
+	}{
+		{"openai", "gpt-4o", "/openai/v1/chat/completions",
+			`{"model":"gpt-4o","temperature":0,"messages":[{"role":"user","content":"hi"}]}`, out},
+		{"groq", "openai/gpt-oss-120b", "/groq/v1/chat/completions",
+			`{"model":"openai/gpt-oss-120b","temperature":0,"messages":[{"role":"user","content":"hi"}]}`, out},
+		{"anthropic", "claude-sonnet-4", "/anthropic/v1/messages",
+			`{"model":"claude-sonnet-4","max_tokens":64,"temperature":0,"messages":[{"role":"user","content":"hi"}]}`, out},
+		// Gemini keeps its temperature in generationConfig, and its output
+		// includes its thinking tokens.
+		{"gemini", "gemini-3.8-flash", "/gemini/v1beta/models/gemini-3.8-flash:generateContent",
+			`{"generationConfig":{"temperature":0},"contents":[{"parts":[{"text":"hi"}]}]}`, out + mockprovider.ThoughtsTokens},
+	}
+
+	// The request IDs of each route's miss and hit, for their usage rows.
+	ids := make([]struct{ miss, hit string }, len(cases))
+	for i, tc := range cases {
+		t.Run(tc.provider, func(t *testing.T) {
+			callsBefore, allowsBefore := calls.Load(), g.limiter.allows.Load()
+			miss := serve(g, postAs(key.Plaintext, tc.path, tc.body))
+			hit := serve(g, postAs(key.Plaintext, tc.path, tc.body))
+			ids[i].miss, ids[i].hit = miss.Header().Get("X-Request-ID"), hit.Header().Get("X-Request-ID")
+
+			if miss.Code != http.StatusOK || verdict(miss) != "miss" {
+				t.Fatalf("first request: status %d, X-Gateway-Cache %q; want 200, miss; body %s", miss.Code, verdict(miss), miss.Body)
+			}
+			if verdict(hit) != "hit" || hit.Code != miss.Code || hit.Header().Get("Content-Type") != miss.Header().Get("Content-Type") ||
+				!bytes.Equal(hit.Body.Bytes(), miss.Body.Bytes()) {
+				t.Errorf("second request: X-Gateway-Cache %q, status %d, Content-Type %q, body %s; want hit, %d, %q, %s", verdict(hit),
+					hit.Code, hit.Header().Get("Content-Type"), hit.Body, miss.Code, miss.Header().Get("Content-Type"), miss.Body)
+			}
+			if n := calls.Load() - callsBefore; n != 1 {
+				t.Errorf("the provider got %d requests, want 1", n)
+			}
+			if n := g.limiter.allows.Load() - allowsBefore; n != 1 {
+				t.Errorf("the limiter got %d Allow calls, want 1, for the miss", n)
+			}
+		})
+	}
+
+	// The writer inserts its rows in batches, off the request path: Close
+	// inserts the rest.
+	if err := g.writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := g.conn.QueryRow(`SELECT count(*) FROM usage_logs`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2*len(cases) {
+		t.Errorf("usage_logs has %d rows, want %d: a miss and a hit on each route", n, 2*len(cases))
+	}
+
+	// row is the usage_logs columns the test reads.
+	type row struct {
+		TenantID, Provider, Model  string
+		Input, CachedInput, Output int64
+		Cost                       sql.NullInt64
+		Cached                     bool
+	}
+	read := func(id string) row {
+		t.Helper()
+		var got row
+		err := g.conn.QueryRow(`
+			SELECT tenant_id, provider, model, input_tokens, cached_input_tokens, output_tokens, cost_micros, cached
+			FROM usage_logs WHERE request_id = $1`, id,
+		).Scan(&got.TenantID, &got.Provider, &got.Model, &got.Input, &got.CachedInput, &got.Output, &got.Cost, &got.Cached)
+		if err != nil {
+			t.Fatalf("no row with request ID %s: %v", id, err)
+		}
+		return got
+	}
+	for i, tc := range cases {
+		cost, ok := pricing.Cost(tc.provider, usage.Usage{Model: tc.model, Input: in, CachedInput: cached, Output: tc.output}, "", time.Now())
+		if !ok || cost <= 0 {
+			t.Fatalf("%s/%s should be priced", tc.provider, tc.model)
+		}
+		missRow := row{TenantID: tn.ID, Provider: tc.provider, Model: tc.model, Input: in, CachedInput: cached, Output: tc.output,
+			Cost: sql.NullInt64{Int64: cost, Valid: true}}
+		if got := read(ids[i].miss); got != missRow {
+			t.Errorf("%s: the miss's row = %+v, want %+v", tc.provider, got, missRow)
+		}
+		// The hit's is the same, but for no tokens, cost 0 and cached.
+		hitRow := row{TenantID: tn.ID, Provider: tc.provider, Model: tc.model, Cost: sql.NullInt64{Valid: true}, Cached: true}
+		if got := read(ids[i].hit); got != hitRow {
+			t.Errorf("%s: the hit's row = %+v, want %+v", tc.provider, got, hitRow)
+		}
+	}
+}
+
+// TestCacheHitLatency: the checkpoint's timing. Through the gateway with
+// main's parts, the median of 20 hits, each timed around ServeHTTP, is under
+// 5 ms.
+func TestCacheHitLatency(t *testing.T) {
+	upstream, _ := countingUpstream(t, mockprovider.Handler().ServeHTTP)
+	g := newCacheGateway(t, upstream)
+	_, key := g.newTenant(t, "acme")
+	const path = "/openai/v1/chat/completions"
+
+	if miss := serve(g, postAs(key.Plaintext, path, zeroTemperature)); miss.Code != http.StatusOK || verdict(miss) != "miss" {
+		t.Fatalf("first request: status %d, X-Gateway-Cache %q; want 200, miss; body %s", miss.Code, verdict(miss), miss.Body)
+	}
+	const hits = 20
+	took := make([]time.Duration, hits)
+	for i := range took {
+		req, rec := postAs(key.Plaintext, path, zeroTemperature), httptest.NewRecorder()
+		start := time.Now()
+		g.ServeHTTP(rec, req)
+		took[i] = time.Since(start)
+		if rec.Code != http.StatusOK || verdict(rec) != "hit" {
+			t.Fatalf("repeat %d: status %d, X-Gateway-Cache %q; want 200, hit", i+1, rec.Code, verdict(rec))
+		}
+	}
+
+	slices.Sort(took)
+	// With an even count, the median is halfway between the middle two.
+	median := (took[hits/2-1] + took[hits/2]) / 2
+	t.Logf("the median of %d hits took %v (fastest %v, slowest %v)", hits, median, took[0], took[hits-1])
+	if median >= 5*time.Millisecond {
+		t.Errorf("the median of %d hits took %v, want under 5 ms (fastest %v, slowest %v)", hits, median, took[0], took[hits-1])
+	}
+}
+
+// TestCacheKeepsTenantsApart: two tenants send the same request, and each
+// misses once and then hits its own entry, never the other's. The mock's
+// answers are all alike, so this upstream numbers its answers instead: a
+// tenant served the other's entry would get the other's number. Redis holds
+// one entry under each tenant's prefix.
+func TestCacheKeepsTenantsApart(t *testing.T) {
+	// answer is the upstream's nth answer, which carries n.
+	answer := func(n int64) string {
+		return fmt.Sprintf(`{"id":"chatcmpl-test","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,`+
+			`"message":{"role":"assistant","content":"answer %d"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`, n)
+	}
+	var answered atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, answer(answered.Add(1)))
+	}))
+	t.Cleanup(upstream.Close)
+	g := newCacheGateway(t, upstream.URL)
+	acme, acmeKey := g.newTenant(t, "acme")
+	globex, globexKey := g.newTenant(t, "globex")
+
+	steps := []struct {
+		tenant, key, want string
+		answer            int64 // the upstream's answer it must get
+	}{
+		{"acme", acmeKey.Plaintext, "miss", 1},
+		{"globex", globexKey.Plaintext, "miss", 2},
+		{"acme", acmeKey.Plaintext, "hit", 1},
+		{"globex", globexKey.Plaintext, "hit", 2},
+	}
+	for _, s := range steps {
+		rec := serve(g, postAs(s.key, "/openai/v1/chat/completions", zeroTemperature))
+		if rec.Code != http.StatusOK || verdict(rec) != s.want || rec.Body.String() != answer(s.answer) {
+			t.Errorf("%s: status %d, X-Gateway-Cache %q, body %s; want 200, %s, the upstream's answer %d",
+				s.tenant, rec.Code, verdict(rec), rec.Body, s.want, s.answer)
+		}
+	}
+
+	ctx := context.Background()
+	for _, tn := range []tenant.Tenant{acme, globex} {
+		// SCAN, not KEYS, which would hold up the shared Redis while it went
+		// through every key.
+		var keys []string
+		iter := g.rdb.Scan(ctx, 0, "cache:{"+tn.ID+"}:*", 0).Iterator()
+		for iter.Next(ctx) {
+			keys = append(keys, iter.Val())
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if len(keys) != 1 {
+			t.Errorf("Redis holds %d entries under %s's prefix, want 1: %q", len(keys), tn.Name, keys)
+		}
 	}
 }

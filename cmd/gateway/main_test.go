@@ -1222,6 +1222,23 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+// gatewayRedis returns the Redis client main builds, by openRedis from
+// REDIS_URL, closed when the test ends. Without REDIS_URL the test is skipped.
+func gatewayRedis(t *testing.T) *redis.Client {
+	t.Helper()
+
+	u := os.Getenv("REDIS_URL")
+	if u == "" {
+		t.Skip("REDIS_URL not set; skipping Redis tests")
+	}
+	rdb, err := openRedis(u)
+	if err != nil {
+		t.Fatalf("openRedis() returned error: %v", err)
+	}
+	t.Cleanup(func() { rdb.Close() })
+	return rdb
+}
+
 // heldGateway is the gateway, rate limited by the real Redis limiter, in
 // front of a provider that holds each request until the test lets it go. A
 // charge is settled only once its response is over, so until then every
@@ -1249,15 +1266,7 @@ type heldGateway struct {
 func newHeldGateway(t *testing.T, tokens int64) *heldGateway {
 	t.Helper()
 
-	u := os.Getenv("REDIS_URL")
-	if u == "" {
-		t.Skip("REDIS_URL not set; skipping Redis tests")
-	}
-	rdb, err := openRedis(u)
-	if err != nil {
-		t.Fatalf("openRedis() returned error: %v", err)
-	}
-	t.Cleanup(func() { rdb.Close() })
+	rdb := gatewayRedis(t)
 
 	g := &heldGateway{arrivals: make(chan struct{}, 64), release: make(chan struct{})}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1501,8 +1510,15 @@ func mockConfig(t *testing.T) *config.Config {
 
 	mock := httptest.NewServer(mockprovider.Handler())
 	t.Cleanup(mock.Close)
-	t.Setenv("TEST_MOCK_KEY", "mock")
+	return mockConfigAt(t, mock.URL)
+}
 
+// mockConfigAt returns mockConfig's config with every format pointed at
+// upstream instead: routes openai, groq, anthropic and gemini.
+func mockConfigAt(t *testing.T, upstream string) *config.Config {
+	t.Helper()
+
+	t.Setenv("TEST_MOCK_KEY", "mock")
 	yaml := fmt.Sprintf(`
 providers:
   openai:
@@ -1527,7 +1543,7 @@ providers:
     key: ${TEST_MOCK_KEY}
     auth: x-goog-api-key
     format: gemini
-`, mock.URL)
+`, upstream)
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
