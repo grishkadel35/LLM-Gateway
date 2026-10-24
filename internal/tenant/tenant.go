@@ -40,6 +40,11 @@ const (
 // learns nothing about why it was rejected.
 var ErrNotFound = errors.New("not found")
 
+// MaxBudgetMicros is the largest budget a tenant can have: 1e15 micro-dollars,
+// $1 billion. It matches the CHECK in migration 00003, which keeps the budget
+// ledger's Lua arithmetic below 2^53, where doubles are exact.
+const MaxBudgetMicros = 1_000_000_000_000_000
+
 // Tenant is one customer of the gateway. Limits come from the column defaults
 // in the schema until something sets them.
 type Tenant struct {
@@ -50,6 +55,13 @@ type Tenant struct {
 	BudgetPeriod          string
 	DefaultMaxTokens      int
 	CreatedAt             time.Time
+}
+
+// Update is a change to a tenant's limits. A field left nil is not changed.
+type Update struct {
+	BudgetMicros          *int64
+	RateLimitTokensPerMin *int64
+	DefaultMaxTokens      *int
 }
 
 // APIKey describes a stored key. It never holds the key itself.
@@ -163,6 +175,49 @@ func (s *Store) Lookup(ctx context.Context, key string) (Tenant, APIKey, error) 
 	}
 	k.TenantID = t.ID
 	return t, k, nil
+}
+
+// Get returns the tenant with that ID, as Lookup would, or ErrNotFound.
+func (s *Store) Get(ctx context.Context, id string) (Tenant, error) {
+	return scanTenant(s.db.QueryRowContext(ctx, `
+		SELECT id, name, rate_limit_tokens_per_min, budget_micros, budget_period,
+		       default_max_tokens, created_at
+		FROM tenants WHERE id = $1`,
+		id,
+	))
+}
+
+// Update changes the limits u sets, leaves the others as they are, and returns
+// the tenant as it now stands. It returns ErrNotFound if the tenant doesn't
+// exist, and an error, with nothing changed, if the database refuses a value.
+func (s *Store) Update(ctx context.Context, id string, u Update) (Tenant, error) {
+	// A nil pointer is sent as NULL, and COALESCE then keeps the column as it
+	// is, so one statement covers every combination of fields.
+	return scanTenant(s.db.QueryRowContext(ctx, `
+		UPDATE tenants SET
+			budget_micros             = COALESCE($2, budget_micros),
+			rate_limit_tokens_per_min = COALESCE($3, rate_limit_tokens_per_min),
+			default_max_tokens        = COALESCE($4, default_max_tokens)
+		WHERE id = $1
+		RETURNING id, name, rate_limit_tokens_per_min, budget_micros, budget_period,
+		          default_max_tokens, created_at`,
+		id, u.BudgetMicros, u.RateLimitTokensPerMin, u.DefaultMaxTokens,
+	))
+}
+
+// scanTenant reads the one row Get and Update return, columns in their order.
+// A statement that matched no tenant returns ErrNotFound.
+func scanTenant(row *sql.Row) (Tenant, error) {
+	var t Tenant
+	err := row.Scan(&t.ID, &t.Name, &t.RateLimitTokensPerMin, &t.BudgetMicros, &t.BudgetPeriod,
+		&t.DefaultMaxTokens, &t.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Tenant{}, ErrNotFound
+	}
+	if err != nil {
+		return Tenant{}, err
+	}
+	return t, nil
 }
 
 // queryRower is satisfied by both *sql.DB and *sql.Tx, so insertKey runs

@@ -16,8 +16,9 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-17
-**Stage:** Weeks 1 to 4 of 8 complete, checkpoints closed. Every provider
+**Last updated:** 2026-10-24
+**Stage:** Weeks 1 to 4 of 8 complete, checkpoints closed; Week 5
+(per-tenant budgets) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -29,6 +30,16 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **A tenant's limits can be changed over the admin API.**
+  `PATCH /admin/tenants/{id}` sets any of `budget_micros`,
+  `rate_limit_tokens_per_min` and `default_max_tokens`, and returns the
+  tenant. The next request uses the new values. Until now they were set with
+  SQL.
+  - It refuses with `400 invalid_request`: a field it doesn't know, a `null`,
+    anything but a whole number, and a value out of range.
+  - Migration 00003 holds a budget between $0 and $1 billion, and the period
+    to `monthly`, the only one the gateway enforces. The database itself
+    refuses any other value, however it is written.
 - **Gemini rows get a provider request ID.** Gemini sends no request-ID
   header, so `provider_request_id` was always empty on its usage rows. The
   gateway now takes the `responseId` that every Gemini response body carries,
@@ -836,6 +847,7 @@ to the network: bind it to the Colima bridge address or firewall it.
 | `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit or the provider (see [The cache contract](#the-cache-contract)). |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
+| `PATCH /admin/tenants/{id}`       | Admin key. Any of `budget_micros`, `rate_limit_tokens_per_min`, `default_max_tokens` → `200` with the tenant; the next request uses them. |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
 | `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage.  |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
@@ -1022,7 +1034,7 @@ internal/tenant/          tenants and API keys: issue, revoke, look up
 internal/ratelimit/       per-tenant token bucket in Redis (Lua scripts)
 internal/cache/           exact-match response cache: the request key, entries in Redis
 internal/redistest/       Redis client for tests
-internal/admin/           admin API: create tenants, issue and revoke keys
+internal/admin/           admin API: create tenants, change their limits, issue and revoke keys
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
 deployments/              docker compose dev stack (Postgres, Redis)

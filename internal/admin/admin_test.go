@@ -1,13 +1,17 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,6 +19,7 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
+	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -65,9 +70,20 @@ type keyBody struct {
 	Plaintext string `json:"plaintext"`
 }
 
+type tenantBody struct {
+	ID                    string    `json:"id"`
+	Name                  string    `json:"name"`
+	RateLimitTokensPerMin int64     `json:"rate_limit_tokens_per_min"`
+	BudgetMicros          int64     `json:"budget_micros"`
+	BudgetPeriod          string    `json:"budget_period"`
+	DefaultMaxTokens      int       `json:"default_max_tokens"`
+	CreatedAt             time.Time `json:"created_at"`
+}
+
 type errorBody struct {
 	Error struct {
-		Type string `json:"type"`
+		Type    string `json:"type"`
+		Message string `json:"message"`
 	} `json:"error"`
 }
 
@@ -121,6 +137,186 @@ func TestCreateTenantRejectsBadInput(t *testing.T) {
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("body %q: status = %d, want %d", body, rec.Code, http.StatusBadRequest)
 		}
+	}
+}
+
+// TestPatchTenant: the response is the tenant as it now stands, only the
+// fields sent change, and the database holds the change by the time it
+// answers. The ends of each range are valid values.
+func TestPatchTenant(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	// A new tenant has 50,000,000 µ$, 100,000 tokens a minute and a cap of 4096.
+	cases := []struct {
+		name, body   string
+		budget, rate int64
+		tokens       int
+	}{
+		{"budget alone", `{"budget_micros":7000000}`, 7_000_000, 100_000, 4096},
+		{"rate limit alone", `{"rate_limit_tokens_per_min":1234}`, 50_000_000, 1234, 4096},
+		{"default cap alone", `{"default_max_tokens":99}`, 50_000_000, 100_000, 99},
+		{"all three", `{"budget_micros":1,"rate_limit_tokens_per_min":2,"default_max_tokens":3}`, 1, 2, 3},
+		{"lowest values", `{"budget_micros":0,"rate_limit_tokens_per_min":1,"default_max_tokens":1}`, 0, 1, 1},
+		{"highest values",
+			fmt.Sprintf(`{"budget_micros":%d,"rate_limit_tokens_per_min":%d,"default_max_tokens":%d}`,
+				int64(tenant.MaxBudgetMicros), int64(ratelimit.MaxCost), int64(math.MaxInt32)),
+			tenant.MaxBudgetMicros, ratelimit.MaxCost, math.MaxInt32},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			created, key, err := store.Create(ctx, "acme")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			rec := serve(t, store, http.MethodPatch, "/admin/tenants/"+created.ID, tc.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+			}
+			var body struct {
+				Tenant tenantBody `json:"tenant"`
+			}
+			decode(t, rec, &body)
+
+			got := body.Tenant
+			if got.ID != created.ID || got.Name != "acme" || got.BudgetPeriod != "monthly" || !got.CreatedAt.Equal(created.CreatedAt) {
+				t.Errorf("tenant = %+v, want the ID, name, period and creation time of %+v", got, created)
+			}
+			if got.BudgetMicros != tc.budget || got.RateLimitTokensPerMin != tc.rate || got.DefaultMaxTokens != tc.tokens {
+				t.Errorf("limits = %d µ$, %d tokens/min, cap %d; want %d, %d, %d",
+					got.BudgetMicros, got.RateLimitTokensPerMin, got.DefaultMaxTokens, tc.budget, tc.rate, tc.tokens)
+			}
+
+			// Lookup is what every request goes through, so this is the change
+			// taking effect.
+			looked, _, err := store.Lookup(ctx, key.Plaintext)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if looked.BudgetMicros != tc.budget || looked.RateLimitTokensPerMin != tc.rate || looked.DefaultMaxTokens != tc.tokens {
+				t.Errorf("Lookup sees %+v, want the limits the response reported", looked)
+			}
+		})
+	}
+}
+
+// TestPatchTenantRejectsBadInput: every refusal is a 400 invalid_request, and
+// names the field at fault where there is one. failingStore fails every call,
+// so a 400 also shows the request never reached the store.
+func TestPatchTenantRejectsBadInput(t *testing.T) {
+	fields := []string{"budget_micros", "rate_limit_tokens_per_min", "default_max_tokens"}
+	valid := map[string]string{"budget_micros": "1", "rate_limit_tokens_per_min": "1", "default_max_tokens": "1"}
+
+	var cases []struct{ body, mention string }
+	add := func(body, mention string) {
+		cases = append(cases, struct{ body, mention string }{body, mention})
+	}
+
+	// Not a JSON object.
+	for _, body := range []string{
+		``, `not json`, `[]`, `[{"budget_micros":1}]`, `"budget_micros"`, `5`, `true`, `null`,
+		`{"budget_micros":1} x`, `{"budget_micros":1}{"budget_micros":2}`,
+	} {
+		add(body, "JSON object")
+	}
+
+	// No field at all.
+	add(`{}`, "at least one")
+
+	// A field the endpoint doesn't change: the rest of the tenant is out of
+	// reach, names must match exactly, and a typo is caught. Beside a valid
+	// field, it still refuses the whole request.
+	for _, name := range []string{"name", "id", "budget_period", "created_at", "bugdet_micros", "Budget_Micros"} {
+		add(fmt.Sprintf(`{%q:1}`, name), name)
+		add(fmt.Sprintf(`{"budget_micros":1,%q:1}`, name), name)
+	}
+
+	// The wrong type, null included. A null beside a valid field is the case
+	// that tells null from a missing field: if it were skipped like one, that
+	// request would succeed.
+	for i, field := range fields {
+		sibling := fields[(i+1)%len(fields)]
+		for _, value := range []string{`null`, `"5"`, `""`, `true`, `1.5`, `1e3`, `[]`, `[1]`, `{}`} {
+			add(fmt.Sprintf(`{%q:%s}`, field, value), field)
+			add(fmt.Sprintf(`{%q:%s,%q:%s}`, field, value, sibling, valid[sibling]), field)
+		}
+	}
+
+	// Out of range, each side of each range, and past int64 altogether.
+	for _, c := range []struct{ field, value string }{
+		{"budget_micros", `-1`},
+		{"budget_micros", strconv.FormatInt(tenant.MaxBudgetMicros+1, 10)},
+		{"rate_limit_tokens_per_min", `0`},
+		{"rate_limit_tokens_per_min", `-1`},
+		{"rate_limit_tokens_per_min", strconv.FormatInt(ratelimit.MaxCost+1, 10)},
+		{"default_max_tokens", `0`},
+		{"default_max_tokens", `-1`},
+		{"default_max_tokens", strconv.FormatInt(math.MaxInt32+1, 10)},
+		{"budget_micros", `9223372036854775808`},
+		{"rate_limit_tokens_per_min", `9223372036854775808`},
+		{"default_max_tokens", `9223372036854775808`},
+	} {
+		add(fmt.Sprintf(`{%q:%s}`, c.field, c.value), c.field)
+	}
+	// One refused value refuses the request, valid fields beside it included.
+	add(`{"budget_micros":1,"rate_limit_tokens_per_min":0,"default_max_tokens":1}`, "rate_limit_tokens_per_min")
+
+	for _, tc := range cases {
+		rec := serve(t, failingStore{}, http.MethodPatch, "/admin/tenants/tn_a", tc.body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %q: status = %d, want %d; response %s", tc.body, rec.Code, http.StatusBadRequest, rec.Body)
+			continue
+		}
+		var body errorBody
+		decode(t, rec, &body)
+		if body.Error.Type != "invalid_request" || !strings.Contains(body.Error.Message, tc.mention) {
+			t.Errorf("body %q: error = %+v, want invalid_request mentioning %q", tc.body, body.Error, tc.mention)
+		}
+	}
+}
+
+func TestPatchTenantUnknownTenant(t *testing.T) {
+	rec := serve(t, newStore(t), http.MethodPatch, "/admin/tenants/tn_0000000000000000", `{"budget_micros":1}`)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	var body errorBody
+	decode(t, rec, &body)
+	if body.Error.Type != "not_found" {
+		t.Errorf("error type = %q, want not_found", body.Error.Type)
+	}
+}
+
+// TestPatchTenantLogsWhatChanged: one Info line, naming the tenant and the
+// fields changed, whatever order the body listed them in.
+func TestPatchTenantLogsWhatChanged(t *testing.T) {
+	store := newStore(t)
+	created, _, err := store.Create(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	h := Handler(store, slog.New(slog.NewJSONHandler(&logs, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/admin/tenants/"+created.ID,
+		strings.NewReader(`{"default_max_tokens":512,"budget_micros":0}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+	}
+
+	var entry struct {
+		Level    string   `json:"level"`
+		TenantID string   `json:"tenant_id"`
+		Fields   []string `json:"fields"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("log output %q is not one JSON line: %v", logs.String(), err)
+	}
+	if entry.Level != "INFO" || entry.TenantID != created.ID || !slices.Equal(entry.Fields, []string{"budget_micros", "default_max_tokens"}) {
+		t.Errorf("log line = %+v, want INFO for %s naming budget_micros and default_max_tokens", entry, created.ID)
 	}
 }
 
@@ -218,6 +414,12 @@ var errDown = errors.New("connection refused")
 func (failingStore) Create(context.Context, string) (tenant.Tenant, tenant.NewKey, error) {
 	return tenant.Tenant{}, tenant.NewKey{}, errDown
 }
+func (failingStore) Get(context.Context, string) (tenant.Tenant, error) {
+	return tenant.Tenant{}, errDown
+}
+func (failingStore) Update(context.Context, string, tenant.Update) (tenant.Tenant, error) {
+	return tenant.Tenant{}, errDown
+}
 func (failingStore) IssueKey(context.Context, string) (tenant.NewKey, error) {
 	return tenant.NewKey{}, errDown
 }
@@ -231,6 +433,7 @@ func (failingStore) TenantUsage(context.Context, string, time.Time, time.Time) (
 func TestStoreFailureIs500(t *testing.T) {
 	requests := []struct{ method, path, body string }{
 		{http.MethodPost, "/admin/tenants", `{"name":"acme"}`},
+		{http.MethodPatch, "/admin/tenants/tn_x", `{"budget_micros":1}`},
 		{http.MethodPost, "/admin/tenants/tn_x/keys", ""},
 		{http.MethodDelete, "/admin/keys/1", ""},
 		{http.MethodGet, "/admin/tenants/tn_x/usage", ""},
@@ -252,6 +455,7 @@ func TestUnknownAdminRouteIsJSON(t *testing.T) {
 	for _, r := range []struct{ method, path string }{
 		{http.MethodGet, "/admin/nope"},
 		{http.MethodGet, "/admin/tenants"},
+		{http.MethodPut, "/admin/tenants/tn_x"},
 		{http.MethodPut, "/admin/keys/1"},
 	} {
 		rec := serve(t, failingStore{}, r.method, r.path, "")

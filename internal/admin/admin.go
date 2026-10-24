@@ -1,5 +1,5 @@
-// Package admin serves the gateway's admin API: creating tenants, issuing
-// and revoking their keys, and reporting their usage.
+// Package admin serves the gateway's admin API: creating tenants, changing
+// their limits, issuing and revoking their keys, and reporting their usage.
 //
 // It does no authentication of its own. The gateway mounts it behind
 // middleware.AdminAuth, so a request that reaches these handlers already
@@ -10,13 +10,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
+	"maps"
+	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -25,6 +31,8 @@ import (
 // *tenant.Store provides, and usage reports, which *usage.Reports provides.
 type Store interface {
 	Create(ctx context.Context, name string) (tenant.Tenant, tenant.NewKey, error)
+	Get(ctx context.Context, id string) (tenant.Tenant, error)
+	Update(ctx context.Context, id string, u tenant.Update) (tenant.Tenant, error)
 	IssueKey(ctx context.Context, tenantID string) (tenant.NewKey, error)
 	RevokeKey(ctx context.Context, keyID int64) error
 	TenantUsage(ctx context.Context, tenantID string, from, to time.Time) (usage.Summary, error)
@@ -36,6 +44,7 @@ func Handler(store Store, logger *slog.Logger) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/tenants", a.createTenant)
+	mux.HandleFunc("PATCH /admin/tenants/{id}", a.patchTenant)
 	mux.HandleFunc("POST /admin/tenants/{id}/keys", a.issueKey)
 	mux.HandleFunc("DELETE /admin/keys/{id}", a.revokeKey)
 	mux.HandleFunc("GET /admin/tenants/{id}/usage", a.tenantUsage)
@@ -119,6 +128,80 @@ func (a *api) createTenant(w http.ResponseWriter, r *http.Request) {
 
 	a.logger.Info("tenant created", "tenant_id", t.ID, "key_id", key.ID, "key_prefix", key.Prefix)
 	writeSecret(w, map[string]any{"tenant": toTenantJSON(t), "key": toKeyJSON(key)})
+}
+
+// patchable lists the tenant fields patchTenant changes, in the order it
+// checks them. Each takes a whole number from min to max: the budget's top is
+// the database's own check (migration 00003), the rate limit's is the most the
+// limiter ever charges one request, and the default cap's is what its INT
+// column holds.
+var patchable = []struct {
+	name     string
+	min, max int64
+	set      func(u *tenant.Update, v int64)
+}{
+	{"budget_micros", 0, tenant.MaxBudgetMicros, func(u *tenant.Update, v int64) { u.BudgetMicros = &v }},
+	{"rate_limit_tokens_per_min", 1, ratelimit.MaxCost, func(u *tenant.Update, v int64) { u.RateLimitTokensPerMin = &v }},
+	{"default_max_tokens", 1, math.MaxInt32, func(u *tenant.Update, v int64) { n := int(v); u.DefaultMaxTokens = &n }},
+}
+
+// patchTenant changes the limits named in the body and returns the tenant as
+// it now stands. A limit left out of the body keeps its value.
+func (a *api) patchTenant(w http.ResponseWriter, r *http.Request) {
+	// Go note: decoding into a struct of pointer fields can't tell a field sent
+	// as null from one left out, since both leave the pointer nil. A map of
+	// json.RawMessage keeps every key that was sent, with its value exactly as
+	// written, so null arrives as a value to refuse.
+	var sent map[string]json.RawMessage
+	body, err := io.ReadAll(r.Body)
+	if err != nil || json.Unmarshal(body, &sent) != nil || sent == nil {
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", `body must be a JSON object, such as {"budget_micros": 50000000}`, nil)
+		return
+	}
+
+	var u tenant.Update
+	var changed []string
+	for _, p := range patchable {
+		raw, ok := sent[p.name]
+		if !ok {
+			continue
+		}
+		delete(sent, p.name)
+		// ParseInt takes a whole number in plain digits and nothing else, so
+		// null, a string, a bool, a fraction, an exponent and a number too big
+		// for an int64 all fail it, as a number out of range does.
+		v, err := strconv.ParseInt(string(raw), 10, 64)
+		if err != nil || v < p.min || v > p.max {
+			apierror.Write(w, http.StatusBadRequest, "invalid_request",
+				fmt.Sprintf("%s must be an integer from %d to %d", p.name, p.min, p.max), nil)
+			return
+		}
+		p.set(&u, v)
+		changed = append(changed, p.name)
+	}
+	// What is left is not a field this endpoint changes.
+	if unknown := slices.Sorted(maps.Keys(sent)); len(unknown) > 0 {
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", fmt.Sprintf("unknown field %q", unknown[0]), nil)
+		return
+	}
+	if len(changed) == 0 {
+		apierror.Write(w, http.StatusBadRequest, "invalid_request", "body must set at least one of budget_micros, rate_limit_tokens_per_min and default_max_tokens", nil)
+		return
+	}
+
+	tenantID := r.PathValue("id")
+	t, err := a.store.Update(r.Context(), tenantID, u)
+	if errors.Is(err, tenant.ErrNotFound) {
+		apierror.Write(w, http.StatusNotFound, "not_found", "no tenant with that ID", nil)
+		return
+	}
+	if err != nil {
+		a.internalError(w, "updating tenant", err)
+		return
+	}
+
+	a.logger.Info("tenant updated", "tenant_id", tenantID, "fields", changed)
+	writeJSON(w, http.StatusOK, map[string]any{"tenant": toTenantJSON(t)})
 }
 
 // issueKey gives an existing tenant another key, for rotation.

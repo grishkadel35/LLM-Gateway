@@ -127,6 +127,193 @@ func TestLimitsMustBePositive(t *testing.T) {
 	}
 }
 
+// violatedCheck names the CHECK constraint err reports as violated (SQLSTATE
+// 23514), or returns "" for any other error.
+func violatedCheck(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23514" {
+		return pgErr.ConstraintName
+	}
+	return ""
+}
+
+// TestBudgetChecks checks the CHECK constraints from migration 00003: the
+// budget ledger's Lua is exact only below 2^53, so a budget stops at
+// MaxBudgetMicros, and monthly is the only period the gateway enforces.
+func TestBudgetChecks(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	tn, _, err := s.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		column, constraint string
+		value              any
+	}{
+		{"budget_micros", "tenants_budget_micros_range", int64(-1)},
+		{"budget_micros", "tenants_budget_micros_range", int64(MaxBudgetMicros) + 1},
+		{"budget_period", "tenants_budget_period_monthly", "weekly"},
+	} {
+		// A column name can't be a query parameter; tc.column is from the list above.
+		_, err := s.db.ExecContext(ctx, `UPDATE tenants SET `+tc.column+` = $1 WHERE id = $2`, tc.value, tn.ID)
+		if got := violatedCheck(err); got != tc.constraint {
+			t.Errorf("setting %s to %v: error = %v, want a violation of %q", tc.column, tc.value, err, tc.constraint)
+		}
+	}
+
+	// Both ends of the range are valid, so the check is BETWEEN, not a strict
+	// inequality on either side. MaxBudgetMicros is the cap the database holds.
+	for _, budget := range []int64{0, MaxBudgetMicros} {
+		if _, err := s.db.ExecContext(ctx, `UPDATE tenants SET budget_micros = $1 WHERE id = $2`, budget, tn.ID); err != nil {
+			t.Errorf("setting the budget to %d: %v", budget, err)
+		}
+	}
+}
+
+// TestGetMatchesLookup: Get returns the tenant as Lookup does, and ErrNotFound
+// for an unknown ID.
+func TestGetMatchesLookup(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	tn, key, err := s.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Limits that differ from the defaults and from each other, so a column
+	// read into the wrong field shows.
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE tenants SET rate_limit_tokens_per_min = 111, budget_micros = 222, default_max_tokens = 333 WHERE id = $1`, tn.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	want, _, err := s.Lookup(ctx, key.Plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(ctx, tn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("Get = %+v, want what Lookup returns, %+v", got, want)
+	}
+	if got.RateLimitTokensPerMin != 111 || got.BudgetMicros != 222 || got.DefaultMaxTokens != 333 || got.Name != "acme" {
+		t.Errorf("Get = %+v, want name acme and limits 111, 222, 333", got)
+	}
+
+	if _, err := s.Get(ctx, "tn_missing"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Get of an unknown ID: error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateChangesOnlyTheFieldsSet: Update changes what it is given, returns
+// the tenant after the change, and the next Lookup sees it. Nothing else
+// changes, another tenant's row included.
+func TestUpdateChangesOnlyTheFieldsSet(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	other, _, err := s.Create(ctx, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	budget, rate, tokens, zero := int64(7_000_000), int64(1234), 99, int64(0)
+	// A new tenant has 50,000,000 µ$, 100,000 tokens a minute and a cap of 4096.
+	cases := []struct {
+		name         string
+		u            Update
+		budget, rate int64
+		tokens       int
+	}{
+		{"budget alone", Update{BudgetMicros: &budget}, budget, 100_000, 4096},
+		{"rate limit alone", Update{RateLimitTokensPerMin: &rate}, 50_000_000, rate, 4096},
+		{"default cap alone", Update{DefaultMaxTokens: &tokens}, 50_000_000, 100_000, tokens},
+		{"all three", Update{BudgetMicros: &budget, RateLimitTokensPerMin: &rate, DefaultMaxTokens: &tokens}, budget, rate, tokens},
+		{"budget of zero", Update{BudgetMicros: &zero}, 0, 100_000, 4096},
+		{"nothing", Update{}, 50_000_000, 100_000, 4096},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before, key, err := s.Create(ctx, "acme")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := s.Update(ctx, before.ID, tc.u)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ID != before.ID || got.Name != before.Name || got.BudgetPeriod != before.BudgetPeriod || !got.CreatedAt.Equal(before.CreatedAt) {
+				t.Errorf("Update returned %+v, want the ID, name, period and creation time of %+v", got, before)
+			}
+			if got.BudgetMicros != tc.budget || got.RateLimitTokensPerMin != tc.rate || got.DefaultMaxTokens != tc.tokens {
+				t.Errorf("Update returned limits %d, %d, %d; want %d, %d, %d",
+					got.BudgetMicros, got.RateLimitTokensPerMin, got.DefaultMaxTokens, tc.budget, tc.rate, tc.tokens)
+			}
+
+			looked, _, err := s.Lookup(ctx, key.Plaintext)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if looked != got {
+				t.Errorf("Lookup = %+v, want what Update returned, %+v", looked, got)
+			}
+
+			if again, err := s.Get(ctx, other.ID); err != nil || again != other {
+				t.Errorf("another tenant is now %+v (error %v), want %+v", again, err, other)
+			}
+		})
+	}
+}
+
+func TestUpdateUnknownTenant(t *testing.T) {
+	budget := int64(1)
+	if _, err := newStore(t).Update(context.Background(), "tn_missing", Update{BudgetMicros: &budget}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("error = %v, want ErrNotFound", err)
+	}
+}
+
+// TestUpdateRefusedValue: a value the CHECK constraints refuse is an error,
+// and the statement is all or nothing: the valid fields sent with it don't
+// change either.
+func TestUpdateRefusedValue(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	ok, negative, tooBig, zero, noTokens := int64(5), int64(-1), int64(MaxBudgetMicros)+1, int64(0), 0
+	for _, tc := range []struct {
+		name       string
+		u          Update
+		constraint string
+	}{
+		{"budget below 0", Update{BudgetMicros: &negative}, "tenants_budget_micros_range"},
+		{"budget above the cap", Update{BudgetMicros: &tooBig}, "tenants_budget_micros_range"},
+		{"rate limit of 0", Update{RateLimitTokensPerMin: &zero}, "tenants_rate_limit_tokens_per_min_positive"},
+		{"default cap of 0", Update{DefaultMaxTokens: &noTokens}, "tenants_default_max_tokens_positive"},
+		{"one refused beside a valid one", Update{BudgetMicros: &ok, DefaultMaxTokens: &noTokens}, "tenants_default_max_tokens_positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, _, err := s.Create(ctx, "acme")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := s.Update(ctx, before.ID, tc.u); violatedCheck(err) != tc.constraint {
+				t.Errorf("error = %v, want a violation of %q", err, tc.constraint)
+			}
+			if after, err := s.Get(ctx, before.ID); err != nil || after != before {
+				t.Errorf("after the refusal the tenant is %+v (error %v), want it unchanged: %+v", after, err, before)
+			}
+		})
+	}
+}
+
 func TestOnlyTheHashIsStored(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)

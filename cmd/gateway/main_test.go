@@ -62,6 +62,14 @@ func (fakeStore) Create(_ context.Context, name string) (tenant.Tenant, tenant.N
 	return tenant.Tenant{ID: "tn_new", Name: name}, tenant.NewKey{APIKey: tenant.APIKey{ID: 2, TenantID: "tn_new"}}, nil
 }
 
+func (fakeStore) Get(context.Context, string) (tenant.Tenant, error) {
+	return tenant.Tenant{}, tenant.ErrNotFound
+}
+
+func (fakeStore) Update(context.Context, string, tenant.Update) (tenant.Tenant, error) {
+	return tenant.Tenant{}, tenant.ErrNotFound
+}
+
 func (fakeStore) IssueKey(context.Context, string) (tenant.NewKey, error) {
 	return tenant.NewKey{}, tenant.ErrNotFound
 }
@@ -411,6 +419,8 @@ func TestAdminRoutesRequireAdminKey(t *testing.T) {
 	rejected := []struct{ name, method, path, authorization string }{
 		{"no key", http.MethodPost, "/admin/tenants", ""},
 		{"tenant key", http.MethodPost, "/admin/tenants", "Bearer " + testTenantKey},
+		{"patch, no key", http.MethodPatch, "/admin/tenants/tn_x", ""},
+		{"patch, tenant key", http.MethodPatch, "/admin/tenants/tn_x", "Bearer " + testTenantKey},
 		{"wrong method, no key", http.MethodGet, "/admin/tenants", ""},
 		{"unknown path, no key", http.MethodGet, "/admin/nope", ""},
 	}
