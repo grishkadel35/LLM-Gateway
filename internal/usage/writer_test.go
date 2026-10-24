@@ -6,6 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +45,12 @@ func testRow(tn tenant.Tenant, key tenant.NewKey, requestID string) Row {
 	}
 }
 
+// withCost returns r priced at micros.
+func withCost(r Row, micros int64) Row {
+	r.CostMicros = &micros
+	return r
+}
+
 func discard() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func countRows(t *testing.T, conn *sql.DB) int {
@@ -66,6 +74,47 @@ func waitForRows(t *testing.T, conn *sql.DB, want int) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("usage_logs has %d rows, want %d", n, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForPending polls until w counts want micro-dollars of tenantID's rows as
+// pending, failing after a deadline: the writer's goroutine takes a batch off
+// the count just after it commits.
+func waitForPending(t *testing.T, w *Writer, tenantID string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := w.Pending(tenantID)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Pending(%s) = %d, want %d", tenantID, got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// waitForBlockedInsert polls until a statement in the test database is waiting
+// on a lock, failing after a deadline. The only one that can is the writer's
+// INSERT, held up by a lock the test took on usage_logs.
+func waitForBlockedInsert(t *testing.T, conn *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting int
+		err := conn.QueryRow(`SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the writer's INSERT never waited on the table lock")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -259,5 +308,330 @@ func TestWriterIsolatesBadRow(t *testing.T) {
 
 	if n := countRows(t, conn); n != 2 {
 		t.Errorf("usage_logs has %d rows, want the 2 good ones", n)
+	}
+}
+
+// TestWriterPendingCountsQueuedRows: Pending is the cost of a tenant's rows
+// from Write until their batch commits. An interval of an hour and a batch of
+// 100 hold these rows until Close flushes them.
+func TestWriterPendingCountsQueuedRows(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	other, otherKey, err := tenant.NewStore(conn).Create(context.Background(), "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := newWriter(conn, discard(), 1000, 100, time.Hour)
+	w.start()
+
+	w.Write(withCost(testRow(tn, key, "req_1"), 100))
+	w.Write(withCost(testRow(tn, key, "req_2"), 20))
+	w.Write(withCost(testRow(other, otherKey, "req_3"), 7))
+
+	if n := countRows(t, conn); n != 0 {
+		t.Fatalf("usage_logs has %d rows, want the 3 still queued", n)
+	}
+	if got := w.Pending(tn.ID); got != 120 {
+		t.Errorf("Pending(%s) = %d, want 120", tn.ID, got)
+	}
+	// Another tenant's rows don't count, and a tenant with none has 0.
+	if got := w.Pending(other.ID); got != 7 {
+		t.Errorf("Pending(%s) = %d, want 7", other.ID, got)
+	}
+	if got := w.Pending("tn_unknown"); got != 0 {
+		t.Errorf("Pending(tn_unknown) = %d, want 0", got)
+	}
+
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, conn); n != 3 {
+		t.Errorf("after Close, usage_logs has %d rows, want 3", n)
+	}
+	for _, id := range []string{tn.ID, other.ID} {
+		if got := w.Pending(id); got != 0 {
+			t.Errorf("after Close, Pending(%s) = %d, want 0", id, got)
+		}
+	}
+}
+
+// TestWriterPendingSkipsRowsWithoutCost: a row with no cost (a model with no
+// price) adds nothing while it is queued, and nor does a cost of 0 (a cache
+// hit). Writing one takes nothing off the count either.
+func TestWriterPendingSkipsRowsWithoutCost(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	w := newWriter(conn, discard(), 1000, 100, time.Hour)
+	w.start()
+
+	unpriced := testRow(tn, key, "req_unpriced")
+	unpriced.CostMicros = nil
+	w.Write(unpriced)
+	w.Write(withCost(testRow(tn, key, "req_hit"), 0))
+	if got := w.Pending(tn.ID); got != 0 {
+		t.Errorf("with two rows queued that cost nothing, Pending = %d, want 0", got)
+	}
+
+	w.Write(withCost(testRow(tn, key, "req_priced"), 30))
+	if got := w.Pending(tn.ID); got != 30 {
+		t.Errorf("Pending = %d, want 30, the priced row's alone", got)
+	}
+
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Pending(tn.ID); got != 0 {
+		t.Errorf("after Close, Pending = %d, want 0", got)
+	}
+	if n := countRows(t, conn); n != 3 {
+		t.Errorf("after Close, usage_logs has %d rows, want all 3", n)
+	}
+}
+
+// TestWriterPendingCountsUntilCommit: a row still counts while the insert that
+// holds it waits on Postgres, and stops counting only once the batch commits. A
+// lock on the table holds the insert up.
+func TestWriterPendingCountsUntilCommit(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	// Two rows fill the batch, so the writer flushes at once.
+	w := newWriter(conn, discard(), 10, 2, time.Hour)
+	w.start()
+	defer w.Close(context.Background())
+
+	lock, err := conn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	if _, err := lock.Exec(`LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write(withCost(testRow(tn, key, "req_1"), 100))
+	w.Write(withCost(testRow(tn, key, "req_2"), 20))
+	waitForBlockedInsert(t, conn)
+	if got := w.Pending(tn.ID); got != 120 {
+		t.Errorf("with the insert waiting, Pending = %d, want 120", got)
+	}
+
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	waitForRows(t, conn, 2)
+	waitForPending(t, w, tn.ID, 0)
+}
+
+// TestWriterPendingCountsBeforeQueueing: Write counts a row before it queues
+// it, so a flush that finishes with the row at once finds the cost already
+// added. Holding the count's lock keeps Write from counting, and it must not
+// have queued the row either. Nothing here touches Postgres.
+func TestWriterPendingCountsBeforeQueueing(t *testing.T) {
+	// Never started: there is no flush, and no database for one to write to.
+	w := newWriter(nil, discard(), 10, 100, time.Hour)
+	cost := int64(75)
+
+	w.pendingMu.Lock()
+	written := make(chan struct{})
+	go func() {
+		w.Write(Row{RequestID: "req_1", TenantID: "tn_1", CostMicros: &cost})
+		close(written)
+	}()
+	// Long enough for a Write that doesn't wait for the count to queue the row.
+	time.Sleep(50 * time.Millisecond)
+	if n := len(w.rows); n != 0 {
+		t.Errorf("Write queued %d rows while it could not yet count them, want 0", n)
+	}
+	w.pendingMu.Unlock()
+
+	select {
+	case <-written:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write never finished")
+	}
+	if got := w.Pending("tn_1"); got != 75 {
+		t.Errorf("Pending(tn_1) = %d, want 75", got)
+	}
+	if n := len(w.rows); n != 1 {
+		t.Errorf("the queue holds %d rows, want 1", n)
+	}
+}
+
+// TestWriterPendingIgnoresDroppedRows: a row Write drops, whether the queue is
+// full or the writer is closed, never counts.
+func TestWriterPendingIgnoresDroppedRows(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	// Not started: nothing drains the one-slot queue.
+	w := newWriter(conn, discard(), 1, 100, time.Hour)
+
+	w.Write(withCost(testRow(tn, key, "req_1"), 100))
+	w.Write(withCost(testRow(tn, key, "req_2"), 20)) // the queue is full
+	if got := w.Pending(tn.ID); got != 100 {
+		t.Errorf("after a row was dropped for a full queue, Pending = %d, want 100, the queued row's alone", got)
+	}
+
+	w.start()
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	w.Write(withCost(testRow(tn, key, "req_3"), 7)) // the writer is closed
+	if got := w.Pending(tn.ID); got != 0 {
+		t.Errorf("after Close and a write past it, Pending = %d, want 0", got)
+	}
+	if got := w.Dropped(); got != 2 {
+		t.Errorf("Dropped() = %d, want 2", got)
+	}
+}
+
+// TestWriterPendingDropsRejectedRows: a row Postgres rejects stops counting
+// once the writer gives it up, whether it shared its batch (and was retried on
+// its own) or was alone in it.
+func TestWriterPendingDropsRejectedRows(t *testing.T) {
+	cases := []struct {
+		name string
+		good bool // whether a row Postgres accepts shares the batch
+	}{
+		{"in a batch with a good row", true},
+		{"alone", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, tn, key := newWriterDB(t)
+			w := newWriter(conn, discard(), 10, 100, time.Hour)
+			w.start()
+
+			orphan := withCost(testRow(tn, key, "req_orphan"), 40)
+			orphan.TenantID = "tn_does_not_exist" // violates the foreign key
+			wantRows := 0
+			if tc.good {
+				w.Write(withCost(testRow(tn, key, "req_1"), 100))
+				wantRows = 1
+			}
+			w.Write(orphan)
+			if got := w.Pending(orphan.TenantID); got != 40 {
+				t.Errorf("while queued, Pending(%s) = %d, want 40", orphan.TenantID, got)
+			}
+
+			if err := w.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{orphan.TenantID, tn.ID} {
+				if got := w.Pending(id); got != 0 {
+					t.Errorf("after the writer gave the row up, Pending(%s) = %d, want 0", id, got)
+				}
+			}
+			if n := countRows(t, conn); n != wantRows {
+				t.Errorf("usage_logs has %d rows, want %d", n, wantRows)
+			}
+		})
+	}
+}
+
+// TestWriterPendingUnderConcurrentWrites runs Write, Pending and flushes at the
+// same time, which is what -race is for. It holds Pending to what the budget's
+// rebuild needs from it: reading Pending and then summing usage_logs never
+// misses a row whose Write has returned. A batch that commits between the two
+// reads is counted twice, which is allowed.
+func TestWriterPendingUnderConcurrentWrites(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	// Small batches and a short interval keep flushes overlapping the writes.
+	w := newWriter(conn, discard(), DefaultQueue, 7, 2*time.Millisecond)
+	w.start()
+
+	const writers, perWriter = 4, 100
+	const rejected = "tn_does_not_exist"
+	// Most rows are priced and tn's. Every 10th has no cost, and every 50th is
+	// for a tenant Postgres rejects, which the writer gives up.
+	rowFor := func(g, i int) Row {
+		row := withCost(testRow(tn, key, "req_"+strconv.Itoa(g)+"_"+strconv.Itoa(i)), int64(1+i%9))
+		switch {
+		case i%50 == 0:
+			row.TenantID = rejected
+		case i%10 == 0:
+			row.CostMicros = nil
+		}
+		return row
+	}
+	var wantRows, wantCost int64
+	for g := range writers {
+		for i := range perWriter {
+			if row := rowFor(g, i); row.TenantID == tn.ID {
+				wantRows++
+				if row.CostMicros != nil {
+					wantCost += *row.CostMicros
+				}
+			}
+		}
+	}
+
+	var returned atomic.Int64 // the cost of tn's rows whose Write has returned
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	readers.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Loaded before Pending: Write counted each of these rows before it
+			// returned.
+			written := returned.Load()
+			queued := w.Pending(tn.ID)
+			var stored int64
+			err := conn.QueryRow(`SELECT COALESCE(SUM(cost_micros), 0)::bigint FROM usage_logs WHERE tenant_id = $1`, tn.ID).Scan(&stored)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if queued < 0 || queued > wantCost || queued+stored < written {
+				t.Errorf("Pending = %d and usage_logs holds %d, but Write has returned for %d (all the rows cost %d)", queued, stored, written, wantCost)
+				return
+			}
+		}
+	})
+	// Pending alone, as often as it can be read.
+	readers.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if queued := w.Pending(tn.ID); queued < 0 || queued > wantCost {
+				t.Errorf("Pending = %d, want 0 to %d", queued, wantCost)
+				return
+			}
+		}
+	})
+
+	var writing sync.WaitGroup
+	for g := range writers {
+		writing.Go(func() {
+			for i := range perWriter {
+				row := rowFor(g, i)
+				w.Write(row)
+				if row.TenantID == tn.ID && row.CostMicros != nil {
+					returned.Add(*row.CostMicros)
+				}
+			}
+		})
+	}
+	writing.Wait()
+	err := w.Close(context.Background())
+	close(stop)
+	readers.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := w.Dropped(); got != 0 {
+		t.Errorf("Dropped() = %d, want 0", got)
+	}
+	for _, id := range []string{tn.ID, rejected} {
+		if got := w.Pending(id); got != 0 {
+			t.Errorf("after Close, Pending(%s) = %d, want 0", id, got)
+		}
+	}
+	if n := countRows(t, conn); int64(n) != wantRows {
+		t.Errorf("usage_logs has %d rows, want %d", n, wantRows)
 	}
 }

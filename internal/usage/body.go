@@ -37,6 +37,13 @@ type Request struct {
 	// source, inlineData...) as raw bytes, escapes included. A body that isn't
 	// a JSON object is ceil(bytes / 4).
 	InputEstimate int64
+	// InputReserve is the budget's conservative counterpart to InputEstimate:
+	// the same guess, with the text divided by 3 where the rate limiter's
+	// divides by 4, so it is never the smaller of the two. It is
+	// ceil((body bytes - media payload bytes) / 3) + 1,600 for each media part,
+	// the parts and payloads being those InputEstimate counts. A body that isn't
+	// a JSON object is ceil(bytes / 3).
+	InputReserve int64
 	// OutputCap is the output limit the client set, times the number of
 	// choices it asked for (n, candidateCount); 0 when it set none.
 	OutputCap int64
@@ -73,9 +80,9 @@ func RequestFrom(ctx context.Context) (*Request, bool) {
 // nothing is rewritten, the provider receives the client's exact bytes. A body
 // that isn't JSON is forwarded unchanged for the provider to reject.
 //
-// It also records the request's InputEstimate, OutputCap, Choices and
-// ZeroTemperature. They are read from the client's bytes and never change the
-// body.
+// It also records the request's InputEstimate, InputReserve, OutputCap, Choices
+// and ZeroTemperature. They are read from the client's bytes and never change
+// the body.
 //
 // It expects the provider-relative path, after StripPrefix: Gemini keeps the
 // model and the stream flag in the URL.
@@ -100,7 +107,7 @@ func ReadBody(format provider.Format, maxBytes int64) func(http.Handler) http.Ha
 			decoded := json.Unmarshal(body, &fields) == nil
 			// Before the rewrite below, so they describe the client's request.
 			// fields is nil unless the body is a JSON object.
-			req.InputEstimate, req.OutputCap, req.Choices = estimate(format, body, fields)
+			req.InputEstimate, req.InputReserve, req.OutputCap, req.Choices = estimate(format, body, fields)
 			req.ZeroTemperature = zeroTemperature(format, fields)
 			if decoded {
 				req.Model, req.Stream = modelAndStream(format, r.URL.Path, fields)

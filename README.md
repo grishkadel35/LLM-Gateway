@@ -30,6 +30,14 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **What budgets will reserve, and rebuild from.** Week 5's budgets reserve
+  the most a request could cost before it reaches a paid provider.
+  - The body owner now records a second, conservative input estimate for
+    them: text at 3 bytes a token instead of the rate limiter's 4. Each image,
+    audio or document part still counts as 1,600 tokens.
+  - The usage writer now keeps, for each tenant, the cost of rows it has
+    queued but not yet inserted. If Redis loses a budget, the budget is
+    rebuilt from Postgres, and these rows are counted too.
 - **A request that never reached its provider costs nothing.** When the
   gateway can't connect at all (a DNS failure, a refused connection, a dial
   timeout), the request never left it. Its usage row now costs 0 instead of

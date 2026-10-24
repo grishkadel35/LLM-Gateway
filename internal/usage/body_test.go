@@ -277,6 +277,65 @@ func TestReadBodyEstimatesClientBytes(t *testing.T) {
 	}
 }
 
+// TestReadBodyRecordsInputReserve: the budget reserves from its own input
+// estimate, the same scan as InputEstimate with the text divided by 3. Recording
+// it never rewrites the body.
+func TestReadBodyRecordsInputReserve(t *testing.T) {
+	openAI := `{"model":"gpt-4o","max_tokens":100,"n":2,"messages":[{"role":"user","content":"hi"}]}`
+	anthropic := `{"model":"claude-sonnet-4","max_tokens":512,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]}]}`
+	gemini := `{"contents":[{"parts":[{"text":"hi"}]}],"generation_config":{"max_output_tokens":300,"candidate_count":2}}`
+	malformed := `{"model":"gpt-4o","max_tokens":100`
+
+	cases := []struct {
+		name       string
+		format     provider.Format
+		path, body string
+		reserve    int64
+	}{
+		{"openai", provider.FormatOpenAI, "/v1/chat/completions", openAI, ceilThird(len(openAI))},
+		// The image's payload is left out of the /3, and the part costs a flat
+		// 1,600 tokens.
+		{"anthropic with an image", provider.FormatAnthropic, "/v1/messages", anthropic,
+			1600 + ceilThird(len(anthropic)-len(`{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}`))},
+		{"gemini", provider.FormatGemini, "/v1beta/models/gemini-3.8-flash:generateContent", gemini, ceilThird(len(gemini))},
+		{"malformed", provider.FormatOpenAI, "/v1/chat/completions", malformed, ceilThird(len(malformed))},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, got := serveBody(t, tc.format, limit, tc.path, tc.body)
+			if got.req == nil {
+				t.Fatal("RequestFrom() found nothing")
+			}
+			if got.req.InputReserve != tc.reserve {
+				t.Errorf("InputReserve = %d, want %d", got.req.InputReserve, tc.reserve)
+			}
+			if got.req.InputReserve < got.req.InputEstimate {
+				t.Errorf("InputReserve = %d, below InputEstimate = %d", got.req.InputReserve, got.req.InputEstimate)
+			}
+			if got.body != tc.body {
+				t.Errorf("forwarded body = %q, want the client's bytes %q", got.body, tc.body)
+			}
+		})
+	}
+}
+
+// TestReadBodyReservesClientBytes: forcing include_usage on adds bytes to the
+// forwarded body but nothing to the prompt, so InputReserve counts what the
+// client sent, as InputEstimate does.
+func TestReadBodyReservesClientBytes(t *testing.T) {
+	body := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	_, got := serveBody(t, provider.FormatOpenAI, limit, "/v1/chat/completions", body)
+
+	if ceilThird(len(got.body)) == ceilThird(len(body)) {
+		t.Fatalf("forwarded body is %d bytes against the client's %d; want the include_usage rewrite to make a difference here", len(got.body), len(body))
+	}
+	if want := ceilThird(len(body)); got.req.InputReserve != want {
+		t.Errorf("InputReserve = %d, want %d, counted from the client's %d bytes", got.req.InputReserve, want, len(body))
+	}
+}
+
 // TestReadBodyRecordsZeroTemperature: the response cache serves only requests
 // that ask for temperature 0, so ReadBody records whether the client's body
 // sets exactly that, where its format keeps it. Reading it never rewrites the

@@ -17,25 +17,32 @@ import (
 const mediaPartTokens = 1600
 
 // estimate sizes a request before any provider has counted it: the values for
-// Request.InputEstimate, Request.OutputCap and Request.Choices. fields is the
-// body decoded into its top-level keys, nil when the body isn't a JSON object.
-// It only reads the body.
-func estimate(format provider.Format, body []byte, fields map[string]json.RawMessage) (inputEstimate, outputCap, choices int64) {
+// Request.InputEstimate, Request.InputReserve, Request.OutputCap and
+// Request.Choices. fields is the body decoded into its top-level keys, nil when
+// the body isn't a JSON object. It only reads the body.
+func estimate(format provider.Format, body []byte, fields map[string]json.RawMessage) (inputEstimate, inputReserve, outputCap, choices int64) {
 	if fields == nil {
-		return textTokens(int64(len(body))), 0, 1
+		return textTokens(int64(len(body))), reserveTokens(int64(len(body))), 0, 1
 	}
 
 	// fields decoded, so the body is valid JSON nested at most 10,000 deep,
 	// which is all scanMedia needs. The payloads it finds are separate pieces
-	// of the body, so they never add up to more than the body.
+	// of the body, so they never add up to more than the body. Both input
+	// estimates come from this one scan.
 	found := scanMedia(format, body)
 	outputCap, choices = outputLimit(format, fields)
-	return textTokens(int64(len(body))-found.payload) + mediaPartTokens*found.parts, outputCap, choices
+	text := int64(len(body)) - found.payload
+	media := mediaPartTokens * found.parts
+	return textTokens(text) + media, reserveTokens(text) + media, outputCap, choices
 }
 
 // textTokens estimates the tokens in n bytes of text: about 4 bytes each,
 // rounded up.
 func textTokens(n int64) int64 { return (n + 3) / 4 }
+
+// reserveTokens is textTokens for the budget, which would rather reserve too
+// much than too little: about 3 bytes a token, rounded up.
+func reserveTokens(n int64) int64 { return (n + 2) / 3 }
 
 // mediaCount tallies media parts and the bytes of their payloads.
 type mediaCount struct {

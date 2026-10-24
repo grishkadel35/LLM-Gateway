@@ -64,6 +64,11 @@ type Writer struct {
 	closed  bool
 	done    chan struct{}
 	dropped atomic.Int64
+
+	// pendingMu guards pending: the cost of each tenant's rows that Write has
+	// queued and no insert has finished with, by tenant ID.
+	pendingMu sync.Mutex
+	pending   map[string]int64
 }
 
 // NewWriter returns a running Writer. Close it on shutdown to flush what is
@@ -82,6 +87,7 @@ func newWriter(db *sql.DB, logger *slog.Logger, queue, batch int, every time.Dur
 		batchSize:  batch,
 		flushEvery: every,
 		done:       make(chan struct{}),
+		pending:    make(map[string]int64),
 	}
 }
 
@@ -94,10 +100,14 @@ func (w *Writer) Write(r Row) {
 	defer w.mu.RUnlock()
 
 	if !w.closed {
+		// Counted before it is queued: once it is, a flush can finish with it
+		// at any moment, and Pending must not have missed it by then.
+		w.adjustPending(1, r)
 		select {
 		case w.rows <- r:
 			return
 		default:
+			w.adjustPending(-1, r) // dropped below, so it isn't pending after all
 		}
 	}
 	w.dropped.Add(1)
@@ -106,6 +116,37 @@ func (w *Writer) Write(r Row) {
 
 // Dropped reports how many rows Write has dropped.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
+
+// Pending returns the cost, in micro-dollars, of the tenant's rows that Write
+// has queued and no insert has finished with. A row counts from Write until its
+// insert commits, or until the writer gives it up (usage row lost). A row with
+// no cost adds nothing, and a row Write drops is not left counted.
+//
+// The budget ledger reads it when it rebuilds a tenant's monthly spend, before
+// it sums usage_logs: a batch that commits between the two reads is then counted
+// twice, never missed. It covers the tenant's whole queue, whatever month its
+// rows belong to, so near a month boundary a row from the previous month can
+// still count, which only over-counts.
+func (w *Writer) Pending(tenantID string) int64 {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	return w.pending[tenantID]
+}
+
+// adjustPending adds sign times the cost of each of rows to its tenant's
+// pending total: 1 when Write queues a row, -1 when an insert has finished with
+// it or Write drops it after all. A row with no cost changes nothing.
+func (w *Writer) adjustPending(sign int64, rows ...Row) {
+	w.pendingMu.Lock()
+	defer w.pendingMu.Unlock()
+
+	for _, r := range rows {
+		if r.CostMicros != nil {
+			w.pending[r.TenantID] += sign * *r.CostMicros
+		}
+	}
+}
 
 // Close stops accepting rows and waits until everything queued is written,
 // or until ctx ends.
@@ -155,17 +196,21 @@ const rowColumns = 17
 
 // flush writes batch as one multi-row INSERT. If Postgres rejects it, each
 // row is retried on its own, so one bad row costs only itself, not the other
-// rows (other tenants' included) that happened to share its batch.
+// rows (other tenants' included) that happened to share its batch. A row stops
+// counting toward Pending once its insert has committed or it is given up, and
+// not before.
 func (w *Writer) flush(batch []Row) {
 	if len(batch) == 0 {
 		return
 	}
 	err := w.insert(batch)
 	if err == nil {
+		w.adjustPending(-1, batch...)
 		return
 	}
 	if len(batch) == 1 {
 		w.logger.Error("usage row lost: insert failed", "request_id", batch[0].RequestID, "error", err)
+		w.adjustPending(-1, batch...)
 		return
 	}
 	w.logger.Warn("usage batch insert failed; retrying rows one by one", "rows", len(batch), "error", err)
@@ -173,6 +218,7 @@ func (w *Writer) flush(batch []Row) {
 		if err := w.insert([]Row{r}); err != nil {
 			w.logger.Error("usage row lost: insert failed", "request_id", r.RequestID, "tenant_id", r.TenantID, "error", err)
 		}
+		w.adjustPending(-1, r) // committed, or lost just above
 	}
 }
 

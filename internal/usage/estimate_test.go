@@ -16,11 +16,23 @@ import (
 func estimateOf(format provider.Format, body string) (inputEstimate, outputCap, choices int64) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal([]byte(body), &fields) // stays nil unless body is a JSON object
-	return estimate(format, []byte(body), fields)
+	inputEstimate, _, outputCap, choices = estimate(format, []byte(body), fields)
+	return inputEstimate, outputCap, choices
+}
+
+// reserveOf is estimateOf for Request.InputReserve.
+func reserveOf(format provider.Format, body string) int64 {
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal([]byte(body), &fields)
+	_, inputReserve, _, _ := estimate(format, []byte(body), fields)
+	return inputReserve
 }
 
 // ceilQuarter is ceil(n / 4), written the way the estimate's rule words it.
 func ceilQuarter(n int) int64 { return int64(math.Ceil(float64(n) / 4)) }
+
+// ceilThird is ceil(n / 3), written the way the reserve's rule words it.
+func ceilThird(n int) int64 { return int64(math.Ceil(float64(n) / 3)) }
 
 // lenSum is the total length of ss.
 func lenSum(ss []string) int {
@@ -407,6 +419,119 @@ func FuzzScanMediaStrings(f *testing.F) {
 			}
 		}
 	})
+}
+
+// nonObjectBodies have no fields to read and no parts to find.
+var nonObjectBodies = []struct {
+	name string
+	body string
+}{
+	{"truncated JSON", `{"model":"gpt-4o","max_tokens":100,"messages":[`},
+	{"array", `[{"type":"image","source":{"type":"base64","data":"AAAA"}}]`},
+	{"string", `"hello"`},
+	{"null", `null`},
+	{"not JSON", `model=gpt-4o&max_tokens=100`},
+	{"empty", ``},
+}
+
+// TestEstimateReserveTextBody: InputReserve is the budget's counterpart to
+// InputEstimate. In a body with no media, every byte counts, three to a token
+// where InputEstimate counts four.
+func TestEstimateReserveTextBody(t *testing.T) {
+	for _, tc := range textBodyCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, want := reserveOf(tc.format, tc.body), ceilThird(len(tc.body)); got != want {
+				t.Errorf("InputReserve = %d, want ceil(%d / 3) = %d", got, len(tc.body), want)
+			}
+		})
+	}
+
+	// 7 bytes are 3 tokens, where /4 gives 2.
+	if got := reserveOf(provider.FormatOpenAI, `{"a":1}`); got != 3 {
+		t.Errorf("InputReserve of 7 bytes = %d, want 3", got)
+	}
+
+	// Every length rounds up, as a JSON object and as plain text.
+	for n := range 64 {
+		text := strings.Repeat("x", n)
+		for _, body := range []string{text, `{"a":"` + text + `"}`} {
+			if got, want := reserveOf(provider.FormatOpenAI, body), ceilThird(len(body)); got != want {
+				t.Errorf("InputReserve of %d bytes = %d, want %d", len(body), got, want)
+			}
+		}
+	}
+}
+
+// TestEstimateReserveMediaParts: each media part costs 1,600 tokens, as it does
+// for InputEstimate, and its payload is left out of the /3.
+func TestEstimateReserveMediaParts(t *testing.T) {
+	for _, tc := range mediaPartCases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := 1600*tc.parts + ceilThird(len(tc.body)-lenSum(tc.payload))
+			if got := reserveOf(tc.format, tc.body); got != want {
+				t.Errorf("InputReserve = %d, want %d (%d media parts)", got, want, tc.parts)
+			}
+		})
+	}
+}
+
+// TestEstimateReservePartsOfOtherFormats: a format's part shapes mean nothing in
+// another format's body, so there they are text like the rest.
+func TestEstimateReservePartsOfOtherFormats(t *testing.T) {
+	for _, tc := range mediaPartCases {
+		for _, format := range provider.Formats {
+			if format == tc.format {
+				continue
+			}
+			t.Run(tc.name+" as "+string(format), func(t *testing.T) {
+				if got, want := reserveOf(format, tc.body), ceilThird(len(tc.body)); got != want {
+					t.Errorf("InputReserve = %d, want ceil(%d / 3) = %d", got, len(tc.body), want)
+				}
+			})
+		}
+	}
+}
+
+// TestEstimateReserveNonObjectBody: a body that isn't a JSON object is
+// estimated as plain text in every format, parts and all.
+func TestEstimateReserveNonObjectBody(t *testing.T) {
+	for _, tc := range nonObjectBodies {
+		for _, format := range provider.Formats {
+			t.Run(tc.name+" as "+string(format), func(t *testing.T) {
+				if got, want := reserveOf(format, tc.body), ceilThird(len(tc.body)); got != want {
+					t.Errorf("InputReserve = %d, want ceil(%d / 3) = %d", got, len(tc.body), want)
+				}
+			})
+		}
+	}
+}
+
+// TestEstimateReserveNeverBelowEstimate: the budget reserves at least what the
+// rate limiter charges, whatever the body and whichever format reads it.
+func TestEstimateReserveNeverBelowEstimate(t *testing.T) {
+	var bodies []string
+	for _, tc := range mediaPartCases {
+		bodies = append(bodies, tc.body)
+	}
+	for _, tc := range textBodyCases {
+		bodies = append(bodies, tc.body)
+	}
+	for _, tc := range nonObjectBodies {
+		bodies = append(bodies, tc.body)
+	}
+	for n := range 64 {
+		text := strings.Repeat("x", n)
+		bodies = append(bodies, text, `{"a":"`+text+`"}`)
+	}
+
+	for _, body := range bodies {
+		for _, format := range provider.Formats {
+			input, _, _ := estimateOf(format, body)
+			if reserve := reserveOf(format, body); reserve < input {
+				t.Errorf("as %s: InputReserve = %d, below InputEstimate = %d, for %.80s", format, reserve, input, body)
+			}
+		}
+	}
 }
 
 // TestOutputCap: the client's own output limit, from the field each format
