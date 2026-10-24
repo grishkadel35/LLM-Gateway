@@ -1038,8 +1038,9 @@ func TestRateLimitClientLeavesMidStream(t *testing.T) {
 
 // TestRateLimitUnansweredRefundsNothing: a provider that never answered may
 // still have received the request and billed it, so the charge stands. That
-// is 502 when the provider is unreachable, 504 when it times out, and 499
-// when the client gives up first.
+// is 502 when the connection drops after the request went out, 504 when the
+// provider times out, and 499 when the client gives up first. A request that
+// never went out is refunded: TestRateLimitRefundsAFailedDial.
 func TestRateLimitUnansweredRefundsNothing(t *testing.T) {
 	check := func(t *testing.T, limiter *fakeLimiter, rec *httptest.ResponseRecorder, status int) {
 		t.Helper()
@@ -1052,9 +1053,15 @@ func TestRateLimitUnansweredRefundsNothing(t *testing.T) {
 	}
 
 	t.Run("502", func(t *testing.T) {
+		// Takes the request, then closes the connection without a word.
+		dropper := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				conn.Close()
+			}
+		}))
+		t.Cleanup(dropper.Close)
 		limiter := &fakeLimiter{allowed: true}
-		// Port 1 on loopback: nothing listens there.
-		r := routerFor(t, fmt.Sprintf(ollamaConfig, "http://127.0.0.1:1"), nil, limiter)
+		r := routerFor(t, fmt.Sprintf(ollamaConfig, dropper.URL), nil, limiter)
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
 		check(t, limiter, rec, http.StatusBadGateway)
@@ -1079,6 +1086,24 @@ func TestRateLimitUnansweredRefundsNothing(t *testing.T) {
 		cancel()
 		check(t, limiter, receive(t, done, "the response"), proxy.StatusClientClosedRequest)
 	})
+}
+
+// TestRateLimitRefundsAFailedDial: a request whose dial failed never reached
+// the provider, so it cost no tokens, and its whole charge comes back.
+func TestRateLimitRefundsAFailedDial(t *testing.T) {
+	limiter := &fakeLimiter{allowed: true}
+	// Port 1 on loopback: nothing listens there, so the dial is refused.
+	r := routerFor(t, fmt.Sprintf(ollamaConfig, "http://127.0.0.1:1"), nil, limiter)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, chatRequest("ollama", "qwen3.5:9b"))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	calls, adjusts := limiter.recorded()
+	if len(calls) != 1 || len(adjusts) != 1 || adjusts[0].delta != calls[0].cost {
+		t.Errorf("Allow calls %+v, Adjust calls %+v; want one Allow, refunded in full", calls, adjusts)
+	}
 }
 
 // TestRateLimitNeverSettlesUnadmitted: a request the gateway refused, at the

@@ -4,8 +4,10 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -675,14 +677,11 @@ func TestBusyProviderIs503(t *testing.T) {
 }
 
 // TestFailedRequestsAreMetered: a request that got no response may still
-// have reached the provider, and be billed (a timeout or a client giving up
-// after the provider started generating). Each one is reported to onUsage,
-// marked incomplete, so it leaves a row with unknown cost rather than none.
+// have reached the provider, and be billed (a response-header timeout or a
+// client giving up after the provider started generating). Each one is
+// reported to onUsage, marked incomplete, so it leaves a row with unknown cost
+// rather than none. A failed dial is the exception: TestFailedDialCostsNothing.
 func TestFailedRequestsAreMetered(t *testing.T) {
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	deadURL := dead.URL
-	dead.Close()
-
 	release := make(chan struct{})
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
 	defer slow.Close()
@@ -695,8 +694,7 @@ func TestFailedRequestsAreMetered(t *testing.T) {
 		cancel     bool
 		wantStatus int
 	}{
-		{"unreachable", deadURL, 5 * time.Second, false, http.StatusBadGateway},
-		{"timeout", slow.URL, 50 * time.Millisecond, false, http.StatusGatewayTimeout},
+		{"response-header timeout", slow.URL, 50 * time.Millisecond, false, http.StatusGatewayTimeout},
 		{"client cancel", slow.URL, 5 * time.Second, true, StatusClientClosedRequest},
 	}
 	for _, tc := range cases {
@@ -719,6 +717,67 @@ func TestFailedRequestsAreMetered(t *testing.T) {
 			}
 			if got[0].Status != tc.wantStatus || got[0].Complete || got[0].Usage.Tokens() != 0 {
 				t.Errorf("result = %+v, want status %d, incomplete, no tokens", got[0], tc.wantStatus)
+			}
+		})
+	}
+}
+
+// TestFailedDialCostsNothing: a request whose dial failed never left the
+// gateway, so the provider can't have billed it. The client gets the error it
+// always did, and onUsage hears a complete result with no tokens, which is how
+// the request's row comes to cost 0 instead of unknown.
+func TestFailedDialCostsNothing(t *testing.T) {
+	// Nothing listens on a port whose listener has closed: it refuses the
+	// connection.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	// A dial whose deadline has passed times out before it connects. That is
+	// the error a dial gets after dialTimeout, without waiting that long or
+	// needing an address that never answers.
+	expired := &http.Transport{DialContext: (&net.Dialer{Deadline: time.Now().Add(-time.Second)}).DialContext}
+
+	// A resolver that can reach no DNS server fails every lookup at once, as
+	// a real one does for a name under .invalid (RFC 6761), but without the
+	// network: a real lookup that hung would run into dialTimeout instead.
+	noDNS := &http.Transport{DialContext: (&net.Dialer{Resolver: &net.Resolver{
+		PreferGo: true,
+		Dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("no DNS server in this test")
+		},
+	}}).DialContext}
+
+	cases := []struct {
+		name       string
+		url        string
+		transport  http.RoundTripper // nil: the proxy's own
+		wantStatus int
+		wantType   string // the error type the client gets
+	}{
+		{"connection refused", deadURL, nil, http.StatusBadGateway, "upstream_unavailable"},
+		{"unresolvable host", "http://gateway-test.invalid", noDNS, http.StatusBadGateway, "upstream_unavailable"},
+		{"dial timeout", deadURL, expired, http.StatusGatewayTimeout, "upstream_timeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []usage.Result
+			h := New(testProvider(t, tc.url), discardLogger(), func(_ context.Context, r usage.Result) { got = append(got, r) })
+			if tc.transport != nil {
+				h.Transport = tc.transport
+			}
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+			if rec.Code != tc.wantStatus || !strings.Contains(rec.Body.String(), tc.wantType) {
+				t.Errorf("client got %d %s, want %d with a %s error", rec.Code, rec.Body, tc.wantStatus, tc.wantType)
+			}
+			if len(got) != 1 {
+				t.Fatalf("onUsage ran %d times, want once", len(got))
+			}
+			if got[0].Status != tc.wantStatus || !got[0].Complete || got[0].Usage.Tokens() != 0 {
+				t.Errorf("result = %+v, want status %d, complete, no tokens", got[0], tc.wantStatus)
 			}
 		})
 	}

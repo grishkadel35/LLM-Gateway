@@ -147,9 +147,11 @@ const StatusClientClosedRequest = 499
 // concurrency slot free). Without it, ReverseProxy logs to stderr and returns
 // a bare 502 with an empty body; clients deserve JSON.
 //
-// Each upstream failure is also reported to onUsage: the provider may have
-// received the request and billed it, so it must leave a usage row, with
-// unknown cost.
+// Each upstream failure is also reported to onUsage, so it leaves a usage row.
+// The provider may have received the request and billed it, so the report is
+// incomplete, with unknown cost. The exception is a failed dial: the request
+// never left the gateway, so its report is complete, with no usage, and costs
+// nothing.
 func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callback) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
 		// modifyResponse handed the response to the fallback, metered.
@@ -194,7 +196,11 @@ func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callba
 		}
 
 		if onUsage != nil {
-			onUsage(r.Context(), usage.Unanswered(r.Context(), status))
+			res := usage.Unanswered(r.Context(), status)
+			// A failed dial never reached the provider, so it cost nothing. Any
+			// other failure may have been billed, and stays incomplete.
+			res.Complete = failedDial(err)
+			onUsage(r.Context(), res)
 		}
 
 		// With a fallback armed, it answers instead: nothing is written here.
@@ -231,6 +237,24 @@ func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callba
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
+}
+
+// failedDial reports whether err is a failed dial: a DNS failure, a refused
+// connection, or a dial timeout. The gateway never connected, so the request
+// never left it.
+//
+// One rare case is miscounted, and accepted. Go's transport resends a request
+// that carries an Idempotency-Key header when a reused connection drops after
+// sending it, and if that resend's dial fails, the error is a dial error
+// although the provider may have received the first send.
+//
+// Go note: errors.As takes a pointer to a variable of the type to find. That
+// type is itself a pointer here, *net.OpError, so the target is &oe, a
+// **net.OpError. errors.As sets oe to the first error in the chain of that
+// type and reports whether there was one.
+func failedDial(err error) bool {
+	var oe *net.OpError
+	return errors.As(err, &oe) && oe.Op == "dial"
 }
 
 // Fixed bounds on connection setup. They are short and independent of the

@@ -30,6 +30,14 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **A request that never reached its provider costs nothing.** When the
+  gateway can't connect at all (a DNS failure, a refused connection, a dial
+  timeout), the request never left it. Its usage row now costs 0 instead of
+  NULL, and the rate limiter refunds its whole charge. Week 5's budgets will
+  refund it the same way, so a network outage can't spend a budget. Any other
+  request that got no answer (a timeout, a connection dropped after sending, a
+  client gone) still keeps its charge and leaves a row with no cost, since the
+  provider may have billed it.
 - **A tenant's limits can be changed over the admin API.**
   `PATCH /admin/tenants/{id}` sets any of `budget_micros`,
   `rate_limit_tokens_per_min` and `default_max_tokens`, and returns the

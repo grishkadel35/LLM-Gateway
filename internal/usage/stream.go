@@ -87,9 +87,10 @@ func Meter(resp *http.Response, format provider.Format, done Callback) {
 }
 
 // Unanswered is the Result for a request that got no response from the
-// provider: a timeout, an unreachable provider, or a client that gave up
-// first. The provider may still have received and billed it, so it is
-// reported as incomplete, with unknown usage.
+// provider: a timeout, a dropped connection, or a client that gave up first.
+// The provider may still have received and billed it, so it is reported as
+// incomplete, with unknown usage. The proxy marks it complete when its dial
+// failed: such a request never left the gateway, so it cost nothing.
 func Unanswered(ctx context.Context, status int) Result {
 	r := Result{Status: status}
 	if req, ok := RequestFrom(ctx); ok {
