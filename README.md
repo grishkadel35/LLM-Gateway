@@ -38,6 +38,14 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
   - The usage writer now keeps, for each tenant, the cost of rows it has
     queued but not yet inserted. If Redis loses a budget, the budget is
     rebuilt from Postgres, and these rows are counted too.
+  - The price table now records each model's maximum output, taken from its
+    provider's model page. `pricing.Reserve` prices the most a request could
+    cost:
+    - **Input:** at the model's dearest input rate, so a prompt the provider
+      writes to its prompt cache is covered.
+    - **Output:** at the client's own cap. With no cap, or a cap above the
+      model's maximum, the model's maximum output, the most it can actually
+      answer.
 - **A request that never reached its provider costs nothing.** When the
   gateway can't connect at all (a DNS failure, a refused connection, a dial
   timeout), the request never left it. Its usage row now costs 0 instead of
