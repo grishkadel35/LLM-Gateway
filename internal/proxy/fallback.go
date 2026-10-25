@@ -64,7 +64,8 @@ func armedFrom(ctx context.Context) *armed {
 //
 // Fallback goes inside ReadBody: it reads the request's model and stream flag
 // from it, and replays the body it made replayable. target is a provider's
-// plain proxy, so auth and ReadBody don't run twice.
+// own proxy (budgeted, when there are budgets), not its whole route, so auth
+// and ReadBody don't run twice.
 func Fallback(from string, primary http.Handler, to string, target http.Handler, models map[string]string, onFallback func(from, to, reason string), logger *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		pw := &providerWriter{ResponseWriter: w, provider: from, fallback: "false"}

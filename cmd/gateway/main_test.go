@@ -176,7 +176,7 @@ providers:
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
 
-	r, err := router(cfg, store, testAdminKey, nil, limiter, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, store, testAdminKey, nil, limiter, nil, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -888,7 +888,7 @@ const mockTokens = mockprovider.PromptTokens + mockprovider.OutputTokens
 // limited by limiter.
 func limitedMockRouter(t *testing.T, limiter middleware.Limiter, logger *slog.Logger) http.Handler {
 	t.Helper()
-	r, err := router(mockConfig(t), fakeStore{}, testAdminKey, nil, limiter, nil, metrics.New(), nil, logger)
+	r, err := router(mockConfig(t), fakeStore{}, testAdminKey, nil, limiter, nil, nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -1328,7 +1328,7 @@ func newHeldGateway(t *testing.T, tokens int64) *heldGateway {
 	store := ownTenant{id: "tn_test_" + rand.Text()}
 	var logs lockedBuffer
 	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	g.Handler, err = router(cfg, store, testAdminKey, nil, ratelimit.New(rdb), nil, metrics.New(), nil, logger)
+	g.Handler, err = router(cfg, store, testAdminKey, nil, ratelimit.New(rdb), nil, nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -1609,7 +1609,7 @@ func newMockRouter(t *testing.T) (http.Handler, func() []meteredCall) {
 		calls = append(calls, meteredCall{provider, r})
 	}
 
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, nil, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, nil, nil, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -1742,7 +1742,7 @@ func TestUsageRowsThroughGateway(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, nil, metrics.New(), nil, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, nil, nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1862,7 +1862,7 @@ func TestEveryFormatLandsAPricedRow(t *testing.T) {
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	writer := usage.NewWriter(conn, logger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, nil, metrics.New(), nil, logger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, logger), nil, nil, nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

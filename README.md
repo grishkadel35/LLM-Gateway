@@ -16,7 +16,7 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-24
+**Last updated:** 2026-10-25
 **Stage:** Weeks 1 to 4 of 8 complete, checkpoints closed; Week 5
 (per-tenant budgets) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
@@ -30,6 +30,32 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **A paid request is refused when its tenant's budget can't cover it.**
+  Before each attempt on a paid provider, the gateway reserves the most the
+  attempt could cost in the tenant's ledger. If that doesn't fit what is left
+  of the month's budget, the attempt is refused. Settlement isn't wired in
+  yet. Until it is, each reservation stays in the month's spend, so a budget
+  fills at the reservation rate, not the real cost. A ledger rebuilt after a
+  Redis restart starts again from the real costs in `usage_logs`.
+  - A request that doesn't fit gets `402 budget_exceeded` before its
+    provider sees it. On a route without a fallback, the rate limiter
+    refunds its whole charge.
+    - The error carries `budget_micros`, `spent_micros`, `remaining_micros`,
+      `reserve_micros`, `period` and `resets_at`.
+    - Its message, in dollars, says what would help: waiting for the reset, a
+      lower output cap, or, on a $0 budget, a free provider.
+  - A model the price table lacks gets `400 unknown_model`, naming the
+    provider and the model, and so does a request that names no model.
+    - An OpenAI- or Anthropic-format body that isn't JSON names no model, so
+      it gets this 400 too. Until now the provider rejected it.
+  - Budgets fail closed: when Redis or Postgres can't answer, a paid request
+    gets `503 budget_unavailable`.
+  - Free providers (Ollama) and cache hits never touch the budget. On the
+    ollama → groq fallback, only groq's attempt reserves, at groq's price for
+    the model the fallback maps to.
+  - The first reservation that takes a tenant's spend to 80% of its budget
+    logs a Warn. That happens once a month, and again only if the ledger is
+    rebuilt.
 - **What budgets will reserve, and rebuild from.** Week 5's budgets reserve
   the most a request could cost before it reaches a paid provider.
   - The body owner now records a second, conservative input estimate for
@@ -47,7 +73,7 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
       model's maximum, the model's maximum output, the most it can actually
       answer.
   - `internal/budget` keeps each tenant's spend for the month in Redis, one
-    hash per tenant and month. It isn't wired into requests yet.
+    hash per tenant and month.
     - One Lua script checks and reserves atomically, so two requests can't
       both take the last of a budget. Another script settles each reservation
       to the real cost.

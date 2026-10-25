@@ -125,7 +125,7 @@ func cachedRouter(t *testing.T, upstream string, store middleware.CacheStore, li
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, nil, limiter, store, metrics.New(), nil, logger)
+	r, err := router(cfg, fakeStore{}, testAdminKey, nil, limiter, store, nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestCacheHitUsageRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := usage.NewWriter(conn, discardLogger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, discardLogger), nil, &fakeCache{}, metrics.New(), nil, discardLogger)
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, discardLogger), nil, &fakeCache{}, nil, metrics.New(), nil, discardLogger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -757,7 +757,7 @@ func fallbackRouter(t *testing.T, ollama, groq string, store middleware.CacheSto
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, nil, nil, store, metrics.New(), nil, discardLogger)
+	r, err := router(cfg, fakeStore{}, testAdminKey, nil, nil, store, nil, metrics.New(), nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -904,7 +904,7 @@ func newCacheGateway(t *testing.T, upstream string) *cacheGateway {
 	// An entry lasts a minute: far longer than any test here takes, and the
 	// shared Redis is rid of it soon after.
 	r, err := router(mockConfigAt(t, upstream), g.store, testAdminKey, recordUsage(g.writer, nil, logger),
-		g.limiter, cache.New(rdb, time.Minute), metrics.New(), nil, logger)
+		g.limiter, cache.New(rdb, time.Minute), nil, metrics.New(), nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}

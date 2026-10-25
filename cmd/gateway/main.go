@@ -25,6 +25,7 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/admin"
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/cache"
 	"github.com/grishkadel/llm-gateway/internal/concurrency"
 	"github.com/grishkadel/llm-gateway/internal/config"
@@ -82,15 +83,15 @@ type stores struct {
 }
 
 // router builds the gateway's handler: one reverse proxy per configured
-// provider behind tenant auth, the response cache and rate limiting, the
-// admin API behind the admin key, /health, /metrics, and a catch-all that
+// provider behind tenant auth, the response cache, rate limiting and budgets,
+// the admin API behind the admin key, /health, /metrics, and a catch-all that
 // rejects unknown prefixes, all behind the request ID and logging middleware.
-// A nil limiter means no rate limiting, and a nil cacheStore no response
-// cache.
+// A nil limiter means no rate limiting, a nil cacheStore no response cache,
+// and a nil ledger no budgets.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, ledger middleware.Ledger, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -111,9 +112,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 
 	tenantAuth := middleware.Auth(store, logger)
 
-	// Every provider's proxy first, so a route can hand a failed request to
-	// its fallback's. Each provider's meter is kept too, for its route's
-	// cache to report hits to.
+	// Every provider's proxy first, budgeted when there are budgets, so a
+	// route can hand a failed request to its fallback's. Each provider's
+	// meter is kept too, for its route's cache to report hits to.
 	proxies := make(map[string]http.Handler, len(providers))
 	meters := make(map[string]usage.Callback, len(providers))
 	for _, p := range providers {
@@ -134,6 +135,12 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			rp.Transport = concurrency.Limit(rp.Transport, p.MaxConcurrency, p.QueueTimeout, m.ConcurrencyWait(p.Name))
 		}
 		proxies[p.Name] = rp
+		// Budget wraps the proxy itself, so each attempt is reserved at the
+		// prices of the provider that serves it, on its own route or as
+		// another's fallback.
+		if ledger != nil {
+			proxies[p.Name] = middleware.Budget(ledger, p.Name, cfg.Providers[p.Name].Free, logger)(rp)
+		}
 		meters[p.Name] = meter
 	}
 
@@ -150,8 +157,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		// from, and ReadBody takes ownership of the body. Both run after
 		// StripPrefix, so they see the provider-relative path.
 		h := proxies[p.Name]
-		// A fallback retries on the target's plain proxy: the request has
-		// already passed auth and ReadBody, which serve the target as well.
+		// A fallback retries on the target's proxy, budgeted at the target's
+		// prices: the request has already passed auth and ReadBody, which
+		// serve the target as well.
 		if fb := cfg.Providers[p.Name].Fallback; fb.Enabled {
 			h = proxy.Fallback(p.Name, h, fb.Provider, proxies[fb.Provider], fb.Models, m.Fallback, logger)
 		}
@@ -162,10 +170,10 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			h = middleware.RateLimit(limiter, logger)(h)
 		}
 		// The cache keys ReadBody's body, so it goes inside ReadBody too. It
-		// wraps the rate limit, so a hit is never charged. A hit reports to
-		// the route's meter for its usage row, and for nothing else:
-		// ReportUsage finds no charge or pending miss on its request, and it
-		// has no tokens to count.
+		// wraps the rate limit, so a hit is never charged, nor reserved
+		// against a budget. A hit reports to the route's meter for its usage
+		// row, and for nothing else: ReportUsage finds no charge or pending
+		// miss on its request, and it has no tokens to count.
 		if cacheStore != nil {
 			// A hit never reaches Fallback, so on a route with one it is given
 			// the headers Fallback puts on every other response.
@@ -247,7 +255,7 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	checker := health.NewChecker(providers, m.ProviderUp, logger)
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), m, checker, logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), budget.New(rdb, conn, writer.Pending), m, checker, logger)
 	if err != nil {
 		return err
 	}
@@ -367,7 +375,8 @@ func openDB(dsn string) (*sql.DB, error) {
 }
 
 // openRedis connects to Redis and pings it, so a missing or unreachable
-// Redis stops startup instead of leaving every request unlimited.
+// Redis stops startup instead of leaving every request unlimited, and every
+// paid one refused.
 func openRedis(redisURL string) (*redis.Client, error) {
 	opts, err := redisOptions(redisURL)
 	if err != nil {
@@ -384,13 +393,14 @@ func openRedis(redisURL string) (*redis.Client, error) {
 	return rdb, nil
 }
 
-// redisOptions parses REDIS_URL into the client options the rate limiter
-// needs, whatever the URL asks for:
+// redisOptions parses REDIS_URL into the client options the rate limiter and
+// the budget ledger need, whatever the URL asks for:
 //   - ContextTimeoutEnabled, without which go-redis ignores context deadlines
 //     on the socket and waits out its own read timeout, so a hung Redis
 //     would hang every request.
-//   - MaxRetries -1, no retries: the rate limit scripts aren't idempotent,
-//     and a retry after a lost reply would charge or refund twice.
+//   - MaxRetries -1, no retries: the rate limit and budget scripts aren't
+//     idempotent, and a retry after a lost reply would charge, refund,
+//     reserve or settle twice.
 //
 // Its errors never quote the URL, which can carry a password.
 func redisOptions(redisURL string) (*redis.Options, error) {
