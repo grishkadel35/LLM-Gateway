@@ -31,7 +31,7 @@ import (
 // Price is a model's prices in micro-dollars per million tokens, one per
 // kind of token in usage.Usage. Each is its own number, not a multiplier of
 // Input: cache-read discounts differ by model (0.1x on most, 0.05x on Claude
-// Opus 5.5, 0.025x on Claude Fable 5.1).
+// Opus 5.5, 0.025x on Claude Fable 5.1 and Mythos 5.1).
 type Price struct {
 	Input        int64
 	Output       int64
@@ -85,6 +85,7 @@ func groq(in, out int64) Price {
 	return Price{Input: in, Output: out, CacheRead: in, CacheWrite: in, CacheWrite1h: in}
 }
 
+var dec2026 = time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
 var jan2027 = time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 
 var rates = []Rate{
@@ -133,8 +134,10 @@ var rates = []Rate{
 	{Provider: "openai", Model: "o4-mini", Price: openAI(1_100_000, 275_000, 1_100_000, 4_400_000), MaxOutput: 100_000},
 
 	// Anthropic. https://platform.claude.com/docs/en/about-claude/pricing
-	// (checked 2026-10-05). No long-context tier: Claude 4.6 and later bill
-	// the full 1M window at standard prices. IDs from
+	// (checked 2026-10-05; claude-mythos-5-1, claude-mythos-5 and
+	// claude-haiku-5-5, 2026-10-24). No long-context tier: Claude 4.6 and
+	// later bill the full 1M window at standard prices, except Haiku 5.5
+	// (below). IDs from
 	// https://platform.claude.com/docs/en/about-claude/models/overview;
 	// dateless from the 4.6 generation on, aliases before it. MaxOutput is
 	// "Max output" on the model page that overview links to
@@ -147,6 +150,11 @@ var rates = []Rate{
 	//                                                        in          5m write    1h write    read       out
 	{Provider: "anthropic", Model: "claude-fable-5-1", Price: anthropic(10_000_000, 12_500_000, 20_000_000, 250_000, 50_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-fable-5", Price: anthropic(10_000_000, 12_500_000, 20_000_000, 1_000_000, 50_000_000), MaxOutput: 128_000},
+	// Mythos is available only to organizations Anthropic has verified
+	// (models/mythos-5-1/overview, models/mythos-5/overview), at Fable's
+	// prices.
+	{Provider: "anthropic", Model: "claude-mythos-5-1", Price: anthropic(10_000_000, 12_500_000, 20_000_000, 250_000, 50_000_000), MaxOutput: 128_000},
+	{Provider: "anthropic", Model: "claude-mythos-5", Price: anthropic(10_000_000, 12_500_000, 20_000_000, 1_000_000, 50_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-opus-5-5", Price: anthropic(4_000_000, 5_000_000, 8_000_000, 200_000, 20_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-opus-5", Price: anthropic(5_000_000, 6_250_000, 10_000_000, 500_000, 25_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-opus-4-8", Price: anthropic(5_000_000, 6_250_000, 10_000_000, 500_000, 25_000_000), MaxOutput: 128_000},
@@ -162,16 +170,40 @@ var rates = []Rate{
 	// listed for it before then. A request for it now fails at Anthropic and
 	// is refunded, so the figure only has to cover an answer it can't give.
 	{Provider: "anthropic", Model: "claude-sonnet-4", Price: anthropic(3_000_000, 3_750_000, 6_000_000, 300_000, 15_000_000), MaxOutput: 64_000},
+	// Haiku 5.5 bills a prompt of over 100K tokens at the higher prices, cache
+	// reads and writes counted in it ("Long context pricing" on the pricing
+	// page).
+	{Provider: "anthropic", Model: "claude-haiku-5-5", Price: anthropic(100_000, 125_000, 200_000, 10_000, 500_000), MaxOutput: 128_000,
+		LongContextAbove: 100_000, LongContext: anthropic(500_000, 625_000, 1_000_000, 50_000, 2_500_000)},
 	{Provider: "anthropic", Model: "claude-haiku-4-5", Price: anthropic(1_000_000, 1_250_000, 2_000_000, 100_000, 5_000_000), MaxOutput: 64_000},
 
 	// Gemini, paid tier, text input. https://ai.google.dev/gemini-api/docs/pricing
-	// (checked 2026-10-05). Output prices include thinking tokens. The 3.6 to
-	// 3.8 Flash prices double on 1 January 2027. Long context is above 200K
-	// input tokens. MaxOutput is "Output token limit" on each model's page
-	// under https://ai.google.dev/gemini-api/docs/models (checked
+	// (checked 2026-10-05; gemini-4-argon, gemini-3.1-pro-preview-customtools
+	// and gemini-robotics-er-2-preview, 2026-10-24). Output prices include
+	// thinking tokens. The 3.6 to 3.8 Flash and Robotics ER 2 prices double on
+	// 1 January 2027, Gemini 4 Argon's on 1 December 2026. Long context is
+	// above 200K input tokens. MaxOutput is "Output token limit" on each
+	// model's page under https://ai.google.dev/gemini-api/docs/models (checked
 	// 2026-10-24). Thinking tokens count toward it
-	// (https://ai.google.dev/gemini-api/docs/thinking).
+	// (https://ai.google.dev/gemini-api/docs/thinking). Gemini 4 Argon's page
+	// says "Max output" 65,536 (default synchronous), up to 1,048,576 with long
+	// decode. Its MaxOutput is the 65,536 that a streaming or SDK request
+	// returns; a non-streaming REST generateContent request returns 32,768, the
+	// model-list API's outputTokenLimit. Long decode past that is further
+	// requests, each carrying the last one's continuation_token and limited
+	// the same way, or a background Interactions API call, which usage.Metered
+	// refuses
+	// (https://ai.google.dev/gemini-api/docs/generate-content/long-decode).
+	// Each further request pays again, as input and mostly at the cache price,
+	// for the prompt and everything generated so far, which its encrypted
+	// token carries. The input estimate sees only the token's bytes, so the
+	// reservation can fall short. The -latest aliases, such as
+	// gemini-flash-latest, have no rate on purpose, so budgets refuse them:
+	// Google moves them to newer models, and a reservation priced for the old
+	// one could fall short.
 	//                                                          in         read     out
+	{Provider: "gemini", Model: "gemini-4-argon", Price: gemini(2_000_000, 100_000, 10_000_000), MaxOutput: 65_536},
+	{Provider: "gemini", Model: "gemini-4-argon", From: dec2026, Price: gemini(4_000_000, 200_000, 20_000_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-3.8-flash", Price: gemini(750_000, 75_000, 3_750_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-3.8-flash", From: jan2027, Price: gemini(1_500_000, 150_000, 7_500_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-3.7-flash", Price: gemini(750_000, 75_000, 3_750_000), MaxOutput: 65_536},
@@ -183,21 +215,30 @@ var rates = []Rate{
 	{Provider: "gemini", Model: "gemini-3.1-flash-lite", Price: gemini(250_000, 25_000, 1_500_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-3.1-pro-preview", Price: gemini(2_000_000, 200_000, 12_000_000), MaxOutput: 65_536,
 		LongContextAbove: 200_000, LongContext: gemini(4_000_000, 400_000, 18_000_000)},
+	// The customtools endpoint has 3.1 Pro Preview's price and model page.
+	{Provider: "gemini", Model: "gemini-3.1-pro-preview-customtools", Price: gemini(2_000_000, 200_000, 12_000_000), MaxOutput: 65_536,
+		LongContextAbove: 200_000, LongContext: gemini(4_000_000, 400_000, 18_000_000)},
 	{Provider: "gemini", Model: "gemini-3-flash-preview", Price: gemini(500_000, 50_000, 3_000_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-2.5-pro", Price: gemini(1_250_000, 125_000, 10_000_000), MaxOutput: 65_536,
 		LongContextAbove: 200_000, LongContext: gemini(2_500_000, 250_000, 15_000_000)},
 	{Provider: "gemini", Model: "gemini-2.5-flash", Price: gemini(300_000, 30_000, 2_500_000), MaxOutput: 65_536},
 	{Provider: "gemini", Model: "gemini-2.5-flash-lite", Price: gemini(100_000, 10_000, 400_000), MaxOutput: 65_536},
+	{Provider: "gemini", Model: "gemini-robotics-er-2-preview", Price: gemini(1_000_000, 100_000, 5_000_000), MaxOutput: 65_536},
+	{Provider: "gemini", Model: "gemini-robotics-er-2-preview", From: jan2027, Price: gemini(2_000_000, 200_000, 10_000_000), MaxOutput: 65_536},
 
-	// Groq. https://console.groq.com/docs/models (checked 2026-10-05). The
-	// Llama models are listed as "Contact Sales", so they have no price here
-	// and their usage is logged with no cost. MaxOutput is "Max completion
-	// tokens" there (checked 2026-10-24), which each model's page repeats as
-	// "Max output tokens".
+	// Groq. https://console.groq.com/docs/models (checked 2026-10-05;
+	// openai/gpt-oss-safeguard-20b and the two Prompt Guard models,
+	// 2026-10-24). The Llama models are listed as "Contact Sales", so they
+	// have no price here and their usage is logged with no cost. MaxOutput is
+	// "Max completion tokens" there (checked 2026-10-24), which each model's
+	// page repeats as "Max output tokens".
 	//                                                         in       out
 	{Provider: "groq", Model: "openai/gpt-oss-120b", Price: groq(150_000, 600_000), MaxOutput: 65_536},
 	{Provider: "groq", Model: "openai/gpt-oss-20b", Price: groq(75_000, 300_000), MaxOutput: 65_536},
+	{Provider: "groq", Model: "openai/gpt-oss-safeguard-20b", Price: groq(75_000, 300_000), MaxOutput: 65_536},
 	{Provider: "groq", Model: "qwen/qwen3.8-27b", Price: groq(800_000, 4_000_000), MaxOutput: 16_384},
+	{Provider: "groq", Model: "meta-llama/llama-prompt-guard-2-22m", Price: groq(30_000, 30_000), MaxOutput: 512},
+	{Provider: "groq", Model: "meta-llama/llama-prompt-guard-2-86m", Price: groq(40_000, 40_000), MaxOutput: 512},
 }
 
 // index maps provider, then model, to its rates in table order, which lists
