@@ -31,7 +31,7 @@ import (
 // Price is a model's prices in micro-dollars per million tokens, one per
 // kind of token in usage.Usage. Each is its own number, not a multiplier of
 // Input: cache-read discounts differ by model (0.1x on most, 0.05x on Claude
-// Opus 5.5, 0.025x on Claude Fable 5.1 and Mythos 5.1).
+// Opus 5.5 and Sonnet 5.5, 0.025x on Claude Fable 5.1 and Mythos 5.1).
 type Price struct {
 	Input        int64
 	Output       int64
@@ -90,7 +90,8 @@ var jan2027 = time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
 
 var rates = []Rate{
 	// OpenAI, Standard tier. https://developers.openai.com/api/docs/pricing
-	// (checked 2026-10-05). Long context is above 272K input tokens. Cache
+	// (checked 2026-10-05; gpt-5.5's long-context prices and gpt-5.6-sol's
+	// promotion, 2026-10-24). Long context is above 272K input tokens. Cache
 	// writes cost 1.25x input from GPT-5.6 on and bill as input before it
 	// (https://developers.openai.com/api/docs/guides/prompt-caching).
 	// MaxOutput is "max output tokens" on each model's page under
@@ -106,13 +107,16 @@ var rates = []Rate{
 		LongContextAbove: 272_000, LongContext: openAI(4_000_000, 400_000, 5_000_000, 15_000_000)},
 	{Provider: "openai", Model: "gpt-6-luna", Price: openAI(100_000, 10_000, 125_000, 500_000), MaxOutput: 128_000,
 		LongContextAbove: 272_000, LongContext: openAI(200_000, 20_000, 250_000, 750_000)},
+	// A promotional price, "available at least through November 21, 2026"
+	// (the model's page), with no later price published yet: check again then.
 	{Provider: "openai", Model: "gpt-5.6-sol", Price: openAI(4_000_000, 400_000, 5_000_000, 20_000_000), MaxOutput: 128_000,
 		LongContextAbove: 272_000, LongContext: openAI(8_000_000, 800_000, 10_000_000, 30_000_000)},
 	{Provider: "openai", Model: "gpt-5.6-terra", Price: openAI(2_000_000, 200_000, 2_500_000, 12_000_000), MaxOutput: 128_000,
 		LongContextAbove: 272_000, LongContext: openAI(4_000_000, 400_000, 5_000_000, 18_000_000)},
 	{Provider: "openai", Model: "gpt-5.6-luna", Price: openAI(200_000, 20_000, 250_000, 1_200_000), MaxOutput: 128_000,
 		LongContextAbove: 272_000, LongContext: openAI(400_000, 40_000, 500_000, 1_800_000)},
-	{Provider: "openai", Model: "gpt-5.5", Price: openAI(5_000_000, 500_000, 5_000_000, 30_000_000), MaxOutput: 128_000},
+	{Provider: "openai", Model: "gpt-5.5", Price: openAI(5_000_000, 500_000, 5_000_000, 30_000_000), MaxOutput: 128_000,
+		LongContextAbove: 272_000, LongContext: openAI(10_000_000, 1_000_000, 10_000_000, 45_000_000)},
 	{Provider: "openai", Model: "gpt-5.4", Price: openAI(2_500_000, 250_000, 2_500_000, 15_000_000), MaxOutput: 128_000,
 		LongContextAbove: 272_000, LongContext: openAI(5_000_000, 500_000, 5_000_000, 22_500_000)},
 	{Provider: "openai", Model: "gpt-5.4-mini", Price: openAI(750_000, 75_000, 750_000, 4_500_000), MaxOutput: 128_000},
@@ -134,10 +138,10 @@ var rates = []Rate{
 	{Provider: "openai", Model: "o4-mini", Price: openAI(1_100_000, 275_000, 1_100_000, 4_400_000), MaxOutput: 100_000},
 
 	// Anthropic. https://platform.claude.com/docs/en/about-claude/pricing
-	// (checked 2026-10-05; claude-mythos-5-1, claude-mythos-5 and
-	// claude-haiku-5-5, 2026-10-24). No long-context tier: Claude 4.6 and
-	// later bill the full 1M window at standard prices, except Haiku 5.5
-	// (below). IDs from
+	// (checked 2026-10-05; claude-mythos-5-1, claude-mythos-5,
+	// claude-haiku-5-5 and claude-sonnet-5-5's cache read, 2026-10-24). No
+	// long-context tier: Claude 4.6 and later bill the full 1M window at
+	// standard prices, except Haiku 5.5 (below). IDs from
 	// https://platform.claude.com/docs/en/about-claude/models/overview;
 	// dateless from the 4.6 generation on, aliases before it. MaxOutput is
 	// "Max output" on the model page that overview links to
@@ -161,7 +165,7 @@ var rates = []Rate{
 	{Provider: "anthropic", Model: "claude-opus-4-7", Price: anthropic(5_000_000, 6_250_000, 10_000_000, 500_000, 25_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-opus-4-6", Price: anthropic(5_000_000, 6_250_000, 10_000_000, 500_000, 25_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-opus-4-5", Price: anthropic(5_000_000, 6_250_000, 10_000_000, 500_000, 25_000_000), MaxOutput: 64_000},
-	{Provider: "anthropic", Model: "claude-sonnet-5-5", Price: anthropic(2_000_000, 2_500_000, 4_000_000, 200_000, 10_000_000), MaxOutput: 128_000},
+	{Provider: "anthropic", Model: "claude-sonnet-5-5", Price: anthropic(2_000_000, 2_500_000, 4_000_000, 100_000, 10_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-sonnet-5", Price: anthropic(2_000_000, 2_500_000, 4_000_000, 200_000, 10_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-sonnet-4-6", Price: anthropic(3_000_000, 3_750_000, 6_000_000, 300_000, 15_000_000), MaxOutput: 128_000},
 	{Provider: "anthropic", Model: "claude-sonnet-4-5", Price: anthropic(3_000_000, 3_750_000, 6_000_000, 300_000, 15_000_000), MaxOutput: 64_000},
