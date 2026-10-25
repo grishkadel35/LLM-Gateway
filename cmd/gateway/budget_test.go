@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,24 +21,28 @@ import (
 
 	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/config"
+	"github.com/grishkadel/llm-gateway/internal/db"
+	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
+	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
 // fakeLedger stands in for the Redis ledger, so routing tests need no Redis.
 // Each Reserve fails with err when it is set, is refused at spent when refuse
-// is, and is admitted otherwise. It records each Reserve, under a lock, so
-// concurrent requests can share it.
+// is, and is admitted otherwise. It records each Reserve and Settle, under a
+// lock, so concurrent requests can share it.
 type fakeLedger struct {
 	err    error
 	refuse bool
 	spent  int64
 
-	mu    sync.Mutex
-	calls []reserveCall
+	mu      sync.Mutex
+	calls   []reserveCall
+	settles []settleCall
 }
 
 // reserveCall is one Reserve a fakeLedger received.
@@ -58,14 +65,34 @@ func (f *fakeLedger) Reserve(_ context.Context, tenantID string, budgetMicros, a
 	return budget.Reservation{Admitted: true, Spent: f.spent + amount, Amount: amount}, nil
 }
 
-// Settle succeeds, and records nothing.
-func (f *fakeLedger) Settle(context.Context, budget.Reservation, int64) error { return nil }
+// settleCall is one Settle a fakeLedger received.
+type settleCall struct {
+	res    budget.Reservation
+	charge int64
+	// requestID is the request ID its context carried.
+	requestID string
+}
+
+// Settle succeeds.
+func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settles = append(f.settles, settleCall{r, charge, middleware.RequestIDFrom(ctx)})
+	return nil
+}
 
 // recorded returns the Reserve calls so far.
 func (f *fakeLedger) recorded() []reserveCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.calls)
+}
+
+// settled returns the Settle calls so far.
+func (f *fakeLedger) settled() []settleCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.settles)
 }
 
 // budgetedStore is fakeStore with its tenant's monthly budget set to micros.
@@ -459,5 +486,284 @@ func TestBudgetFallback(t *testing.T) {
 			// Uncapped, so at the mapped model's maximum output.
 			checkReserve(t, reserves, fiftyDollars, "groq", "qwen/qwen3.8-27b", body, 0, 1, before, after)
 		})
+	}
+}
+
+// settledOnce fails the test unless ledger got one Reserve and one Settle,
+// for the request requestID, swapping the reservation that Reserve made. It
+// returns the reservation's amount and the charge.
+func settledOnce(t *testing.T, ledger *fakeLedger, requestID string) (amount, charge int64) {
+	t.Helper()
+	reserves, settles := ledger.recorded(), ledger.settled()
+	if len(reserves) != 1 || len(settles) != 1 {
+		t.Fatalf("Reserve calls %+v, Settle calls %+v; want one of each", reserves, settles)
+	}
+	s, amount := settles[0], reserves[0].amount
+	// The reservation as the fake's Reserve made it, from a spend of 0.
+	want := budget.Reservation{Admitted: true, Spent: amount, Amount: amount}
+	if s.res != want || s.requestID != requestID {
+		t.Errorf("Settle(%+v) for request %q, want Settle(%+v) for %q", s.res, s.requestID, want, requestID)
+	}
+	return amount, s.charge
+}
+
+// openaiConfig is a config file with one paid provider, openai, at the URL it
+// is formatted with.
+const openaiConfig = `
+providers:
+  openai:
+    url: %s
+    key: ${TEST_MOCK_KEY}
+    auth: bearer
+    format: openai
+`
+
+// openaiAt loads openaiConfig at url, with extra appended to openai's
+// settings.
+func openaiAt(t *testing.T, url, extra string) *config.Config {
+	t.Helper()
+	t.Setenv("TEST_MOCK_KEY", "mock")
+	return loadConfig(t, fmt.Sprintf(openaiConfig, url)+extra)
+}
+
+// rowsGateway builds the gateway from cfg, budgeted by ledger, over a tenant
+// it creates in a fresh database. The real recordUsage writes each request's
+// usage row there through writer, which a test closes before reading the
+// rows. It returns the tenant's key too. Without DATABASE_URL the test is
+// skipped.
+func rowsGateway(t *testing.T, cfg *config.Config, ledger middleware.Ledger) (r http.Handler, conn *sql.DB, writer *usage.Writer, key string) {
+	t.Helper()
+	conn = dbtest.New(t)
+	ctx := context.Background()
+	if _, err := db.Migrate(ctx, conn); err != nil {
+		t.Fatalf("Migrate() returned error: %v", err)
+	}
+	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
+	_, k, err := store.Create(ctx, "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer = usage.NewWriter(conn, discardLogger)
+	// Registered after the database's cleanups, so it runs before them.
+	t.Cleanup(func() { writer.Close(context.Background()) })
+	r, err = router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+	return r, conn, writer, k.Plaintext
+}
+
+// rowCost returns cost_micros from the usage_logs row of the request
+// requestID.
+func rowCost(t *testing.T, conn *sql.DB, requestID string) sql.NullInt64 {
+	t.Helper()
+	var cost sql.NullInt64
+	if err := conn.QueryRow(`SELECT cost_micros FROM usage_logs WHERE request_id = $1`, requestID).Scan(&cost); err != nil {
+		t.Fatalf("no usage row for request %s: %v", requestID, err)
+	}
+	return cost
+}
+
+// TestBudgetSettlesAtTheRowsCost: every format, streamed or not, through the
+// gateway to the mock, against Postgres. Each request is settled once,
+// swapping the reservation Reserve made for exactly the cost on its usage
+// row.
+func TestBudgetSettlesAtTheRowsCost(t *testing.T) {
+	cases := []struct{ name, path, body string }{
+		{"openai", "/openai/v1/chat/completions", `{"model":"gpt-4o","messages":[]}`},
+		{"openai stream", "/openai/v1/chat/completions", `{"model":"gpt-4o","stream":true,"messages":[]}`},
+		{"groq", "/groq/v1/chat/completions", `{"model":"openai/gpt-oss-120b","messages":[]}`},
+		{"groq stream", "/groq/v1/chat/completions", `{"model":"openai/gpt-oss-120b","stream":true,"messages":[]}`},
+		{"anthropic", "/anthropic/v1/messages", `{"model":"claude-sonnet-4","max_tokens":64,"messages":[]}`},
+		{"anthropic stream", "/anthropic/v1/messages", `{"model":"claude-sonnet-4","max_tokens":64,"stream":true,"messages":[]}`},
+		{"gemini", "/gemini/v1beta/models/gemini-3.8-flash:generateContent", `{}`},
+		{"gemini sse", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", `{}`},
+		{"gemini json stream", "/gemini/v1beta/models/gemini-3.8-flash:streamGenerateContent", `{}`},
+	}
+	ledger := &fakeLedger{}
+	r, conn, writer, key := rowsGateway(t, mockConfig(t), ledger)
+
+	ids := make([]string, len(cases))
+	for i, tc := range cases {
+		rec := serve(r, postAs(key, tc.path, tc.body))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d; body %s", tc.name, rec.Code, rec.Body)
+		}
+		ids[i] = rec.Header().Get("X-Request-ID")
+	}
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	reserves, settles := ledger.recorded(), ledger.settled()
+	if len(reserves) != len(cases) || len(settles) != len(cases) {
+		t.Fatalf("%d Reserve and %d Settle calls, want one of each per request (%d)", len(reserves), len(settles), len(cases))
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := settles[i]
+			// The reservation as the fake's Reserve made it, from a spend of 0.
+			want := budget.Reservation{Admitted: true, Spent: reserves[i].amount, Amount: reserves[i].amount}
+			if s.res != want || s.requestID != ids[i] {
+				t.Errorf("Settle(%+v) for request %q, want Settle(%+v) for %q", s.res, s.requestID, want, ids[i])
+			}
+			if cost := rowCost(t, conn, ids[i]); !cost.Valid || cost.Int64 <= 0 || s.charge != cost.Int64 {
+				t.Errorf("charge %d, row's cost %v; want a priced row, and the charge its cost", s.charge, cost)
+			}
+		})
+	}
+}
+
+// TestBudgetRefundsProviderErrors: a provider that refuses the request, with a
+// 4xx or a 5xx, reports no tokens, so the attempt is charged 0 and its whole
+// reservation comes back.
+func TestBudgetRefundsProviderErrors(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			ollama := newFakeOllama(t, ollamaKnobs{status: status})
+			ledger := &fakeLedger{}
+			r := budgetRouter(t, openaiAt(t, ollama.server.URL, ""), budgetedStore{micros: fiftyDollars}, ledger, nil, nil)
+			rec := serve(r, chatRequest("openai", "gpt-4o"))
+			if rec.Code != status {
+				t.Fatalf("status = %d, want %d", rec.Code, status)
+			}
+			if _, charge := settledOnce(t, ledger, rec.Header().Get("X-Request-ID")); charge != 0 {
+				t.Errorf("charge = %d, want 0", charge)
+			}
+		})
+	}
+}
+
+// TestBudgetUnansweredKeepsTheReservation: a stream the client left, and a
+// request the provider never answered in time, may still have been billed, so
+// each is charged exactly its reservation. The stream's usage so far costs
+// less. The stream runs behind a real server, so ReverseProxy aborts it with
+// panic(http.ErrAbortHandler), as it would in production.
+func TestBudgetUnansweredKeepsTheReservation(t *testing.T) {
+	t.Run("stream cut short", func(t *testing.T) {
+		ledger := &fakeLedger{}
+		// One input token seen, a few µ$, where the reservation is about 100.
+		r := budgetRouter(t, openaiAt(t, sseUpstream(t, 1), ""), budgetedStore{micros: fiftyDollars}, ledger, nil, nil)
+		// done closes when the gateway is through with the request, abort
+		// included.
+		done := make(chan struct{})
+		gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			defer close(done)
+			r.ServeHTTP(w, req)
+		}))
+		t.Cleanup(gw.Close)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+"/openai/v1/chat/completions",
+			strings.NewReader(`{"model":"gpt-4o","stream":true,"max_tokens":5,"messages":[]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+testTenantKey)
+		resp, err := gw.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The usage chunk went through the gateway's meter on its way here.
+		if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+			t.Fatalf("reading the stream: %v", err)
+		}
+		cancel()
+		resp.Body.Close()
+		receive(t, done, "the gateway to finish the request")
+
+		if amount, charge := settledOnce(t, ledger, resp.Header.Get("X-Request-ID")); charge != amount {
+			t.Errorf("charge = %d, want the reservation, %d", charge, amount)
+		}
+	})
+
+	t.Run("504", func(t *testing.T) {
+		ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+		ledger := &fakeLedger{}
+		r := budgetRouter(t, openaiAt(t, ollama.server.URL, "    timeout: 1\n"), budgetedStore{micros: fiftyDollars}, ledger, nil, nil)
+		rec := serve(r, chatRequest("openai", "gpt-4o"))
+		if rec.Code != http.StatusGatewayTimeout {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusGatewayTimeout)
+		}
+		if amount, charge := settledOnce(t, ledger, rec.Header().Get("X-Request-ID")); charge != amount {
+			t.Errorf("charge = %d, want the reservation, %d", charge, amount)
+		}
+	})
+}
+
+// TestBudgetRefundsBusyRequest: a request that got no concurrency slot never
+// reached the provider, and nothing reports usage for it, so it is charged 0.
+func TestBudgetRefundsBusyRequest(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{hold: true})
+	ledger := &fakeLedger{}
+	r := budgetRouter(t, openaiAt(t, ollama.server.URL, "    max_concurrency: 1\n    queue_timeout: 1\n"), budgetedStore{micros: fiftyDollars}, ledger, nil, nil)
+
+	first := serveAsync(r, chatRequest("openai", "gpt-4o"))
+	receive(t, ollama.arrivals, "the first request at the provider")
+	rec := serve(r, chatRequest("openai", "gpt-4o"))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	// The first request still holds its slot, so only the busy one has
+	// settled.
+	reserves, settles := ledger.recorded(), ledger.settled()
+	if len(reserves) != 2 || len(settles) != 1 || settles[0].requestID != rec.Header().Get("X-Request-ID") || settles[0].charge != 0 {
+		t.Errorf("Reserve calls %+v, Settle calls %+v; want two Reserves, and the busy request settled at 0", reserves, settles)
+	}
+	ollama.release()
+	receive(t, first, "the first response")
+}
+
+// TestBudgetFallbackSettlesOnce: when ollama fails and groq answers, only
+// groq's attempt is settled, at groq's cost of the mock's usage for the model
+// the fallback maps to. The free ollama attempt reserved nothing, so it
+// settles nothing.
+func TestBudgetFallbackSettlesOnce(t *testing.T) {
+	ollama := newFakeOllama(t, ollamaKnobs{status: http.StatusInternalServerError})
+	groq, _ := countingUpstream(t, mockprovider.Handler().ServeHTTP)
+	t.Setenv("TEST_GROQ_KEY", "sk-groq")
+	ledger := &fakeLedger{}
+	r := budgetRouter(t, loadConfig(t, fmt.Sprintf(freeFallbackConfig, ollama.server.URL, groq)), budgetedStore{micros: fiftyDollars}, ledger, nil, nil)
+
+	rec := serve(r, chatRequest("ollama", "qwen3.5:9b"))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-Gateway-Fallback") != "true" {
+		t.Fatalf("status %d, X-Gateway-Fallback %q; want 200 from the fallback", rec.Code, rec.Header().Get("X-Gateway-Fallback"))
+	}
+
+	_, charge := settledOnce(t, ledger, rec.Header().Get("X-Request-ID"))
+	mock := usage.Usage{
+		Model:       "qwen/qwen3.8-27b",
+		Input:       mockprovider.PromptTokens - mockprovider.CachedPromptTokens,
+		CachedInput: mockprovider.CachedPromptTokens,
+		Output:      mockprovider.OutputTokens,
+	}
+	want, ok := pricing.Cost("groq", mock, "", ledger.recorded()[0].at)
+	if !ok || charge != want {
+		t.Errorf("charge = %d, want groq's cost of the mock's usage, %d", charge, want)
+	}
+}
+
+// TestBudgetRefundsAFailedDial: a request whose dial failed never left the
+// gateway, so it is charged 0, and its usage row costs 0.
+func TestBudgetRefundsAFailedDial(t *testing.T) {
+	ledger := &fakeLedger{}
+	// Port 1 on loopback: nothing listens there, so the dial is refused.
+	r, conn, writer, key := rowsGateway(t, openaiAt(t, "http://127.0.0.1:1", ""), ledger)
+	rec := serve(r, postAs(key, "/openai/v1/chat/completions", `{"model":"gpt-4o","messages":[]}`))
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	id := rec.Header().Get("X-Request-ID")
+	if _, charge := settledOnce(t, ledger, id); charge != 0 {
+		t.Errorf("charge = %d, want 0", charge)
+	}
+	if cost := rowCost(t, conn, id); !cost.Valid || cost.Int64 != 0 {
+		t.Errorf("row's cost = %v, want 0", cost)
 	}
 }

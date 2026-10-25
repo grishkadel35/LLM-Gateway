@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -26,16 +27,18 @@ import (
 // fakeLedger stands in for the Redis ledger. Each Reserve fails with err when
 // it is set, is refused at spent when refuse is, and is admitted otherwise:
 // the first admission warns when warn is set, as the ledger warns once a
-// month. It records each Reserve, under a lock, so concurrent requests can
-// share it.
+// month. Each Settle fails with settleErr when it is set. It records each
+// call, under a lock, so concurrent requests can share it.
 type fakeLedger struct {
-	err    error
-	refuse bool
-	spent  int64
-	warn   bool
+	err       error
+	refuse    bool
+	spent     int64
+	warn      bool
+	settleErr error
 
-	mu    sync.Mutex
-	calls []reserveCall
+	mu      sync.Mutex
+	calls   []reserveCall
+	settles []settleCall
 }
 
 // reserveCall is one Reserve a fakeLedger received.
@@ -60,14 +63,34 @@ func (f *fakeLedger) Reserve(_ context.Context, tenantID string, budgetMicros, a
 	return budget.Reservation{Admitted: true, Spent: f.spent + amount, Warn: warn, Amount: amount}, nil
 }
 
-// Settle succeeds, and records nothing.
-func (f *fakeLedger) Settle(context.Context, budget.Reservation, int64) error { return nil }
+// settleCall is one Settle a fakeLedger received.
+type settleCall struct {
+	res    budget.Reservation
+	charge int64
+	// ctxErr is its context's error when it arrived: nil unless already
+	// done.
+	ctxErr error
+}
+
+func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settles = append(f.settles, settleCall{r, charge, ctx.Err()})
+	return f.settleErr
+}
 
 // recorded returns the Reserve calls so far.
 func (f *fakeLedger) recorded() []reserveCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return slices.Clone(f.calls)
+}
+
+// settled returns the Settle calls so far.
+func (f *fakeLedger) settled() []settleCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.settles)
 }
 
 // acmeWithBudget is acme with a monthly budget of micros.
@@ -83,14 +106,18 @@ func reserveTokens(body string) int64 { return int64(len(body)+2) / 3 }
 
 // serveBudget sends body as tn's OpenAI-format request through RequestID,
 // ReadBody and Budget for the provider name, in front of a handler that
-// records whether it was reached and the reservation it saw. It also returns
-// the Request ReadBody made. A zero tn sends it with no tenant at all.
-func serveBudget(t *testing.T, ledger Ledger, name string, free bool, logger *slog.Logger, tn tenant.Tenant, body string) (rec *httptest.ResponseRecorder, req *usage.Request, reached bool, res *budget.Reservation) {
+// records whether it was reached and the reservation it saw, and then reports
+// each of reports, as a provider's attempt would. It also returns the Request
+// ReadBody made. A zero tn sends it with no tenant at all.
+func serveBudget(t *testing.T, ledger Ledger, name string, free bool, logger *slog.Logger, tn tenant.Tenant, body string, reports ...usage.Result) (rec *httptest.ResponseRecorder, req *usage.Request, reached bool, res *reservation) {
 	t.Helper()
 
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reached = true
 		res = reservationFrom(r.Context())
+		for _, report := range reports {
+			ReportUsage(r.Context(), name, report)
+		}
 	})
 	// Between ReadBody and Budget, so it sees the Request even when Budget
 	// refuses it.
@@ -148,7 +175,7 @@ func TestBudgetAdmits(t *testing.T) {
 			c.tenantID, c.budget, c.amount, c.at, "tn_acme", 50_000_000, amount, req.Received)
 	}
 	want := budget.Reservation{Admitted: true, Spent: 1_000 + amount, Amount: amount}
-	if res == nil || *res != want {
+	if res == nil || res.Reservation != want {
 		t.Errorf("reservation on the context = %+v, want %+v", res, want)
 	}
 }
@@ -374,6 +401,155 @@ func TestBudgetWarnsOnce(t *testing.T) {
 	if entry["level"] != "WARN" || entry["request_id"] != first.Header().Get(HeaderRequestID) || entry["tenant_id"] != "tn_acme" ||
 		entry["spent_micros"] != float64(40_000_000+amount) || entry["budget_micros"] != float64(50_000_000) {
 		t.Errorf("log line = %v, want one WARN for the first request, with its tenant, spend and budget", entry)
+	}
+}
+
+// TestBudgetSettles: once an admitted attempt is over, the reservation Reserve
+// made is settled once, under a live context, by the usage last reported for
+// the attempt:
+//   - no report: 0
+//   - a cost pricing.ResultCost knows: that cost
+//   - an incomplete result: the reservation, or what the usage seen costs if
+//     that's more
+//
+// Settle is called even when the charge is the reservation.
+func TestBudgetSettles(t *testing.T) {
+	const body = `{"model":"gpt-4o","max_tokens":100,"messages":[]}`
+	// gpt-4o has one price, so these are what they are whenever the request
+	// arrives.
+	now := time.Now()
+	reserved, _ := pricing.Reserve("openai", "gpt-4o", reserveTokens(body), 100, 1, now)
+	cost := func(u usage.Usage) int64 {
+		c, _ := pricing.Cost("openai", u, "gpt-4o", now)
+		return c
+	}
+	used := usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}
+	// What a stream cut short had seen: less than the reservation costs, and
+	// more.
+	under := usage.Usage{Model: "gpt-4o", Input: 10}
+	over := usage.Usage{Model: "gpt-4o", Input: 1_000_000}
+	if c := cost(used); c == 0 || c == reserved || cost(under) >= reserved || cost(over) <= reserved {
+		t.Fatalf("the usages don't fit the reservation, %d µ$: used %d, under %d, over %d", reserved, c, cost(under), cost(over))
+	}
+	complete := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK, Complete: true} }
+	cutShort := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK} }
+
+	cases := []struct {
+		name    string
+		reports []usage.Result
+		want    int64 // the charge
+	}{
+		{"no report: 0", nil, 0},
+		{"complete: its cost", []usage.Result{complete(used)}, cost(used)},
+		// The response names a model with no price, so the model asked for
+		// prices it. Priced as unknown, it would be charged the reservation.
+		{"complete, from an unpriced model: its cost as asked", []usage.Result{complete(usage.Usage{Model: "m", Input: 10})}, cost(under)},
+		{"complete with no tokens, a provider's error: 0", []usage.Result{complete(usage.Usage{Model: "gpt-4o"})}, 0},
+		{"incomplete with no usage: the reservation", []usage.Result{cutShort(usage.Usage{Model: "gpt-4o"})}, reserved},
+		{"incomplete, seen under the reservation: the reservation", []usage.Result{cutShort(under)}, reserved},
+		{"incomplete, seen over the reservation: what was seen", []usage.Result{cutShort(over)}, cost(over)},
+		{"the last report wins", []usage.Result{cutShort(over), complete(used)}, cost(used)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ledger := &fakeLedger{}
+			serveBudget(t, ledger, "openai", false, discard, acmeWithBudget(50_000_000), body, tc.reports...)
+
+			want := settleCall{budget.Reservation{Admitted: true, Spent: reserved, Amount: reserved}, tc.want, nil}
+			if got := ledger.settled(); len(got) != 1 || got[0] != want {
+				t.Errorf("Settle calls = %+v, want one: %+v", got, want)
+			}
+		})
+	}
+}
+
+// TestBudgetSettlesWhenAborted: a client that leaves mid-stream cancels the
+// request's context, and ReverseProxy then aborts with
+// panic(http.ErrAbortHandler). The attempt is still settled, by the usage
+// reported as the body closed, under a context that isn't cancelled, and the
+// panic goes on up to net/http. ReverseProxy panics only under a real server,
+// so this is tested here, not through the gateway.
+func TestBudgetSettlesWhenAborted(t *testing.T) {
+	const body = `{"model":"gpt-4o","max_tokens":100,"messages":[]}`
+	ledger := &fakeLedger{}
+	ctx, cancel := context.WithCancel(context.Background())
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cancel()
+		// $2.50 of input seen, more than the reservation.
+		ReportUsage(r.Context(), "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 1_000_000}, Status: http.StatusOK})
+		panic(http.ErrAbortHandler)
+	})
+	h := asTenant(acmeWithBudget(50_000_000), usage.ReadBody(provider.FormatOpenAI, 1<<20)(Budget(ledger, "openai", false, discard)(next)))
+
+	defer func() {
+		if p := recover(); p != http.ErrAbortHandler {
+			t.Errorf("recovered %v, want http.ErrAbortHandler", p)
+		}
+		reserved, _ := pricing.Reserve("openai", "gpt-4o", reserveTokens(body), 100, 1, time.Now())
+		want := settleCall{budget.Reservation{Admitted: true, Spent: reserved, Amount: reserved}, 2_500_000, nil}
+		if got := ledger.settled(); len(got) != 1 || got[0] != want {
+			t.Errorf("Settle calls = %+v, want one: %+v", got, want)
+		}
+	}()
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	t.Error("ServeHTTP returned; want the abort to go on up")
+}
+
+// TestBudgetSettlementFailure: a failed Settle is logged at Warn, with what it
+// was for, and the client gets the response next wrote, unchanged.
+func TestBudgetSettlementFailure(t *testing.T) {
+	const reply = `{"choices":[]}`
+	var logs bytes.Buffer
+	ledger := &fakeLedger{settleErr: errors.New("redis: i/o timeout")}
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 1,000 input and 100 output tokens of gpt-4o: 3,500 µ$.
+		ReportUsage(r.Context(), "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}, Status: http.StatusOK, Complete: true})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, reply)
+	})
+	h := asTenant(acmeWithBudget(50_000_000), usage.ReadBody(provider.FormatOpenAI, 1<<20)(
+		Budget(ledger, "openai", false, slog.New(slog.NewJSONHandler(&logs, nil)))(next)))
+	rec := httptest.NewRecorder()
+	RequestID(h).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-4o","messages":[]}`)))
+
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/json" || rec.Body.String() != reply {
+		t.Errorf("status %d, Content-Type %q, body %s; want next's 200, application/json and %s", rec.Code, rec.Header().Get("Content-Type"), rec.Body, reply)
+	}
+	if got := ledger.settled(); len(got) != 1 || got[0].charge != 3_500 {
+		t.Errorf("Settle calls = %+v, want one, charging 3500", got)
+	}
+	entry := logLine(t, &logs)
+	if entry["level"] != "WARN" || entry["msg"] != "budget settlement failed" || entry["request_id"] != rec.Header().Get(HeaderRequestID) ||
+		entry["tenant_id"] != "tn_acme" || entry["provider"] != "openai" || entry["charge_micros"] != float64(3_500) || entry["error"] != "redis: i/o timeout" {
+		t.Errorf("log line = %v, want WARN with the request ID, tenant, provider, charge and error", entry)
+	}
+}
+
+// TestBudgetNeverSettlesUnadmitted: a request Budget refused, over budget, for
+// a model with no price or for a failing ledger, holds no reservation, so
+// nothing is settled.
+func TestBudgetNeverSettlesUnadmitted(t *testing.T) {
+	cases := []struct {
+		name   string
+		ledger *fakeLedger
+		body   string
+		status int
+	}{
+		{"over budget", &fakeLedger{refuse: true}, `{"model":"gpt-4o","messages":[]}`, http.StatusPaymentRequired},
+		{"unpriced", &fakeLedger{}, `{"model":"gpt-9000","messages":[]}`, http.StatusBadRequest},
+		{"ledger error", &fakeLedger{err: errors.New("redis: connection refused")}, `{"model":"gpt-4o","messages":[]}`, http.StatusServiceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, _, _, _ := serveBudget(t, tc.ledger, "openai", false, discard, acmeWithBudget(50_000_000), tc.body)
+			if rec.Code != tc.status {
+				t.Errorf("status = %d, want %d", rec.Code, tc.status)
+			}
+			if got := tc.ledger.settled(); len(got) != 0 {
+				t.Errorf("Settle calls = %+v, want none", got)
+			}
+		})
 	}
 }
 

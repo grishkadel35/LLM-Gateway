@@ -285,6 +285,33 @@ func Cost(provider string, u usage.Usage, requested string, at time.Time) (cost 
 	return (sum + 500_000) / 1_000_000, true
 }
 
+// ResultCost returns what r, a response from provider, cost in micro-dollars,
+// priced as Cost prices its usage: by the model it names or else requested,
+// at the time at. free reports that provider costs nothing. ok is false when
+// the cost isn't known; the caller records no cost rather than a guess. A
+// usage row and a budget's settlement both price a response here, so they
+// agree to the micro-dollar.
+//
+// A cache hit always costs 0, whatever its usage says, since no provider saw
+// it. So does a free provider's response, even one cut short. Otherwise a
+// response cut short (or too large to parse) may be missing its usage, so its
+// cost is unknown, never a guess and never 0. A complete response with no
+// tokens, such as an upstream error, really did cost nothing. Any other costs
+// what Cost says, which is unknown when the model isn't priced.
+func ResultCost(provider string, free bool, r usage.Result, requested string, at time.Time) (cost int64, ok bool) {
+	switch {
+	case r.Cached:
+		return 0, true
+	case free:
+		return 0, true
+	case !r.Complete:
+		return 0, false
+	case r.Tokens() == 0:
+		return 0, true
+	}
+	return Cost(provider, r.Usage, requested, at)
+}
+
 // MaxMicros is the most a reservation can be: the largest budget,
 // tenant.MaxBudgetMicros ($1 billion), since a bigger one could never fit
 // any. The budget ledger's Lua scripts compare these amounts as doubles,

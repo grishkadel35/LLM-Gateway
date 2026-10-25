@@ -22,17 +22,31 @@ type Ledger interface {
 	// budget. A refusal reserves nothing.
 	Reserve(ctx context.Context, tenantID string, budget, amount int64, at time.Time) (budget.Reservation, error)
 	// Settle swaps r's reservation for charge, what its request really
-	// cost, once the request is over.
+	// cost, once the request is over. r must be admitted, and the request's
+	// usage row already queued: a ledger that finds the month missing counts
+	// the request from that row when it rebuilds.
 	Settle(ctx context.Context, r budget.Reservation, charge int64) error
+}
+
+// reservation is what Budget reserved for one attempt. It rides on the
+// attempt's context as a pointer, so the attempt's usage can be reported onto
+// it (ReportUsage), and Budget settles the reservation by that usage once the
+// attempt is over.
+//
+// It needs no lock, for the reason charge gives: the reports are made, and
+// the settlement reads them, on the goroutine serving the request.
+type reservation struct {
+	budget.Reservation
+	// result is the usage last reported for the attempt; nil if none was.
+	result *usage.Result
 }
 
 type reservationKey struct{}
 
 // reservationFrom returns the reservation Budget put on ctx for its attempt,
-// or nil if it put none. Like RateLimit's charge, it rides on the context as a
-// pointer.
-func reservationFrom(ctx context.Context) *budget.Reservation {
-	res, _ := ctx.Value(reservationKey{}).(*budget.Reservation)
+// or nil if it put none.
+func reservationFrom(ctx context.Context) *reservation {
+	res, _ := ctx.Value(reservationKey{}).(*reservation)
 	return res
 }
 
@@ -44,16 +58,23 @@ func reservationFrom(ctx context.Context) *budget.Reservation {
 //   - A model with no price gets 400 unknown_model, with nothing reserved.
 //   - A reservation the budget can't fit gets 402 budget_exceeded, with the
 //     numbers behind it, and goes no further.
-//   - An admitted request goes on, with its reservation on the context, so
-//     the reservation can be settled once the request's real cost is known.
-//     The first reservation to take the month's spend to 80% of the budget
-//     is logged with a Warn.
+//   - An admitted request goes on, with its reservation on the context for
+//     its usage to be reported onto (ReportUsage). The first reservation to
+//     take the month's spend to 80% of the budget is logged with a Warn.
+//
+// Once an admitted attempt is over, its reservation is settled: swapped for
+// what the attempt cost, by the usage last reported for it (see
+// settleReservation). By then the attempt's usage row is queued, as
+// Ledger.Settle requires: cmd/gateway's usage callback reports the usage
+// (ReportUsage), then queues the row (recordUsage), and the proxy makes that
+// callback before it returns or aborts.
 //
 // Budgets fail closed: when Reserve fails (Redis or Postgres is down, or
 // slower than the ledger's timeouts), the request gets 503
 // budget_unavailable. A reserve that fails after Redis ran it, such as one
 // whose reply was lost, still leaves its amount in the tenant's spend, which
-// over-counts but never under-counts.
+// over-counts but never under-counts. A Settle that fails is logged with a
+// Warn, and leaves the reservation in the spend in place of the charge.
 //
 // It needs the tenant from Auth and the Request from ReadBody, so it runs
 // after both. It goes inside any fallback, around each provider's own proxy,
@@ -125,8 +146,60 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 					"budget_micros", t.BudgetMicros,
 				)
 			}
-			next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, reservationKey{}, &res)))
+
+			// Deferred, so the attempt is settled even when ReverseProxy
+			// aborts a stream with panic(http.ErrAbortHandler). It gets the
+			// pointer, and reads the last report only when it runs. Like
+			// RateLimit's settle, it holds the response's last bytes for one
+			// Redis call.
+			held := &reservation{Reservation: res}
+			defer settleReservation(ctx, ledger, logger, provider, t.ID, req, held)
+			next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, reservationKey{}, held)))
 		})
+	}
+}
+
+// settleReservation swaps res's reservation for what its attempt cost, once
+// the attempt is over, by the usage last reported for it:
+//   - None: nothing reached the provider (no concurrency slot came free), so
+//     the attempt is charged 0.
+//   - A cost pricing.ResultCost knows: that cost, the one the attempt's usage
+//     row records.
+//   - Unknown (the client left mid-stream, the provider never answered): the
+//     reservation, or what the usage seen so far costs if that's more. The
+//     attempt keeps what it reserved, as RateLimit keeps its charge.
+//
+// req is the attempt's own Request, which its row is priced by too: after a
+// fallback, it names the model the fallback asked for.
+//
+// Settle is called even when the charge is the reservation, since the ledger
+// may need the whole charge (the month was rebuilt without the reservation)
+// or a miss counted (the month is missing). ctx is the attempt's context; a
+// client that has left must still be settled, so Settle gets it without its
+// cancellation, and the ledger bounds the call. A failed Settle is logged and
+// left: the response is already written.
+func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, provider, tenantID string, req *usage.Request, res *reservation) {
+	var charged int64
+	if r := res.result; r != nil {
+		var known bool
+		// Budget never runs for a free provider.
+		charged, known = pricing.ResultCost(provider, false, *r, req.Model, req.Received)
+		if !known {
+			charged = res.Amount
+			if seen, priced := pricing.Cost(provider, r.Usage, req.Model, req.Received); priced {
+				charged = max(charged, seen)
+			}
+		}
+	}
+
+	if err := ledger.Settle(context.WithoutCancel(ctx), res.Reservation, charged); err != nil {
+		logger.Warn("budget settlement failed",
+			"request_id", RequestIDFrom(ctx),
+			"tenant_id", tenantID,
+			"provider", provider,
+			"charge_micros", charged,
+			"error", err,
+		)
 	}
 }
 

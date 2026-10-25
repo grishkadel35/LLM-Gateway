@@ -120,8 +120,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	for _, p := range providers {
 		name := p.Name
 		meter := func(ctx context.Context, r usage.Result) {
-			// For the rate limiter to settle the request's charge by, and
-			// the cache to decide by whether to store the response.
+			// For the rate limiter to settle the request's charge by, the
+			// budget the attempt's reservation, and the cache to decide by
+			// whether to store the response.
 			middleware.ReportUsage(ctx, name, r)
 			m.Tokens(name, r.Usage)
 			if onUsage != nil {
@@ -172,8 +173,8 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		// The cache keys ReadBody's body, so it goes inside ReadBody too. It
 		// wraps the rate limit, so a hit is never charged, nor reserved
 		// against a budget. A hit reports to the route's meter for its usage
-		// row, and for nothing else: ReportUsage finds no charge or pending
-		// miss on its request, and it has no tokens to count.
+		// row, and for nothing else: ReportUsage finds no charge, reservation
+		// or pending miss on its request, and it has no tokens to count.
 		if cacheStore != nil {
 			// A hit never reaches Fallback, so on a route with one it is given
 			// the headers Fallback puts on every other response.
@@ -455,29 +456,19 @@ func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, lo
 			CreatedAt:         req.Received,
 		}
 
-		// Cost is recorded only when it is known. For a cache hit it always
-		// is: 0, whatever its usage says, since no provider saw it. So it is
-		// for a free provider: 0, even for a response cut short. Otherwise a
-		// response cut short (or too large to parse) may be missing its usage,
-		// so its cost is NULL, never a guess and never 0. A complete response
-		// with no tokens, such as an upstream error, really did cost nothing.
+		// Cost is recorded only when it is known, and is NULL otherwise.
+		// Budget settles a paid attempt by the same function, so whenever
+		// its row has a cost, the ledger is charged exactly that.
+		cost, known := pricing.ResultCost(provider, providers[provider].Free, r, req.Model, req.Received)
 		switch {
-		case r.Cached:
-			row.CostMicros = new(int64)
-		case providers[provider].Free:
-			row.CostMicros = new(int64)
+		case known:
+			row.CostMicros = &cost
 		case !r.Complete:
 			logger.Warn("usage incomplete; logged without cost",
 				"request_id", row.RequestID, "provider", provider, "model", r.Model)
-		case r.Usage.Tokens() == 0:
-			row.CostMicros = new(int64)
 		default:
-			if cost, ok := pricing.Cost(provider, r.Usage, req.Model, req.Received); ok {
-				row.CostMicros = &cost
-			} else {
-				logger.Warn("model not priced; usage logged without cost",
-					"request_id", row.RequestID, "provider", provider, "model", r.Model)
-			}
+			logger.Warn("model not priced; usage logged without cost",
+				"request_id", row.RequestID, "provider", provider, "model", r.Model)
 		}
 
 		w.Write(row)

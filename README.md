@@ -30,12 +30,23 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **Each paid attempt is settled at its real cost.** Once an attempt is over,
+  the gateway swaps its reservation for what it cost, so a budget now fills
+  at the real cost, not the reservation rate.
+  - The charge is the cost on the attempt's usage row. The ledger and
+    `usage_logs` price a response with the same function, so they agree to the
+    micro-dollar.
+  - A provider's error, a failed dial, and a request that never got a
+    concurrency slot are charged 0, so the whole reservation comes back.
+  - A request that may have been billed, but whose usage is unknown (a
+    timeout, a stream the client left), keeps its reservation. If the usage
+    seen so far costs more, it pays that instead.
+  - Settlement runs even when a stream is aborted or the client has gone. If
+    it fails, a Warn is logged and the reservation stays in the month's spend.
 - **A paid request is refused when its tenant's budget can't cover it.**
   Before each attempt on a paid provider, the gateway reserves the most the
   attempt could cost in the tenant's ledger. If that doesn't fit what is left
-  of the month's budget, the attempt is refused. Settlement isn't wired in
-  yet. Until it is, each reservation stays in the month's spend, so a budget
-  fills at the reservation rate, not the real cost. A ledger rebuilt after a
+  of the month's budget, the attempt is refused. A ledger rebuilt after a
   Redis restart starts again from the real costs in `usage_logs`.
   - A request that doesn't fit gets `402 budget_exceeded` before its
     provider sees it. On a route without a fallback, the rate limiter
@@ -85,8 +96,8 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 - **A request that never reached its provider costs nothing.** When the
   gateway can't connect at all (a DNS failure, a refused connection, a dial
   timeout), the request never left it. Its usage row now costs 0 instead of
-  NULL, and the rate limiter refunds its whole charge. Week 5's budgets will
-  refund it the same way, so a network outage can't spend a budget. Any other
+  NULL, and the rate limiter refunds its whole charge. Budgets now refund it
+  the same way, so a network outage can't spend a budget. Any other
   request that got no answer (a timeout, a connection dropped after sending, a
   client gone) still keeps its charge and leaves a row with no cost, since the
   provider may have billed it.

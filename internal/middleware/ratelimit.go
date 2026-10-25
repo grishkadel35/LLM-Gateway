@@ -59,14 +59,20 @@ func chargeFrom(ctx context.Context) *charge {
 }
 
 // ReportUsage records r, the usage of provider's response, as the usage of the
-// request ctx belongs to: for RateLimit to settle its charge by, and for Cache
-// to decide by whether to store the response. The last report wins: on a
-// route with a fallback, the attempt that answered reports after the one that
-// failed. A request RateLimit didn't admit has no charge, and one Cache won't
-// store has no pending miss; the report is dropped for each.
+// request ctx belongs to: for RateLimit to settle its charge by, for Budget to
+// settle the attempt's reservation by, and for Cache to decide by whether to
+// store the response. The last report wins: on a route with a fallback, the
+// attempt that answered reports after the one that failed. Each attempt has a
+// reservation of its own, settled by that attempt's last report. A request
+// RateLimit didn't admit has no charge, an attempt Budget didn't reserve for
+// has no reservation, and a request Cache won't store has no pending miss;
+// the report is dropped for each.
 func ReportUsage(ctx context.Context, provider string, r usage.Result) {
 	if c := chargeFrom(ctx); c != nil {
 		c.result = &r
+	}
+	if res := reservationFrom(ctx); res != nil {
+		res.result = &r
 	}
 	if p := pendingFrom(ctx); p != nil {
 		p.provider, p.result = provider, &r

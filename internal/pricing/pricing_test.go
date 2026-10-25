@@ -152,6 +152,56 @@ func TestCostUnknown(t *testing.T) {
 	}
 }
 
+// TestResultCost: a response's cost is known only when its usage is. A cache
+// hit costs 0, whatever its usage says, and so does a free provider's
+// response, even one cut short. A response cut short has an unknown cost,
+// never 0. A complete one with no tokens, such as a provider's error, cost
+// nothing, and any other costs what Cost says: by the requested model when
+// the response's isn't priced, at the price in force at at, and unknown for a
+// model with no price.
+func TestResultCost(t *testing.T) {
+	// gpt-4o: $2.50 in, $1.25 cached, $10 out. 15×2.5 + 5×1.25 + 10×10 =
+	// 143.75 → 144.
+	gpt4o := usage.Usage{Model: "gpt-4o", Input: 15, CachedInput: 5, Output: 10}
+	llama := usage.Usage{Model: "llama-3.3-70b-versatile", Input: 10}
+	cases := []struct {
+		name      string
+		provider  string
+		free      bool
+		r         usage.Result
+		requested string
+		at        time.Time
+		want      int64
+		known     bool
+	}{
+		{"complete", "openai", false, usage.Result{Usage: gpt4o, Complete: true}, "", oct2026, 144, true},
+		// Sonnet 5.5: $2 in, $10 out. 1,000×2 + 100×10 = 3,000.
+		{"complete, by the requested model", "anthropic", false,
+			usage.Result{Usage: usage.Usage{Model: "claude-sonnet-5-5-experimental", Input: 1_000, Output: 100}, Complete: true}, "claude-sonnet-5-5", oct2026, 3_000, true},
+		// gemini-3.8-flash from 2027: $1.50 in, $7.50 out.
+		{"complete, at the price in force", "gemini", false,
+			usage.Result{Usage: usage.Usage{Model: "gemini-3.8-flash", Input: 1_000_000, Output: 1_000_000}, Complete: true}, "", jan2027, 9_000_000, true},
+		{"complete, unpriced", "groq", false, usage.Result{Usage: llama, Complete: true}, "", oct2026, 0, false},
+		{"complete, no tokens", "openai", false, usage.Result{Usage: usage.Usage{Model: "gpt-4o"}, Status: 429, Complete: true}, "", oct2026, 0, true},
+		{"complete, no tokens, unpriced", "groq", false, usage.Result{Usage: usage.Usage{Model: llama.Model}, Status: 500, Complete: true}, "", oct2026, 0, true},
+		{"cut off before usage arrived", "openai", false, usage.Result{Usage: usage.Usage{Model: "gpt-4o"}}, "", oct2026, 0, false},
+		{"cut off with partial usage", "openai", false, usage.Result{Usage: gpt4o}, "", oct2026, 0, false},
+		{"free, complete", "ollama", true, usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15, Output: 10}, Complete: true}, "", oct2026, 0, true},
+		{"free, cut off", "ollama", true, usage.Result{Usage: usage.Usage{Model: "qwen3.5:9b", Input: 15}}, "", oct2026, 0, true},
+		{"cached", "openai", false, usage.Result{Usage: gpt4o, Complete: true, Cached: true}, "", oct2026, 0, true},
+		{"cached, unpriced", "groq", false, usage.Result{Usage: llama, Complete: true, Cached: true}, "", oct2026, 0, true},
+		{"cached, cut off", "openai", false, usage.Result{Usage: gpt4o, Cached: true}, "", oct2026, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, known := ResultCost(tc.provider, tc.free, tc.r, tc.requested, tc.at)
+			if got != tc.want || known != tc.known {
+				t.Errorf("ResultCost() = %d, %t; want %d, %t", got, known, tc.want, tc.known)
+			}
+		})
+	}
+}
+
 // TestRatesAreComplete guards the table against a typo leaving a price at
 // zero, which would bill those tokens as free.
 func TestRatesAreComplete(t *testing.T) {
