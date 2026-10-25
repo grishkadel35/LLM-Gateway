@@ -82,16 +82,24 @@ type stores struct {
 	*usage.Reports
 }
 
+// budgetLedger is what the routes need from the budget ledger: Reserve and
+// Settle for the provider routes, and Spent for the admin API. *budget.Ledger
+// satisfies it; routing tests substitute a fake.
+type budgetLedger interface {
+	middleware.Ledger
+	admin.Ledger
+}
+
 // router builds the gateway's handler: one reverse proxy per configured
 // provider behind tenant auth, the response cache, rate limiting and budgets,
 // the admin API behind the admin key, /health, /metrics, and a catch-all that
 // rejects unknown prefixes, all behind the request ID and logging middleware.
 // A nil limiter means no rate limiting, a nil cacheStore no response cache,
-// and a nil ledger no budgets.
+// and a nil ledger no budgets and no budget report in the admin API.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, ledger middleware.Ledger, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, ledger budgetLedger, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -108,7 +116,7 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	// One subtree behind AdminAuth, not a pattern per admin route: with
 	// per-route patterns, ServeMux would answer an unauthenticated request for
 	// the wrong method with 405 and an Allow header, before any auth ran.
-	mux.Handle("/admin/", middleware.AdminAuth(adminKey)(admin.Handler(store, logger)))
+	mux.Handle("/admin/", middleware.AdminAuth(adminKey)(admin.Handler(store, ledger, logger)))
 
 	tenantAuth := middleware.Auth(store, logger)
 

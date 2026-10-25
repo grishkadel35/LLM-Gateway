@@ -34,7 +34,8 @@ import (
 // fakeLedger stands in for the Redis ledger, so routing tests need no Redis.
 // Each Reserve fails with err when it is set, is refused at spent when refuse
 // is, and is admitted otherwise. It records each Reserve and Settle, under a
-// lock, so concurrent requests can share it.
+// lock, so concurrent requests can share it. Spent reports spent, or fails
+// with err when it is set, and records nothing.
 type fakeLedger struct {
 	err    error
 	refuse bool
@@ -79,6 +80,10 @@ func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge in
 	defer f.mu.Unlock()
 	f.settles = append(f.settles, settleCall{r, charge, middleware.RequestIDFrom(ctx)})
 	return nil
+}
+
+func (f *fakeLedger) Spent(context.Context, string, time.Time) (int64, error) {
+	return f.spent, f.err
 }
 
 // recorded returns the Reserve calls so far.
@@ -126,7 +131,7 @@ func loadConfig(t *testing.T, yaml string) *config.Config {
 
 // budgetRouter builds the gateway from cfg over store, budgeted by ledger,
 // and rate limited by limiter and caching in cacheStore unless they are nil.
-func budgetRouter(t *testing.T, cfg *config.Config, store tenantStore, ledger middleware.Ledger, limiter middleware.Limiter, cacheStore middleware.CacheStore) http.Handler {
+func budgetRouter(t *testing.T, cfg *config.Config, store tenantStore, ledger budgetLedger, limiter middleware.Limiter, cacheStore middleware.CacheStore) http.Handler {
 	t.Helper()
 	r, err := router(cfg, store, testAdminKey, nil, limiter, cacheStore, ledger, metrics.New(), nil, discardLogger)
 	if err != nil {
@@ -526,27 +531,36 @@ func openaiAt(t *testing.T, url, extra string) *config.Config {
 	return loadConfig(t, fmt.Sprintf(openaiConfig, url)+extra)
 }
 
-// rowsGateway builds the gateway from cfg, budgeted by ledger, over a tenant
-// it creates in a fresh database. The real recordUsage writes each request's
-// usage row there through writer, which a test closes before reading the
-// rows. It returns the tenant's key too. Without DATABASE_URL the test is
-// skipped.
-func rowsGateway(t *testing.T, cfg *config.Config, ledger middleware.Ledger) (r http.Handler, conn *sql.DB, writer *usage.Writer, key string) {
+// rowsTenant creates a tenant in a fresh database, and returns the stores over
+// the database, its connection, a usage writer on it and the tenant's key. The
+// writer is closed as the test ends, if the test hasn't closed it already to
+// read the rows. Without DATABASE_URL the test is skipped.
+func rowsTenant(t *testing.T) (store stores, conn *sql.DB, writer *usage.Writer, key tenant.NewKey) {
 	t.Helper()
 	conn = dbtest.New(t)
 	ctx := context.Background()
 	if _, err := db.Migrate(ctx, conn); err != nil {
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
-	store := stores{tenant.NewStore(conn), usage.NewReports(conn)}
-	_, k, err := store.Create(ctx, "acme")
+	store = stores{tenant.NewStore(conn), usage.NewReports(conn)}
+	_, key, err := store.Create(ctx, "acme")
 	if err != nil {
 		t.Fatal(err)
 	}
 	writer = usage.NewWriter(conn, discardLogger)
 	// Registered after the database's cleanups, so it runs before them.
 	t.Cleanup(func() { writer.Close(context.Background()) })
-	r, err = router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
+	return store, conn, writer, key
+}
+
+// rowsGateway builds the gateway from cfg, budgeted by ledger, over rowsTenant's
+// tenant. The real recordUsage writes each request's usage row there through
+// writer, which a test closes before reading the rows. It returns the tenant's
+// key too. Without DATABASE_URL the test is skipped.
+func rowsGateway(t *testing.T, cfg *config.Config, ledger budgetLedger) (r http.Handler, conn *sql.DB, writer *usage.Writer, key string) {
+	t.Helper()
+	store, conn, writer, k := rowsTenant(t)
+	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -765,5 +779,102 @@ func TestBudgetRefundsAFailedDial(t *testing.T) {
 	}
 	if cost := rowCost(t, conn, id); !cost.Valid || cost.Int64 != 0 {
 		t.Errorf("row's cost = %v, want 0", cost)
+	}
+}
+
+// TestBudgetReportThroughGateway: the admin API's budget report over the real
+// ledger in the real Redis, after paid requests through the gateway to the
+// mock. The first report, before any request, builds the tenant's month. A
+// report reserves nothing, so asking again gives the same spend, the one the
+// ledger holds. Once the usage rows are written, with nothing in flight, it is
+// their sum: the ledger and the rows price each response by the same function.
+func TestBudgetReportThroughGateway(t *testing.T) {
+	// Redis first, so that without REDIS_URL no database is made.
+	rdb := gatewayRedis(t)
+	store, conn, writer, key := rowsTenant(t)
+	tenantID := key.TenantID
+	ledger := budget.New(rdb, conn, writer.Pending)
+
+	// Every test shares the one Redis, so this one deletes its own keys only:
+	// the tenant's hash for this month, and the hash's missed counter.
+	start, _ := budget.Period(time.Now())
+	hash := "budget:{" + tenantID + "}:" + start.Format("2006-01")
+	t.Cleanup(func() { rdb.Del(context.Background(), hash, hash+":missed") })
+
+	cfg := mockConfig(t)
+	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
+	if err != nil {
+		t.Fatalf("router() returned error: %v", err)
+	}
+
+	adminCall := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+testAdminKey)
+		return serve(r, req)
+	}
+	type budgetReport struct {
+		TenantID        string `json:"tenant_id"`
+		BudgetMicros    int64  `json:"budget_micros"`
+		SpentMicros     int64  `json:"spent_micros"`
+		RemainingMicros int64  `json:"remaining_micros"`
+	}
+	report := func() budgetReport {
+		t.Helper()
+		rec := adminCall(http.MethodGet, "/admin/tenants/"+tenantID+"/budget", "")
+		var got budgetReport
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); rec.Code != http.StatusOK || err != nil {
+			t.Fatalf("budget report: status %d, body %s (%v); want 200 and JSON", rec.Code, rec.Body, err)
+		}
+		return got
+	}
+
+	// $1: more than any one request below reserves, and each is settled before
+	// the next is sent.
+	const budgetMicros = 1_000_000
+	if rec := adminCall(http.MethodPatch, "/admin/tenants/"+tenantID, fmt.Sprintf(`{"budget_micros":%d}`, budgetMicros)); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH: status = %d; body %s", rec.Code, rec.Body)
+	}
+	if got, want := report(), (budgetReport{tenantID, budgetMicros, 0, budgetMicros}); got != want {
+		t.Errorf("report before any request = %+v, want %+v", got, want)
+	}
+	// The route exists on this router, and is still behind the admin key.
+	for _, authorization := range []string{"", "Bearer " + key.Plaintext} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/tenants/"+tenantID+"/budget", nil)
+		if authorization != "" {
+			req.Header.Set("Authorization", authorization)
+		}
+		if rec := serve(r, req); rec.Code != http.StatusUnauthorized {
+			t.Errorf("report with Authorization %q: status = %d, want %d", authorization, rec.Code, http.StatusUnauthorized)
+		}
+	}
+
+	for _, tc := range []struct{ path, body string }{
+		{"/openai/v1/chat/completions", `{"model":"gpt-4o","messages":[]}`},
+		{"/anthropic/v1/messages", `{"model":"claude-sonnet-4","max_tokens":64,"messages":[]}`},
+		{"/gemini/v1beta/models/gemini-3.8-flash:generateContent", `{}`},
+	} {
+		if rec := serve(r, postAs(key.Plaintext, tc.path, tc.body)); rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d; body %s", tc.path, rec.Code, rec.Body)
+		}
+	}
+
+	first, second := report(), report()
+	spent, err := ledger.Spent(context.Background(), tenantID, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (budgetReport{tenantID, budgetMicros, spent, budgetMicros - spent}); spent <= 0 || first != want || second != want {
+		t.Errorf("reports %+v then %+v, want both %+v, from the ledger's own spend, above 0", first, second, want)
+	}
+
+	if err := writer.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var rows int64
+	if err := conn.QueryRow(`SELECT COALESCE(SUM(cost_micros), 0) FROM usage_logs WHERE tenant_id = $1`, tenantID).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != first.SpentMicros {
+		t.Errorf("the tenant's usage rows cost %d µ$ in all, want spent_micros, %d", rows, first.SpentMicros)
 	}
 }

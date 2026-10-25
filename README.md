@@ -30,6 +30,15 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 
 ### What changed
 
+- **A tenant's budget can be read over the admin API.**
+  `GET /admin/tenants/{id}/budget` reports the current UTC month in the
+  fields a 402 uses: `budget_micros`, `spent_micros`, `remaining_micros`
+  (never below 0), `period` and `resets_at`.
+  - `spent_micros` is the ledger's: settled costs plus requests still in
+    flight. If Redis has lost the month, it is rebuilt from Postgres first.
+  - Asking reserves nothing.
+  - An unknown tenant gets 404, and Redis is never asked about it. When the
+    ledger can't answer, the report gets `503 budget_unavailable`.
 - **Each paid attempt is settled at its real cost.** Once an attempt is over,
   the gateway swaps its reservation for what it cost, so a budget now fills
   at the real cost, not the reservation rate.
@@ -921,6 +930,7 @@ to the network: bind it to the Colima bridge address or firewall it.
 | `PATCH /admin/tenants/{id}`       | Admin key. Any of `budget_micros`, `rate_limit_tokens_per_min`, `default_max_tokens` → `200` with the tenant; the next request uses them. |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
 | `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage.  |
+| `GET /admin/tenants/{id}/budget`  | Admin key. This UTC month's `budget_micros`, `spent_micros` (in-flight reservations included) and `remaining_micros`, with `period` and `resets_at`; `503 budget_unavailable` if the ledger can't answer. |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
 
 Metered endpoints, the only ones forwarded:

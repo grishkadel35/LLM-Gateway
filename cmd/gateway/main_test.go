@@ -421,6 +421,8 @@ func TestAdminRoutesRequireAdminKey(t *testing.T) {
 		{"tenant key", http.MethodPost, "/admin/tenants", "Bearer " + testTenantKey},
 		{"patch, no key", http.MethodPatch, "/admin/tenants/tn_x", ""},
 		{"patch, tenant key", http.MethodPatch, "/admin/tenants/tn_x", "Bearer " + testTenantKey},
+		{"budget, no key", http.MethodGet, "/admin/tenants/tn_x/budget", ""},
+		{"budget, tenant key", http.MethodGet, "/admin/tenants/tn_x/budget", "Bearer " + testTenantKey},
 		{"wrong method, no key", http.MethodGet, "/admin/tenants", ""},
 		{"unknown path, no key", http.MethodGet, "/admin/nope", ""},
 	}

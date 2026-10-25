@@ -1,5 +1,6 @@
 // Package admin serves the gateway's admin API: creating tenants, changing
-// their limits, issuing and revoking their keys, and reporting their usage.
+// their limits, issuing and revoking their keys, and reporting their usage and
+// budgets.
 //
 // It does no authentication of its own. The gateway mounts it behind
 // middleware.AdminAuth, so a request that reaches these handlers already
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/grishkadel/llm-gateway/internal/apierror"
+	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
@@ -38,9 +40,19 @@ type Store interface {
 	TenantUsage(ctx context.Context, tenantID string, from, to time.Time) (usage.Summary, error)
 }
 
-// Handler returns the admin routes, at their full /admin/... paths.
-func Handler(store Store, logger *slog.Logger) http.Handler {
-	a := &api{store: store, logger: logger}
+// Ledger is what the budget report needs: a tenant's spend for the month, in
+// micro-dollars (µ$). *budget.Ledger satisfies it; tests substitute a fake.
+type Ledger interface {
+	// Spent returns the tenant's spend for the month holding at: settled costs
+	// plus the reservations in flight. It reserves nothing.
+	Spent(ctx context.Context, tenantID string, at time.Time) (int64, error)
+}
+
+// Handler returns the admin routes, at their full /admin/... paths. A nil
+// ledger means no budgets: the budget route is not registered, so the
+// catch-all answers it with its JSON 404.
+func Handler(store Store, ledger Ledger, logger *slog.Logger) http.Handler {
+	a := &api{store: store, ledger: ledger, logger: logger}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/tenants", a.createTenant)
@@ -48,6 +60,9 @@ func Handler(store Store, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("POST /admin/tenants/{id}/keys", a.issueKey)
 	mux.HandleFunc("DELETE /admin/keys/{id}", a.revokeKey)
 	mux.HandleFunc("GET /admin/tenants/{id}/usage", a.tenantUsage)
+	if ledger != nil {
+		mux.HandleFunc("GET /admin/tenants/{id}/budget", a.tenantBudget)
+	}
 	// Everything else under /admin/, wrong methods included, gets a JSON 404
 	// rather than ServeMux's plain-text 404 or 405.
 	mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
@@ -58,6 +73,7 @@ func Handler(store Store, logger *slog.Logger) http.Handler {
 
 type api struct {
 	store  Store
+	ledger Ledger
 	logger *slog.Logger
 }
 
@@ -286,6 +302,50 @@ func (a *api) tenantUsage(w http.ResponseWriter, r *http.Request) {
 		"to":        to,
 		"total":     summary.Total,
 		"by_model":  summary.ByModel,
+	})
+}
+
+// tenantBudget reports a tenant's budget for the current calendar month in
+// UTC, beside the spend the ledger holds for it: settled costs plus the
+// reservations in flight. Asking reserves nothing. What is left is never below
+// 0: a tenant whose budget was lowered under its spend has none left, not a
+// negative amount.
+func (a *api) tenantBudget(w http.ResponseWriter, r *http.Request) {
+	// One reading of the clock, for the spend and the period alike, so they name
+	// the same month even across a month boundary.
+	now := time.Now()
+
+	// The store comes first: an unknown ID never reaches the ledger, which
+	// would build a hash in Redis for it.
+	tenantID := r.PathValue("id")
+	t, err := a.store.Get(r.Context(), tenantID)
+	if errors.Is(err, tenant.ErrNotFound) {
+		apierror.Write(w, http.StatusNotFound, "not_found", "no tenant with that ID", nil)
+		return
+	}
+	if err != nil {
+		a.internalError(w, "reading tenant", err)
+		return
+	}
+
+	spent, err := a.ledger.Spent(r.Context(), tenantID, now)
+	if err != nil {
+		// Logged as internalError logs, with the tenant, and answered without
+		// the error's text, which may name Redis or database hosts.
+		a.logger.Error("admin request failed", "action", "reading budget", "tenant_id", tenantID, "error", err)
+		apierror.Write(w, http.StatusServiceUnavailable, "budget_unavailable",
+			"the gateway can't read this tenant's budget right now; retry shortly", nil)
+		return
+	}
+
+	start, end := budget.Period(now)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tenant_id":        tenantID,
+		"period":           start.Format("2006-01"),
+		"budget_micros":    t.BudgetMicros,
+		"spent_micros":     spent,
+		"remaining_micros": max(t.BudgetMicros-spent, 0),
+		"resets_at":        end.Format(time.RFC3339),
 	})
 }
 

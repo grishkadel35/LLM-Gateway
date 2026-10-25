@@ -11,12 +11,14 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/db"
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/ratelimit"
@@ -41,11 +43,20 @@ func newStore(t *testing.T) stores {
 	return stores{tenant.NewStore(conn), usage.NewReports(conn)}
 }
 
+// serve sends the request to the admin API over store and a ledger that has
+// spent nothing.
 func serve(t *testing.T, store Store, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 
+	return serveLedger(t, store, &fakeLedger{}, method, path, body)
+}
+
+// serveLedger is serve over ledger, which may be nil.
+func serveLedger(t *testing.T, store Store, ledger Ledger, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+
 	rec := httptest.NewRecorder()
-	h := Handler(store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := Handler(store, ledger, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	h.ServeHTTP(rec, httptest.NewRequest(method, path, strings.NewReader(body)))
 	return rec
 }
@@ -299,7 +310,7 @@ func TestPatchTenantLogsWhatChanged(t *testing.T) {
 	}
 
 	var logs bytes.Buffer
-	h := Handler(store, slog.New(slog.NewJSONHandler(&logs, nil)))
+	h := Handler(store, &fakeLedger{}, slog.New(slog.NewJSONHandler(&logs, nil)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/admin/tenants/"+created.ID,
 		strings.NewReader(`{"default_max_tokens":512,"budget_micros":0}`)))
@@ -437,6 +448,7 @@ func TestStoreFailureIs500(t *testing.T) {
 		{http.MethodPost, "/admin/tenants/tn_x/keys", ""},
 		{http.MethodDelete, "/admin/keys/1", ""},
 		{http.MethodGet, "/admin/tenants/tn_x/usage", ""},
+		{http.MethodGet, "/admin/tenants/tn_x/budget", ""},
 	}
 	for _, r := range requests {
 		rec := serve(t, failingStore{}, r.method, r.path, r.body)
@@ -457,6 +469,7 @@ func TestUnknownAdminRouteIsJSON(t *testing.T) {
 		{http.MethodGet, "/admin/tenants"},
 		{http.MethodPut, "/admin/tenants/tn_x"},
 		{http.MethodPut, "/admin/keys/1"},
+		{http.MethodPost, "/admin/tenants/tn_x/budget"},
 	} {
 		rec := serve(t, failingStore{}, r.method, r.path, "")
 		if rec.Code != http.StatusNotFound {
@@ -558,5 +571,169 @@ func TestTenantUsageRejectsBadInput(t *testing.T) {
 	rec := serve(t, &usageStore{}, http.MethodGet, "/admin/tenants/tn_missing/usage", "")
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("unknown tenant: status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+}
+
+// fakeLedger stands in for the Redis ledger: Spent returns spent, or fails
+// with err when it is set, and records its call. The handler runs on the
+// test's own goroutine, so the record needs no lock.
+type fakeLedger struct {
+	spent int64
+	err   error
+	calls []spentCall
+}
+
+// spentCall is one Spent a fakeLedger received.
+type spentCall struct {
+	tenantID string
+	at       time.Time
+}
+
+func (f *fakeLedger) Spent(_ context.Context, tenantID string, at time.Time) (int64, error) {
+	f.calls = append(f.calls, spentCall{tenantID, at})
+	return f.spent, f.err
+}
+
+// TestTenantBudget: the report sets the tenant's budget, from the store, beside
+// its spend, from the ledger, and what is left. The ledger is asked once, for
+// the tenant in the path, at a time within the request, and the period and the
+// reset are the ones of that time, so they can't name another month than the
+// spend. A tenant spent past its budget, as when the budget is lowered, has 0
+// left, not a negative amount, and its spend is reported in full.
+func TestTenantBudget(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	cases := []struct {
+		name                     string
+		budget, spent, remaining int64
+	}{
+		{"part spent", 7_000_000, 2_500_000, 4_500_000},
+		{"nothing spent", 7_000_000, 0, 7_000_000},
+		{"all spent", 7_000_000, 7_000_000, 0},
+		{"overspent", 1_000_000, 3_000_000, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			created, _, err := store.Create(ctx, "acme")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.Update(ctx, created.ID, tenant.Update{BudgetMicros: &tc.budget}); err != nil {
+				t.Fatal(err)
+			}
+			ledger := &fakeLedger{spent: tc.spent}
+
+			before := time.Now()
+			rec := serveLedger(t, store, ledger, http.MethodGet, "/admin/tenants/"+created.ID+"/budget", "")
+			after := time.Now()
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
+			}
+			if len(ledger.calls) != 1 {
+				t.Fatalf("Spent calls = %+v, want one", ledger.calls)
+			}
+			call := ledger.calls[0]
+			if call.tenantID != created.ID || call.at.Before(before) || call.at.After(after) {
+				t.Errorf("Spent(%q, %v), want Spent(%q) at a time from %v to %v", call.tenantID, call.at, created.ID, before, after)
+			}
+
+			// The month of the time the ledger was asked about, not of the clock
+			// now, so a test run across the end of a month still passes.
+			start, end := budget.Period(call.at)
+			want := map[string]any{
+				"tenant_id":        created.ID,
+				"period":           start.Format("2006-01"),
+				"budget_micros":    float64(tc.budget),
+				"spent_micros":     float64(tc.spent),
+				"remaining_micros": float64(tc.remaining),
+				"resets_at":        end.Format(time.RFC3339),
+			}
+			var got map[string]any
+			decode(t, rec, &got)
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("body = %v\nwant %v", got, want)
+			}
+		})
+	}
+}
+
+// TestTenantBudgetUnknownTenant: an unknown ID is a 404, and the ledger is never
+// asked, so it never builds a hash in Redis for an ID that is not a tenant.
+func TestTenantBudgetUnknownTenant(t *testing.T) {
+	ledger := &fakeLedger{}
+	rec := serveLedger(t, newStore(t), ledger, http.MethodGet, "/admin/tenants/tn_0000000000000000/budget", "")
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	var body errorBody
+	decode(t, rec, &body)
+	if body.Error.Type != "not_found" {
+		t.Errorf("error type = %q, want not_found", body.Error.Type)
+	}
+	if len(ledger.calls) != 0 {
+		t.Errorf("Spent calls = %+v, want none", ledger.calls)
+	}
+}
+
+// TestTenantBudgetLedgerFailure: a ledger that can't answer is a 503 the client
+// can retry. The error (which may name Redis or database hosts) stays in the
+// log, beside the tenant, and out of the response.
+func TestTenantBudgetLedgerFailure(t *testing.T) {
+	store := newStore(t)
+	created, _, err := store.Create(context.Background(), "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errLedger := errors.New("redis: i/o timeout")
+
+	var logs bytes.Buffer
+	h := Handler(store, &fakeLedger{err: errLedger}, slog.New(slog.NewJSONHandler(&logs, nil)))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/tenants/"+created.ID+"/budget", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want %d; body %s", rec.Code, http.StatusServiceUnavailable, rec.Body)
+	}
+	if v := rec.Header().Values("Retry-After"); v != nil {
+		t.Errorf("Retry-After = %q, want none", v)
+	}
+	var body errorBody
+	decode(t, rec, &body)
+	if body.Error.Type != "budget_unavailable" {
+		t.Errorf("error type = %q, want budget_unavailable", body.Error.Type)
+	}
+	if strings.Contains(rec.Body.String(), errLedger.Error()) {
+		t.Errorf("response leaks the ledger error: %s", rec.Body)
+	}
+
+	var entry struct {
+		Level    string `json:"level"`
+		TenantID string `json:"tenant_id"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+		t.Fatalf("log output %q is not one JSON line: %v", logs.String(), err)
+	}
+	if entry.Level != "ERROR" || entry.TenantID != created.ID || entry.Error != errLedger.Error() {
+		t.Errorf("log line = %+v, want ERROR for %s with %q", entry, created.ID, errLedger)
+	}
+}
+
+// TestTenantBudgetWithoutLedger: with no ledger there are no budgets, and the
+// budget route isn't registered, so the catch-all answers it. failingStore
+// fails every call, so a 404 also shows the request never reached the store.
+func TestTenantBudgetWithoutLedger(t *testing.T) {
+	rec := serveLedger(t, failingStore{}, nil, http.MethodGet, "/admin/tenants/tn_x/budget", "")
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d; body %s", rec.Code, http.StatusNotFound, rec.Body)
+	}
+	var body errorBody
+	decode(t, rec, &body)
+	if body.Error.Type != "not_found" {
+		t.Errorf("error type = %q, want not_found", body.Error.Type)
 	}
 }
