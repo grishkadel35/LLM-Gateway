@@ -138,7 +138,8 @@ var rates = []Rate{
 	// https://platform.claude.com/docs/en/about-claude/models/overview;
 	// dateless from the 4.6 generation on, aliases before it. MaxOutput is
 	// "Max output" on the model page that overview links to
-	// (https://platform.claude.com/docs/en/models/<model>/overview, checked
+	// (https://platform.claude.com/docs/en/models/<model>/overview, with the
+	// ID's "claude-" left off, as in models/opus-4-5/overview; checked
 	// 2026-10-24): the synchronous Messages API limit, with K as 1,000 (the
 	// Batch API page writes its 300K as 300,000). That page's extended output
 	// beta raises the limit to 300K on the Message Batches API only, which
