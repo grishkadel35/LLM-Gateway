@@ -46,6 +46,16 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
     - **Output:** at the client's own cap. With no cap, or a cap above the
       model's maximum, the model's maximum output, the most it can actually
       answer.
+  - `internal/budget` keeps each tenant's spend for the month in Redis, one
+    hash per tenant and month. It isn't wired into requests yet.
+    - One Lua script checks and reserves atomically, so two requests can't
+      both take the last of a budget. Another script settles each reservation
+      to the real cost.
+    - A missing hash is rebuilt from `usage_logs` plus the writer's queue.
+      A request still in flight while that happens is counted exactly once.
+  - The dev Redis keeps no snapshots now (`--save ''`). A snapshot restored
+    after a crash would bring back an older, lower spend, so every restart
+    starts empty, and budgets are rebuilt from Postgres.
 - **A request that never reached its provider costs nothing.** When the
   gateway can't connect at all (a DNS failure, a refused connection, a dial
   timeout), the request never left it. Its usage row now costs 0 instead of
@@ -1056,6 +1066,7 @@ internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
 internal/ratelimit/       per-tenant token bucket in Redis (Lua scripts)
+internal/budget/          per-tenant monthly spend in Redis (Lua scripts), rebuilt from Postgres
 internal/cache/           exact-match response cache: the request key, entries in Redis
 internal/redistest/       Redis client for tests
 internal/admin/           admin API: create tenants, change their limits, issue and revoke keys

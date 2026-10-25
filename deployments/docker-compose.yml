@@ -32,11 +32,15 @@ services:
 
   redis:
     image: redis:8-alpine
+    # No snapshots. A snapshot restored after a crash would bring back an
+    # older, lower spent in every budget ledger. With none, a restart starts
+    # empty, and each ledger is rebuilt from usage_logs in Postgres.
+    command: ["redis-server", "--save", ""]
     # Bound to loopback like Postgres, so nothing off this machine can reach it.
     ports:
       - "127.0.0.1:6379:6379"
-    # No volume: the rate-limit buckets are disposable, and losing them only
-    # refills every tenant.
+    # No volume: everything here can be lost. Rate-limit buckets refill, cached
+    # answers are fetched again, and budget ledgers are rebuilt from Postgres.
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
