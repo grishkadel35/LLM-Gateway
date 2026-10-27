@@ -3,22 +3,22 @@
 A reverse proxy that sits between your applications and LLM providers. It routes
 each request to the right provider, presents that provider's API key in whatever
 header it expects, and logs the result. It enforces each tenant's
-tokens-per-minute limit and answers repeated requests from a response cache;
-budget enforcement plugs in later.
+tokens-per-minute limit and monthly dollar budget, and answers repeated
+requests from a response cache.
 
 Providers speak their own native APIs — the gateway never translates request or
 response bodies, so new provider features work the day they ship. Adding a
 provider is a block of YAML, not code.
 
 > **⚠️ Keep it on loopback for now.** Every provider route requires a tenant
-> key, but there is no TLS or budget enforcement yet, so the gateway binds to
-> `127.0.0.1` by default. Binding wider is your call to make deliberately.
+> key and is held to the tenant's budget, but there is no TLS yet and
+> `/metrics` needs no key, so the gateway binds to `127.0.0.1` by default.
+> Binding wider is your call to make deliberately.
 
 ## Project status
 
-**Last updated:** 2026-10-25
-**Stage:** Weeks 1 to 4 of 8 complete, checkpoints closed; Week 5
-(per-tenant budgets) is under way. Every provider
+**Last updated:** 2026-10-26
+**Stage:** Weeks 1 to 5 of 8 complete, checkpoints closed. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -26,10 +26,36 @@ Groq and Gemini. A tenant over its limit gets `429` with `Retry-After` before
 any provider is called, and each charge is corrected to the tokens the
 provider reported. A repeated non-streaming request that sets temperature 0 or
 sends `X-Gateway-Cache: on` is answered from Redis, without a charge and without
-calling the provider, in about 1.1 ms (median of 20 hits, by curl).
+calling the provider, in about 1.1 ms (median of 20 hits, by curl). A paid
+request is also held to its tenant's monthly budget: before the provider is
+called, the gateway reserves the most the request could cost, and a tenant whose
+budget can't cover that gets `402`. Of 50 requests sent at once against room for
+10, exactly 10 reach the provider, and a month lost with Redis is rebuilt from
+the usage rows.
 
 ### What changed
 
+- **Week 5 checkpoint closed.** Six tests in
+  `cmd/gateway/budget_checkpoint_test.go`, through the real router against a
+  real Postgres and Redis, show that a tenant with a $1 budget gets its first
+  `402` after 18 requests and $0.90 of usage, once its next request could cost
+  more than is left, and that the usage rows then sum to the ledger's spend;
+  that 50 simultaneous requests against room for 10 put exactly 10 through; and
+  that a month lost with Redis is rebuilt from the rows, so the next request is
+  admitted or refused exactly as before, and a request in flight when it was
+  lost still ends with the spend equal to the rows' sum. A live check against
+  Groq and Gemini passed: every `402` was exact,
+  `GET /admin/tenants/{id}/budget` matched the usage rows, and the spend
+  survived a Redis restart. See
+  [Week 5 deliverables](#week-5-deliverables--per-tenant-budgets-) and
+  [The budget contract](#the-budget-contract).
+- **A client that leaves during the budget check is no longer an error.** When
+  the budget check fails and the request's own context is done, the gateway now
+  logs "client closed request during budget check" at Info and ends the request
+  with 499 and no body, as the proxy does for a client that leaves before the
+  provider answers. Until now that was an Error, "budget check failed", and a
+  503 that nobody read. A ledger that fails or times out while the client is
+  still there still logs the Error and answers `503 budget_unavailable`.
 - **A tenant's budget can be read over the admin API.**
   `GET /admin/tenants/{id}/budget` reports the current UTC month in the
   fields a 402 uses: `budget_micros`, `spent_micros`, `remaining_micros`
@@ -66,8 +92,9 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
       lower output cap, or, on a $0 budget, a free provider.
   - A model the price table lacks gets `400 unknown_model`, naming the
     provider and the model, and so does a request that names no model.
-    - An OpenAI- or Anthropic-format body that isn't JSON names no model, so
-      it gets this 400 too. Until now the provider rejected it.
+    - A body that isn't a JSON object has no model to read, so it gets this
+      400 too, Gemini's included, though Gemini names its model in the URL.
+      Until now the provider rejected it.
   - Budgets fail closed: when Redis or Postgres can't answer, a paid request
     gets `503 budget_unavailable`.
   - Free providers (Ollama) and cache hits never touch the budget. On the
@@ -76,8 +103,8 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
   - The first reservation that takes a tenant's spend to 80% of its budget
     logs a Warn. That happens once a month, and again only if the ledger is
     rebuilt.
-- **What budgets will reserve, and rebuild from.** Week 5's budgets reserve
-  the most a request could cost before it reaches a paid provider.
+- **What budgets reserve, and rebuild from.** Budgets reserve the most a
+  request could cost before it reaches a paid provider.
   - The body owner now records a second, conservative input estimate for
     them: text at 3 bytes a token instead of the rate limiter's 4. Each image,
     audio or document part still counts as 1,600 tokens.
@@ -231,14 +258,16 @@ calling the provider, in about 1.1 ms (median of 20 hits, by curl).
 - **Usage is recorded in Postgres.** Every request that reaches a provider
   now leaves one `usage_logs` row: the `X-Request-ID` the client got, the
   provider's own request ID, tenant, key, provider, model, endpoint, status,
-  tokens, cost in micro-dollars (NULL, with a warning, for an unpriced model or
-  a response whose usage is incomplete),
-  whether it streamed, and latency. A request that got no response (timeout,
-  unreachable provider, client gone) still leaves a row, with status
-  499/502/504 and NULL cost: the provider may have billed it. Rows are queued and batch-inserted every
-  100 rows or second, off the response path: a full queue drops a row (logged
-  and counted) rather than slow a response down, and shutdown drains the
-  queue. This replaces the interim `usage` log line.
+  tokens, cost in micro-dollars (NULL, with a warning, for a response whose
+  usage is incomplete; since Week 5 a paid provider's unpriced model is refused
+  before it gets a row), whether it streamed, and latency. A request that got
+  no response (timeout, unreachable provider, client gone) still leaves a row,
+  with status 499/502/504 and NULL cost: the provider may have billed it. The
+  exception is a failed dial (a DNS failure, a refused connection, a dial
+  timeout): the request never left the gateway, so its row costs 0. Rows are
+  queued and batch-inserted every 100 rows or second, off the response path: a
+  full queue drops a row (logged and counted) rather than slow a response down,
+  and shutdown drains the queue. This replaces the interim `usage` log line.
 - **Pricing.** `internal/pricing` holds per-model prices for all four
   providers in integer micro-dollars, copied from each provider's pricing
   page on 2026-10-05 (source and date noted per block). It handles dated
@@ -504,9 +533,9 @@ charging the tenant.
 
 The cache runs after `ReadBody` and before `RateLimit`. It needs the tenant from
 Auth and the body from `ReadBody`, and a hit must never touch the rate limit's
-bucket or, from Week 5, the budget. The order on a provider route is Auth →
-StripPrefix → RequireMetered → ReadBody → Cache → RateLimit → (Fallback) →
-proxy. For the same reason it is middleware rather than a hook in
+bucket or the budget. The order on a provider route is Auth → StripPrefix →
+RequireMetered → ReadBody → Cache → RateLimit → (Fallback) → Budget → proxy.
+For the same reason it is middleware rather than a hook in
 `ModifyResponse`, which runs inside the proxy, after `RateLimit` has charged the
 request. Like the rate limiter, it comes in two pieces: `internal/cache` owns
 the key and Redis, and `middleware.Cache` is the HTTP side, over a small
@@ -567,6 +596,164 @@ Hit latency through the real server, by curl, had a median of 1.14 ms on Groq
 comparison, calls the provider answered took 0.31–0.45 s on Groq and 2.6–7.8 s
 on Gemini (non-streamed misses and bypasses, from `latency_ms`). Gemini answered
 every call this time, with no 503s, and the gateway logged no Warn.
+
+### Week 5 deliverables — per-tenant budgets ✅
+
+Goal: a paid request is refused, before its provider sees it, when its tenant's
+monthly budget can't cover what it could cost, and concurrent requests can't
+spend the same dollars twice.
+
+- [x] Integer micro-dollars — prices, reservations, budgets and costs are
+  whole µ$, with no floats, and the ledger adds with `HINCRBY`. Budgets and
+  reservations stop at 1e15 µ$ ($1 billion), which keeps every number the Lua
+  scripts compare exact
+- [x] The reservation — `pricing.Reserve` prices the most a request could
+  cost: the input estimate (text at 3 bytes a token, 1,600 per media part) at
+  the model's dearest input-side rate, plus the output cap, held to the model's
+  maximum output, which a request with no cap reserves whole. Each attempt
+  reserves at its own provider's prices
+- [x] Check-and-reserve in Redis — `internal/budget` keeps a tenant's month in
+  one hash, `budget:{<tenant_id>}:<YYYY-MM>`, and one Lua script checks the
+  budget and reserves in a single step, so two requests can't take the last of
+  it. The hash expires a day after the month ends
+- [x] Rebuilding after a Redis loss — a missing hash is rebuilt from the
+  month's `usage_logs` rows plus the cost of rows still queued in the usage
+  writer, and a request in flight settles its whole cost into the rebuilt
+  month. The bounds where overspend is still possible are in the contract
+- [x] Settlement at the real cost — once an attempt is over, its reservation
+  is swapped for the cost on its usage row, priced by the same function, so the
+  ledger and `usage_logs` agree to the micro-dollar. A provider's error, a
+  failed dial and a request that got no concurrency slot cost 0. A request that
+  may have been billed, with its usage unknown, keeps its reservation
+- [x] The refusals — `402 budget_exceeded` carries the numbers behind it, and
+  `400 unknown_model` refuses a model with no price, both before the provider
+  sees the request
+- [x] Free providers and cache hits never touch the budget — Ollama answers on
+  a spent budget and with Redis down, and a hit is served before the budget is
+  asked
+- [x] The 80% warning — one Warn a month for each tenant, and again after a
+  rebuild
+- [x] The admin API — `PATCH /admin/tenants/{id}` sets a tenant's
+  `budget_micros` (and its two limits), and `GET /admin/tenants/{id}/budget`
+  reports the month
+- [x] Tests — the reservation and the price table; the ledger, against a real
+  Redis and Postgres; the middleware and the routes, over a fake ledger; and the
+  checkpoint, through the real router against a real Postgres and Redis
+
+[The budget contract](#the-budget-contract) has each of these in full.
+
+The Week 5 checkpoint is "a $1-budget tenant gets 402 after about $1 of usage,
+with no overspend under concurrent load or across a Redis restart." Six tests in
+`cmd/gateway/budget_checkpoint_test.go` check it through the real router, built
+from the parts `main` uses: the tenant store and usage writer on Postgres, and
+the cache, the rate limiter and the budget ledger on Redis, on the client
+`openRedis` builds. They sit in front of a provider whose every answer reports
+20 input and 5,000 output tokens, so a request costs a known amount: 50,050 µ$
+on `gpt-4o`, at $2.50 and $10 per million. They need `DATABASE_URL` and
+`REDIS_URL`: without them they skip.
+
+`TestBudgetOneDollar` gives a tenant a $1 budget and sends it `gpt-4o` requests
+capped at 10,000 output tokens, one after another. Each reserves 100,068 µ$ and
+settles at 50,050, so 18 get in, and the 19th finds 99,100 µ$ left, 968 short,
+and gets `402` with every field of its error exact, the message aside. The 18
+usage rows sum to 900,900 µ$, under the $1, and `spent_micros` from the budget
+report equals them. `TestBudgetNoOverspendUnderLoad` sends 50 requests at once
+against a budget 1 µ$ short of room for 11 reservations. The provider holds each
+request it gets until all 50 have reached it or been refused, so none settles
+while the others are checked. Exactly 10 reach the provider and 40 get `402`,
+each finding the same spend, 10 reservations, and reporting the same
+`reserve_micros`. Once the provider lets go, the rows sum to 500,500 µ$, within
+the budget, and the ledger's spend equals them. The test opens its pool's 10
+database connections before the requests go and allows no more: 50 cold
+connections opening at once under `-race` could hold a Redis call past its
+100 ms deadline, failing the test on a Warn or a 503 though no budget went
+wrong. That happened in 2 of 40 runs before the cap, and in none of the 90
+stress runs since.
+
+`TestBudgetRedisLossAtTheBoundary` spends part of a budget on 5 requests: the
+rows of 3 are committed to Postgres, and the rows of 2 are held in the writer's
+queue by a table lock, so no batch can commit inside a rebuild and be counted
+twice. With the budget 1 µ$ short of one more reservation, the next request is
+refused with the same `402` before the loss and after it, from the month that
+request rebuilds. With room for exactly one, a month lost and rebuilt by the
+budget report holds the spend from before, and then admits one request and
+refuses the next. `TestBudgetRedisLossInFlight` loses the month while a request
+is held at the provider. The month is rebuilt without that request's
+reservation, since it has no usage row yet, and with a new `gen`; once the
+request ends, it settles its whole cost into the rebuilt month, and
+`spent_micros` comes to the sum of the rows.
+
+`TestBudgetFreeOnASpentBudget` uses up a tenant's budget on one request to groq.
+Groq then gets `402`, while ollama, which is free, still answers: its usage row
+costs 0, and the spend stays where it was. `TestBudgetFallbackAtGroqsPrice`
+sends a request to ollama while ollama is failing, so groq answers. While groq's
+attempt is in flight, the spend holds its reservation at groq's price for the
+model the fallback maps to (`qwen/qwen3.8-27b`, for the client's `qwen3.5:9b`),
+and once it settles, the spend has risen by exactly the cost on groq's usage
+row.
+
+Any line the gateway logs at Warn or above that a test doesn't expect fails it,
+with a message saying what can cause it: budgets fail closed, so a Redis script
+over 100 ms or a rebuild over 2 s refuses a request with
+`503 budget_unavailable` where the cache and the rate limiter would let it
+through with a Warn, and a settlement over 100 ms leaves a reservation in place
+of the charge. The 80% Warn counts too: each test expects it exactly as often
+as its reservations should log it.
+
+`go test -race -count=30 -cpu 1,2,4 -run 'Budget' ./cmd/gateway/` passed: each
+of the 22 tests it runs, these six and the 16 other `Budget` tests in the
+package, passed 90 of 90 runs (30 at each of `-cpu` 1, 2 and 4), with none
+failed or skipped and no data race. With `reserve.lua`'s check replaced by
+"admit everything", `TestBudgetNoOverspendUnderLoad` fails: 50 of the 50
+requests reach the provider, where it wants 10.
+
+The gateway has also been exercised against live providers with budgets on
+(2026-10-25 and 2026-10-26, built from `b266bde`, with the compose Postgres and
+a Redis of its own, started with `--save ''`): Groq `openai/gpt-oss-120b`
+through the `openai` Python SDK (3.37.0) and Gemini through `google-genai`
+(2.33.0), each on a tenant whose budget was PATCHed small. The prompt was "Reply
+with the single word: ok", and a capped request asks for 256 output tokens.
+
+On Groq, a capped request (`reasoning_effort` low) reserved 161 µ$. With the
+budget at 311 µ$, 7 requests were admitted and the 8th got `402` with every
+field exact: spent 171, remaining 140, reserve 161.
+`GET /admin/tenants/{id}/budget` said 171, the sum of the 7 rows. After a
+`docker restart` of the Redis, the same `GET` rebuilt the month with spent 171,
+and the next request got the same `402`. Raising the budget to spent + 161,
+332 µ$, admitted exactly one more request and refused the next. Ollama, which
+is free, answered on the spent budget, and its row cost 0. In all there were 9
+rows, costing 197 µ$, equal to `spent_micros`, and one 80% Warn for each hash
+the ledger built.
+
+On `gemini-3.8-flash` both `402`s were exact. A capped request reserved 994 µ$
+and was refused with 151 µ$ left. An uncapped one reserved 245,782 µ$ (its
+65,536 maximum output tokens at $3.75 per million is 245,760, plus the input
+estimate) and was refused as more than the whole budget. The requests that were
+admitted got Gemini's own `503` "high demand", which gave the whole reservation
+back, or timed out as `504`. Each `504` kept its whole reservation, with a
+NULL-cost row: 994 µ$ for a capped request, and 245,782 for an uncapped one.
+The Redis restart came between the two, and its rebuild counted the capped
+request's row as 0, dropping its reservation. Both are documented bounds, seen
+live.
+
+`gemini-3.8-flash` answered `503` "high demand" or timed out on both days,
+direct calls without the gateway included, so that is Gemini's capacity and not
+the gateway's doing. The rest of the check ran on `gemini-3.6-flash`
+(2026-10-26), which has the same price row. Gemini names its model in the URL,
+so the request body and both reservations are identical. With the budget at
+1,994 µ$, 4 capped requests were admitted, each only while 994 µ$ still fit, and
+the 5th got `402` with every field exact: spent 1,187, remaining 807, reserve
+994. Each row holds Gemini's own token counts, thoughts counted as output (8 in;
+87, 62, 93 and 68 out), and costs exactly their price (332, 239, 355 and
+261 µ$); `GET /admin/tenants/{id}/budget` said 1,187, the rows' sum. With the
+budget then set to spent + 245,782, one uncapped request was admitted. While it
+ran, `spent_micros` stood exactly 245,782 above its value before: the
+reservation of the model's whole maximum output. When the request ended, that
+was swapped for the 359 µ$ on its row, and the next uncapped request got an
+exact `402`. In all there were 5 rows, none with a NULL cost, costing 1,546 µ$,
+equal to `spent_micros`, and one 80% Warn. An earlier run that day, on another
+tenant, had one capped request time out as a `504`, which kept its 994 µ$
+reservation, as above.
 
 ## Quick start
 
@@ -688,12 +875,15 @@ Migrations live in `internal/db/migrations` and are embedded into the binary,
 so a build always carries the schema its code expects. `make migrate` targets
 the compose database; pass `DATABASE_URL=postgres://...` to use another.
 
-Redis holds the rate-limit buckets (Week 3) and the cached responses (Week 4).
-It has no volume, because both are disposable: losing the buckets only refills
-every tenant, and losing a cached response only makes the next identical request
-a miss. It has no password either, so binding to loopback is what keeps it
-private, which matters more now that cached answers sit in it unencrypted until
-their TTL ends.
+Redis holds the rate-limit buckets (Week 3), the cached responses (Week 4) and
+the budget ledgers (Week 5). It has no volume and takes no snapshots
+(`--save ''`), because all three can be lost: losing the buckets only refills
+every tenant, losing a cached response only makes the next identical request a
+miss, and a lost ledger is rebuilt from `usage_logs` (see
+[The budget contract](#the-budget-contract)). A snapshot would be worse than
+none: restored after a crash, it would bring back an older, lower spend. It has
+no password either, so binding to loopback is what keeps it private, which
+matters more now that cached answers sit in it unencrypted until their TTL ends.
 
 The gateway finds it through `REDIS_URL`: `make run` and `make run-mock` point
 it at this one (pass `REDIS_URL=redis://...` to use another). The gateway pings
@@ -792,6 +982,11 @@ non-streaming request with temperature 0 or the header `X-Gateway-Cache: on`;
 below 1, is a startup error. [The cache contract](#the-cache-contract) has the
 details.
 
+Budgets are not configuration. A tenant's monthly budget is its `budget_micros`
+in Postgres ($50.00 by default), changed with `PATCH /admin/tenants/{id}`; the
+only budget setting here is a provider's `free: true`, which exempts it.
+[The budget contract](#the-budget-contract) has the details.
+
 ### Adding a provider
 
 Anything OpenAI-compatible is pure config. Groq is in the default file as proof
@@ -843,8 +1038,9 @@ The provider block:
 
 `auth: none` because Ollama takes no key (see [Configuration](#configuration));
 `free: true` because it costs nothing, though its tokens still belong in the
-usage rows. The environment variables are all optional, and
-[`.env.example`](.env.example) lists them:
+usage rows, and because a free provider is never budgeted: it is served even
+when a tenant's budget is spent. The environment variables are all optional,
+and [`.env.example`](.env.example) lists them:
 
 | Variable                       | Default                  | Meaning                                                           |
 | ------------------------------ | ------------------------ | ----------------------------------------------------------------- |
@@ -908,7 +1104,12 @@ a route with fallback enabled say who answered:
 - `X-Gateway-Fallback: true|false`
 
 Each attempt leaves its own usage row under the same request ID: the failed
-Ollama attempt costs 0, and the Groq attempt is priced normally.
+Ollama attempt costs 0, and the Groq attempt is priced normally. Budgets follow
+the same split: Ollama's attempt reserves nothing, and Groq's reserves at
+Groq's prices for the model it maps to. A tenant whose budget can't cover that
+gets `402` with `X-Gateway-Provider: groq` and `X-Gateway-Fallback: true`
+instead of Groq's answer, and a mapped model with no price gets
+`400 unknown_model` (see [The budget contract](#the-budget-contract)).
 
 **Docker.** The gateway has no compose service yet (Week 7). Once it runs in a
 container, set `OLLAMA_BASE_URL=http://host.docker.internal:11434` and add
@@ -924,13 +1125,13 @@ to the network: bind it to the Colima bridge address or firewall it.
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
 | `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
-| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit or the provider (see [The cache contract](#the-cache-contract)). |
+| `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)) and, on a paid provider, with room in its monthly budget for what the request could cost (`402` otherwise, see [The budget contract](#the-budget-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit, the budget or the provider (see [The cache contract](#the-cache-contract)). |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
-| `PATCH /admin/tenants/{id}`       | Admin key. Any of `budget_micros`, `rate_limit_tokens_per_min`, `default_max_tokens` → `200` with the tenant; the next request uses them. |
+| `PATCH /admin/tenants/{id}`       | Admin key. Any of `budget_micros` (0 to 1e15 µ$; $50.00 by default), `rate_limit_tokens_per_min` (1 to 2^40) and `default_max_tokens` (1 to 2^31 − 1) → `200` with the tenant; the next request uses them. `400` for an unknown field, a `null`, a non-integer or a value out of range; `404` for an unknown tenant. |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
 | `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage.  |
-| `GET /admin/tenants/{id}/budget`  | Admin key. This UTC month's `budget_micros`, `spent_micros` (in-flight reservations included) and `remaining_micros`, with `period` and `resets_at`; `503 budget_unavailable` if the ledger can't answer. |
+| `GET /admin/tenants/{id}/budget`  | Admin key. This UTC month's `budget_micros`, `spent_micros` (in-flight reservations included) and `remaining_micros` (never below 0), with `period` and `resets_at`; `404` for an unknown tenant, `503 budget_unavailable` if the ledger can't answer. See [The budget contract](#the-budget-contract). |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
 
 Metered endpoints, the only ones forwarded:
@@ -1058,11 +1259,12 @@ can read one.
   `X-Gateway-Provider` (the route's provider) and `X-Gateway-Fallback: false`,
   as every other response there does.
 - **What a hit costs, and how long it lasts.** A hit never reaches the rate
-  limit, so it is served even when the tenant's bucket is empty. It leaves a
-  usage row with `cached` true, no tokens and cost 0, which the usage report
-  counts as a request. Entries live for `cache.ttl` (3,600 seconds by default)
-  from the moment they are stored, and a hit doesn't extend that. There is no
-  way to flush a tenant's entries, and a hit carries no `Age` header.
+  limit or the budget, so it is served even when the tenant's bucket is empty
+  or its budget is spent. It leaves a usage row with `cached` true, no tokens
+  and cost 0, which the usage report counts as a request. Entries live for
+  `cache.ttl` (3,600 seconds by default) from the moment they are stored, and a
+  hit doesn't extend that. There is no way to flush a tenant's entries, and a
+  hit carries no `Age` header.
 - **Opting out.** Send `X-Gateway-Cache: off`. A "regenerate" button that
   resends a temperature-0 request would otherwise get the same answer back for
   the whole TTL, and so would an eval that runs one prompt several times.
@@ -1077,6 +1279,228 @@ can read one.
   never reaches the provider. The providers' prompt caching is another thing: it
   still runs the model, bills the input tokens it has seen before at a discount,
   and is metered as before (`cached_input_tokens` and `cache_write_tokens`).
+
+### The budget contract
+
+Every tenant has a monthly budget, in dollars. Before a request goes to a paid
+provider, the gateway reserves the most that request could cost. When the
+reservation doesn't fit what is left of the month's budget, the gateway answers
+`402` itself and the provider is never called. Here is one (a `gpt-5.5` request
+with `max_completion_tokens` 1,000 and a 300-byte body, against a $1.00 budget
+with $0.98 spent). The body has this shape for every provider:
+
+```json
+{"error":{"budget_micros":1000000,"message":"this request could cost up to $0.0305, more than the $0.02 left of the gateway's $1.00 monthly budget for this tenant; the budget resets at 2026-11-01T00:00:00Z","period":"2026-10","remaining_micros":20000,"reserve_micros":30500,"resets_at":"2026-11-01T00:00:00Z","spent_micros":980000,"type":"budget_exceeded"}}
+```
+
+Once an admitted request is over, its reservation is swapped for what it really
+cost. Reserving first is what keeps two requests that arrive together from both
+taking the last of a budget: the check and the reservation are one Lua script,
+which Redis runs atomically.
+
+Money is counted in micro-dollars (µ$): 1,000,000 µ$ is $1. A tenant's budget
+is its `budget_micros`: 50,000,000 ($50.00) by default, at most 1e15 ($1
+billion), and 0 for free providers only. `PATCH /admin/tenants/{id}` changes it,
+and the next request uses the new value against the month's spend as it stands.
+The budget belongs to the tenant, so all of its keys, providers and models share
+it. Its period is the UTC calendar month in which a request arrived, the same
+clock as the request's usage row, and monthly is the only period: the database
+refuses any other.
+
+- **What a request reserves.** The most it could cost, estimated before the
+  provider has seen it:
+  - **Input** is a conservative estimate: the body's text at 3 bytes a token
+    (the rate limiter's estimate uses 4), plus 1,600 tokens for each image,
+    audio, document or file part, whose payload is left out. It is priced at the
+    model's dearest input-side rate: the input rate, or a cache-write rate,
+    which is up to twice the input rate (Anthropic's 1-hour writes). So a prompt
+    the provider writes to its prompt cache is covered too.
+  - **Output** is the client's own cap (`max_tokens`, `max_completion_tokens`,
+    Gemini's `maxOutputTokens`) times the choices it asked for (`n`,
+    `candidateCount`), but never more than the model's maximum output times the
+    choices. A request with no cap reserves that maximum, since the gateway
+    never rewrites a request to add one and the answer can be that long: at the
+    prices of 2026-10-25, `gpt-5.5` reserves $3.84 of output (128,000 tokens) and
+    `gemini-3.8-flash` $0.25 (65,536), plus the input. A lower cap keeps the
+    reservation small, and a cap above the maximum is held to it. The maximums
+    are the figures on each provider's model pages, kept in `internal/pricing`.
+  - **The price** is the one in force when the request arrived. When the input
+    estimate is over a model's long-context threshold, the long-context prices
+    apply to the whole request. The total is rounded up to a whole micro-dollar
+    and stops at 1e15 µ$, the largest budget, which keeps the Lua scripts'
+    arithmetic exact: their numbers are doubles, exact only below 2^53.
+  - **Each paid attempt** reserves at its own provider's prices. On the
+    ollama → groq fallback, Ollama's attempt reserves nothing, and Groq's
+    reserves at Groq's prices for the model the fallback maps to.
+- **The 402.** `error.type` is `budget_exceeded`, and the body carries six
+  fields:
+  - `budget_micros`: the tenant's monthly budget.
+  - `spent_micros`: the month's spend, which is settled costs plus the
+    reservations of requests still in flight. A tenant with big requests open
+    can be refused while its settled spend is well under its budget.
+  - `remaining_micros`: the budget minus the spend, never below 0. A budget
+    lowered under the spend has nothing left.
+  - `reserve_micros`: the most this request could cost, the reservation that
+    didn't fit.
+  - `period`: the UTC month, such as `2026-10`.
+  - `resets_at`: when the month ends, which is the next month's start in UTC, in
+    RFC 3339.
+
+  The message is in exact dollars ($0.004 is never shown as $0.00) and says what
+  would help. An ordinary refusal names what the request could cost, what is
+  left and when the budget resets. A request that could cost more than the whole
+  budget gets a 402 whatever the spend, since waiting won't help, and its
+  message says to set a lower output cap or send a shorter request. An uncapped
+  request to an expensive model is such a request on a small budget. On a $0
+  budget the message says the tenant can use free providers only.
+- **No `Retry-After`.** The reset is weeks away, and the SDKs don't retry a 402.
+  A client can tell the gateway's 402 from a provider's own error by its
+  `error.type`, a message that names the gateway's monthly budget, and the six
+  fields; a provider's own error passes through with its own body. A refused
+  request leaves no usage row, and on a route without a fallback the rate
+  limiter refunds its whole charge. The gateway logs one Info line for each 402.
+- **`400 unknown_model`.** A request can be reserved only for a model that has a
+  price. A model the price table lacks gets `400 unknown_model`, naming the
+  provider and the model, before anything is reserved. So does a request that
+  names no model, and one whose body isn't a JSON object, which has no model to
+  read (Gemini's too, though Gemini names its model in the URL). Every tenant has
+  a budget, so every tenant gets it, and the gateway logs a Warn, since the fix
+  is a row in `internal/pricing/pricing.go`. A model
+  can lack a price for want of a public one (the Llama models Groq lists as
+  "contact sales") or on purpose (the `-latest` aliases, such as
+  `gemini-flash-latest`, which Google moves to newer models, so a reservation
+  priced for the old one could fall short). A free provider's models never get
+  it.
+- **Failing closed.** If the gateway can't check a budget (Redis fails, Postgres
+  fails while a missing ledger is rebuilt, or either is too slow), a paid
+  request gets `503 budget_unavailable`, the provider is never called and the
+  gateway logs an Error. An outage costs availability, never overspend. This is
+  the opposite of the rate limiter and the cache, which fail open, because a
+  budget guards money. Each Redis script gets 100 ms, and a rebuild 2 s, however
+  many times it reads again.
+  - A client that leaves while the check runs is the exception. Nobody reads the
+    503, so its request ends with status 499 and the gateway logs an Info line,
+    as the proxy does for a client that has gone before the provider answers. A
+    ledger that fails or times out while the client is still there stays an
+    Error and a 503.
+  - A reservation that fails after Redis has run it, such as one whose reply was
+    lost, stays in the month's spend. That over-counts, never under-counts.
+- **Free providers and cache hits never touch the budget.** A provider with
+  `free: true` (Ollama) has no reservation, no Redis call and no settlement, so
+  it is served when the budget is spent and when Redis is down, and its usage
+  rows cost 0. A cache hit is answered before the rate limit and the budget, so
+  it reserves nothing, costs 0 and is served on a spent budget.
+- **Settlement.** When an admitted attempt is over, the gateway swaps its
+  reservation for its charge, by the last usage reported for the attempt:
+  - **No report: 0.** Nothing reached the provider, as with a request that got
+    no concurrency slot (`503 provider_busy`).
+  - **A complete response: its cost,** priced by the function that prices its
+    usage row, so the ledger and `usage_logs` agree to the micro-dollar. A
+    provider's 4xx or 5xx carries no tokens and costs 0, so the whole
+    reservation comes back.
+  - **A failed dial: 0.** A DNS failure, a refused connection or a dial timeout
+    means the request never left the gateway. It is reported complete with no
+    usage, so its row costs 0 and not NULL, and the rate limiter refunds it in
+    full. Without this, a network outage would use up budgets at the reservation
+    rate.
+  - **An incomplete response: the reservation,** or the cost of the usage seen
+    so far if that is more. That is a timeout, a stream the client abandoned, or
+    a connection dropped after the request was sent. The provider may have
+    billed it, so it keeps what it reserved, as the rate limiter keeps its
+    charge, and its row's cost is NULL. For an uncapped request, the reservation
+    is the model's maximum output.
+
+  Settlement runs once for each attempt, in a `defer`, so it also runs when the
+  proxy aborts a stream and when the client has gone. It holds the response's
+  last bytes for one Redis call, 100 ms at most. If it fails, the gateway logs a
+  Warn and the reservation stays in the month's spend in place of the charge.
+- **The 80% warning.** The first reservation in a month that takes a tenant's
+  spend (reservations in flight included) to 80% of its budget or more logs one
+  Warn, naming the tenant. That is once per tenant and month, and again only if
+  the ledger is rebuilt.
+- **Reading a budget.** `GET /admin/tenants/{id}/budget` reports the current
+  month's `budget_micros`, `spent_micros`, `remaining_micros`, `period` and
+  `resets_at`, with the `tenant_id`. `spent_micros` is the ledger's, rebuilt
+  first if it is missing, and asking reserves nothing. It can differ from the
+  usage report (`GET /admin/tenants/{id}/usage`), which sums the rows' costs: the
+  ledger also holds reservations in flight, and those kept by requests cut short,
+  whose rows have no cost. An unknown tenant gets 404, and Redis is never asked
+  about it. A ledger that can't answer gets `503 budget_unavailable`.
+- **Rebuilding after a Redis loss.** Postgres is the record of what a tenant
+  spent, and Redis holds a running total of it: one hash for each tenant and
+  month, `budget:{<tenant_id>}:<YYYY-MM>`, with `spent` (settled costs plus
+  reservations in flight), `gen` and `warned`. It expires a day after the month
+  ends, so a request that arrived on the last day still settles into it. When a
+  request finds no hash (Redis restarted, or flushed or evicted it, or the month
+  is new), the gateway rebuilds it before reserving:
+  - It reads, in this order, the month's missed-settle counter (below), the cost
+    of the tenant's rows still queued in the usage writer, and `SUM(cost_micros)`
+    over the month's rows in `usage_logs`. The queue comes before the sum so that
+    a batch that commits between the two reads is counted twice, an over-count,
+    and never missed. A row with no cost counts as 0.
+  - It writes the total only while the hash is still missing, inside the Lua
+    script that reserves, with a new random `gen`. A settle that finds no hash
+    writes none: it adds one to the missed counter, which expires with the hash.
+    If the counter has moved since the rebuild read it, nothing is written and
+    the reads start again, because that settle's row may have been queued after
+    the queue was read and committed after the sum.
+  - A request in flight when the hash went missing holds a reservation the
+    rebuilt hash doesn't have. It carries the old `gen`, so it settles its whole
+    cost into the new hash.
+  - Concurrent rebuilds of one hash share one set of reads, which gets 2 s and
+    runs under `context.WithoutCancel`, so one client leaving can't fail the
+    others waiting on it.
+- **Where overspend is still possible.** Under concurrent load and across a
+  Redis restart, a tenant doesn't spend past its budget, within these bounds:
+  - **A reservation below the real cost.** The input estimate and the output
+    allowance fall short for media beyond 1,600 tokens a part (PDFs, audio,
+    video, large images, `fileData`); text that takes more than a token per 3
+    bytes, such as dense non-Latin text; prompt tokens the body doesn't contain,
+    such as a chat template's (Groq counted 78 prompt tokens for
+    `openai/gpt-oss-120b` on a 145-byte body that the gateway estimates at 49,
+    because gpt-oss's template adds about 70, so a request whose answer reaches
+    its cap can cost a few µ$ more than it reserved: here 29 tokens at $0.15 per
+    million, about 4 µ$); Gemini's tool-use prompt tokens (code
+    execution, grounding), which are billed as input but aren't in the request;
+    Gemini 4 Argon's long-decode continuations, where each further request pays
+    again for the state its encrypted token carries; and prices the table
+    doesn't model (Anthropic's fast mode and `inference_geo`, OpenAI's service
+    tiers other than Standard, Gemini's audio input rates). Such a request is
+    charged its real cost when it settles, which can take the month past its
+    budget. The overspend is bounded by how far the requests in flight when the
+    budget runs out cost more than they reserved. After them, the next request
+    is refused.
+  - **A settlement that fails.** The reservation stays in place of the charge. A
+    request that cost less than it reserved is over-counted, and one that cost
+    more is under-counted by the difference. If the month's hash was missing,
+    a settle that failed before Redis ran it added nothing to the missed
+    counter, so a rebuild already under way can miss that request's row.
+  - **A rebuild.** It counts what this gateway's queue and Postgres hold when it
+    reads them. It misses rows queued on other gateway replicas, rows the usage
+    writer dropped (a full queue, or Postgres rejecting the row), and the rows a
+    gateway crash loses: those queued and not yet flushed, normally the last
+    second's. It forgets the reservations that requests cut short keep, since
+    their rows have no cost. And it doesn't hold the reservations of requests in
+    flight when the hash went missing until those requests settle.
+
+  The other mistakes are over-counts, which refuse a tenant early: a
+  reservation whose reply was lost, and a row a rebuild counts twice. They end
+  when the month does, or at the next rebuild.
+- **Redis without persistence.** The dev stack starts Redis with `--save ''`: no
+  snapshots, no append-only file (Redis's default) and no volume. Postgres, not
+  Redis, is the record of spend, and a restart is safe only if Redis comes back
+  empty. A snapshot restored after a crash would bring back an older, lower
+  `spent`, and the gateway would trust it, since a hash that exists is never
+  checked against Postgres. Empty, every ledger is rebuilt from `usage_logs` by
+  its next request. Production should run the Redis that holds budgets the same
+  way, with no snapshots and no append-only file. It should also keep budget
+  keys out of eviction: an evicted ledger is rebuilt like a lost one, with the
+  bounds above, and a missed counter evicted during a rebuild can hide a settle,
+  so that request's cost is counted nowhere. The dev Redis sets no `maxmemory`,
+  so nothing is evicted there. Week 7 plans one for the cache's sake, and budget
+  keys need a Redis of their own under `noeviction`, or no expiry under a
+  `volatile-*` policy, which evicts only keys that have one, with past months
+  deleted another way.
 
 ## Make targets
 
@@ -1103,7 +1527,7 @@ cmd/gateway/main.go       entry point: loads config, builds routes, serves
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy, its hooks and the fallback
-internal/middleware/      request IDs, request logging, tenant key auth, response cache, rate limiting
+internal/middleware/      request IDs, request logging, tenant key auth, response cache, rate limiting, budgets
 internal/health/          GET /health
 internal/concurrency/     per-provider request limit and its queue
 internal/metrics/         Prometheus metrics
@@ -1112,11 +1536,13 @@ cmd/mockprovider/main.go  serves the mock on 127.0.0.1:9090
 internal/db/              Postgres schema: embedded goose migrations
 internal/db/dbtest/       throwaway Postgres database for tests
 internal/tenant/          tenants and API keys: issue, revoke, look up
+internal/usage/           request body owner and estimates, usage parsers and metering, the usage_logs writer and reports
+internal/pricing/         per-model prices in micro-dollars, and the most a request could cost
 internal/ratelimit/       per-tenant token bucket in Redis (Lua scripts)
 internal/budget/          per-tenant monthly spend in Redis (Lua scripts), rebuilt from Postgres
 internal/cache/           exact-match response cache: the request key, entries in Redis
 internal/redistest/       Redis client for tests
-internal/admin/           admin API: create tenants, change their limits, issue and revoke keys
+internal/admin/           admin API: create tenants, change their limits, issue and revoke keys, report usage and budgets
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
 deployments/              docker compose dev stack (Postgres, Redis)
@@ -1135,23 +1561,44 @@ details you don't want other projects depending on.
 
 `ModifyResponse` in [internal/proxy/proxy.go](internal/proxy/proxy.go) runs
 after the provider responds and before the response is copied back to the
-client. That is where usage accounting reads token counts.
-Returning an error from it causes `ErrorHandler` to run instead of the response
-being forwarded — that's the mechanism for rejecting a request over budget.
+client. That is where usage accounting reads token counts. Returning an error
+from it causes `ErrorHandler` to run instead of the response being forwarded,
+which is how a fallback replaces a 5xx with another provider's answer.
 
 Rate limiting runs *before* the proxy, as middleware after `ReadBody` in
 `main.go`, so a refused request never reaches the provider. It settles on the
 way back too: the usage callback, which fires as each response ends (or fails),
 reports that request's tokens to it (`middleware.ReportUsage`), and it corrects
-the bucket once the request is over. Budget checks belong next to it.
+the bucket once the request is over.
+
+Budgets run before the proxy too, as `middleware.Budget`
+([internal/middleware/budget.go](internal/middleware/budget.go)), not as an
+error from `ModifyResponse`: a request over budget is answered there with a
+`402`, and its provider never sees it. Budget wraps each provider's own proxy,
+inside the rate limit and any fallback, so each attempt is reserved and settled
+at the prices of the provider that serves it. It settles through the same usage
+callback: `middleware.ReportUsage` also records each report on the attempt's
+reservation, and Budget swaps the reservation for the real cost in a `defer`,
+which runs even when the proxy aborts a stream.
 
 The response cache runs before rate limiting, as middleware between `ReadBody`
 and `RateLimit` in `main.go`
 ([internal/middleware/cache.go](internal/middleware/cache.go)), not in
 `ModifyResponse`: a hit has to skip the rate limit, which runs before the proxy.
 A miss learns how its response ended from the same usage callback
-(`middleware.ReportUsage`), and is stored once the request is over. Week 5's
-budget check goes inside the cache too, so a hit is never charged.
+(`middleware.ReportUsage`), and is stored once the request is over. The budget
+check sits inside the cache too, so a hit is never reserved or charged.
+
+Week 6, observability, hooks in at the same points. `internal/metrics` is
+already wired in `router()` in `main.go`: `Requests` wraps each provider route,
+and the usage callback feeds `Tokens`. That callback also prices each usage row
+(`recordUsage`), so it is where a cost counter goes. The refusals to count are
+each answered in one place, and each already logs one line: the rate limit's
+`429` in `middleware.RateLimit` and the budget's `402` in `middleware.Budget`.
+The cache's `hit`, `miss` and `bypass` are decided in `middleware.Cache`, the
+provider's time to first byte is known in `modifyResponse`, and the usage writer
+already counts the rows it drops (`Writer.Dropped`). A tenant's budget
+utilization is what `Ledger.Spent` reads for `GET /admin/tenants/{id}/budget`.
 
 ## Observability
 
@@ -1175,7 +1622,7 @@ admin auth and a separate port. No metric has a tenant or model label.
 
 | Metric                                       | Meaning                                                                                 |
 | -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`, `403`, `413`, `429` and `503` included.      |
+| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`–`403`, `413`, `429` and `503` included.       |
 | `gateway_request_duration_seconds{provider}` | Histogram of the whole response, streaming included.                                    |
 | `gateway_tokens_total{provider,type}`        | Tokens by `type`: `input`, `cached_input`, `cache_write`, `cache_write_1h` or `output`. |
 | `gateway_concurrency_wait_seconds{provider}` | Histogram of time spent waiting for a slot.                                             |
