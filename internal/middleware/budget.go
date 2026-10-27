@@ -11,6 +11,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/apierror"
 	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
+	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
@@ -71,10 +72,15 @@ func reservationFrom(ctx context.Context) *reservation {
 //
 // Budgets fail closed: when Reserve fails (Redis or Postgres is down, or
 // slower than the ledger's timeouts), the request gets 503
-// budget_unavailable. A reserve that fails after Redis ran it, such as one
-// whose reply was lost, still leaves its amount in the tenant's spend, which
-// over-counts but never under-counts. A Settle that fails is logged with a
-// Warn, and leaves the reservation in the spend in place of the charge.
+// budget_unavailable. The exception is a client that has left, told by the
+// request's own context being done: nobody reads a response, so it is logged
+// at Info, not Error, and ends with proxy.StatusClientClosedRequest, as the
+// proxy ends a request whose client leaves before the provider answers.
+// Either way there is no reservation to settle, and a reserve that fails
+// after Redis ran it, such as one whose reply was lost, still leaves its
+// amount in the tenant's spend, which over-counts but never under-counts. A
+// Settle that fails is logged with a Warn, and leaves the reservation in the
+// spend in place of the charge.
 //
 // It needs the tenant from Auth and the Request from ReadBody, so it runs
 // after both. It goes inside any fallback, around each provider's own proxy,
@@ -119,6 +125,17 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 			res, err := ledger.Reserve(ctx, t.ID, t.BudgetMicros, amount, req.Received)
 			switch {
 			case err != nil:
+				// The client has left if the request's own context is done. Ask
+				// the context, not err: the ledger's timeouts wrap
+				// context.DeadlineExceeded with the request still live, and stay
+				// a 503. As the proxy does for a client that has gone, answer 499
+				// with no body, at Info. No usage is reported, so RateLimit
+				// refunds the whole charge.
+				if ctx.Err() != nil {
+					logger.Info("client closed request during budget check", "request_id", id, "tenant_id", t.ID, "provider", provider)
+					w.WriteHeader(proxy.StatusClientClosedRequest)
+					return
+				}
 				logger.Error("budget check failed; request refused", "request_id", id, "tenant_id", t.ID, "provider", provider, "error", err)
 				budgetUnavailable(w)
 				return

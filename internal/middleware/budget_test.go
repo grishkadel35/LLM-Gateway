@@ -20,6 +20,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/provider"
+	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
@@ -35,6 +36,11 @@ type fakeLedger struct {
 	spent     int64
 	warn      bool
 	settleErr error
+	// started, when set, makes each Reserve send on it as it starts, and then
+	// wait for its request's context to be done before it answers: a client
+	// that leaves while the ledger works. It fails with err when that is set,
+	// and with the context's error when it isn't.
+	started chan struct{}
 
 	mu      sync.Mutex
 	calls   []reserveCall
@@ -48,13 +54,19 @@ type reserveCall struct {
 	at             time.Time
 }
 
-func (f *fakeLedger) Reserve(_ context.Context, tenantID string, budgetMicros, amount int64, at time.Time) (budget.Reservation, error) {
+func (f *fakeLedger) Reserve(ctx context.Context, tenantID string, budgetMicros, amount int64, at time.Time) (budget.Reservation, error) {
+	if f.started != nil {
+		f.started <- struct{}{}
+		<-ctx.Done()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, reserveCall{tenantID, budgetMicros, amount, at})
 	switch {
 	case f.err != nil:
 		return budget.Reservation{}, f.err
+	case f.started != nil:
+		return budget.Reservation{}, ctx.Err()
 	case f.refuse:
 		return budget.Reservation{Spent: f.spent, Amount: amount}, nil
 	}
@@ -288,27 +300,98 @@ func TestBudgetUnknownModel(t *testing.T) {
 }
 
 // TestBudgetFailsClosed: when Reserve fails, the request gets 503
-// budget_unavailable and goes no further, with an Error log.
+// budget_unavailable and goes no further, with an Error log. That includes a
+// ledger timeout, which wraps context.DeadlineExceeded: the request's own
+// context is still live, so it is no client that has left (see
+// TestBudgetClientLeaves).
 func TestBudgetFailsClosed(t *testing.T) {
-	var logs bytes.Buffer
-	ledger := &fakeLedger{err: errors.New("redis: connection refused")}
-	rec, _, reached, _ := serveBudget(t, ledger, "openai", false, slog.New(slog.NewJSONHandler(&logs, nil)), acmeWithBudget(50_000_000),
-		`{"model":"gpt-4o","messages":[]}`)
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"ledger error", errors.New("redis: connection refused")},
+		{"ledger timeout", fmt.Errorf("budget: rebuilding budget:{tn_acme}:2026-10: %w", context.DeadlineExceeded)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ledger := &fakeLedger{err: tc.err}
+			rec, _, reached, _ := serveBudget(t, ledger, "openai", false, slog.New(slog.NewJSONHandler(&logs, nil)), acmeWithBudget(50_000_000),
+				`{"model":"gpt-4o","messages":[]}`)
 
-	if reached || rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("reached = %v, status = %d; want 503, refused", reached, rec.Code)
+			if reached || rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("reached = %v, status = %d; want 503, refused", reached, rec.Code)
+			}
+			want := map[string]any{"type": "budget_unavailable", "message": "the gateway can't check this tenant's budget right now; retry shortly"}
+			if got := errorBody(t, rec); !reflect.DeepEqual(got, want) {
+				t.Errorf("error = %v, want %v", got, want)
+			}
+			if calls := ledger.recorded(); len(calls) != 1 {
+				t.Errorf("Reserve calls = %+v, want one", calls)
+			}
+			entry := logLine(t, &logs)
+			if entry["level"] != "ERROR" || entry["request_id"] != rec.Header().Get(HeaderRequestID) || entry["tenant_id"] != "tn_acme" ||
+				entry["provider"] != "openai" || entry["error"] != tc.err.Error() {
+				t.Errorf("log line = %v, want ERROR with the request ID, tenant, provider and error", entry)
+			}
+		})
 	}
-	want := map[string]any{"type": "budget_unavailable", "message": "the gateway can't check this tenant's budget right now; retry shortly"}
-	if got := errorBody(t, rec); !reflect.DeepEqual(got, want) {
-		t.Errorf("error = %v, want %v", got, want)
+}
+
+// TestBudgetClientLeaves: a client that leaves while Reserve runs has no one to
+// read a 503, so its request ends with 499 and no body, logged at Info, not
+// Error. The request's own context says so, whatever error the ledger fails
+// with: the context's, or one of its own. The request goes no further, and
+// nothing is settled.
+func TestBudgetClientLeaves(t *testing.T) {
+	cases := []struct {
+		name string
+		// err is what the ledger fails with once the client has left; nil for
+		// the context's own error.
+		err error
+	}{
+		{"ledger fails with the context's error", nil},
+		{"ledger fails with an error of its own", errors.New("redis: connection closed")},
 	}
-	if calls := ledger.recorded(); len(calls) != 1 {
-		t.Errorf("Reserve calls = %+v, want one", calls)
-	}
-	entry := logLine(t, &logs)
-	if entry["level"] != "ERROR" || entry["request_id"] != rec.Header().Get(HeaderRequestID) || entry["tenant_id"] != "tn_acme" ||
-		entry["provider"] != "openai" || entry["error"] != "redis: connection refused" {
-		t.Errorf("log line = %v, want ERROR with the request ID, tenant, provider and error", entry)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			ledger := &fakeLedger{err: tc.err, started: make(chan struct{}, 1)}
+			reached := false
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true })
+			h := RequestID(asTenant(acmeWithBudget(50_000_000), usage.ReadBody(provider.FormatOpenAI, 1<<20)(
+				Budget(ledger, "openai", false, slog.New(slog.NewJSONHandler(&logs, nil)))(next))))
+
+			// The client leaves once Reserve has started.
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() {
+				select {
+				case <-ledger.started:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"gpt-4o","messages":[]}`)))
+
+			if reached || rec.Code != proxy.StatusClientClosedRequest || rec.Body.Len() != 0 {
+				t.Fatalf("reached = %v, status = %d, body %q; want %d with no body, refused", reached, rec.Code, rec.Body, proxy.StatusClientClosedRequest)
+			}
+			if calls := ledger.recorded(); len(calls) != 1 {
+				t.Errorf("Reserve calls = %+v, want one", calls)
+			}
+			if got := ledger.settled(); len(got) != 0 {
+				t.Errorf("Settle calls = %+v, want none", got)
+			}
+			// One line, so no Error beside it.
+			entry := logLine(t, &logs)
+			if entry["level"] != "INFO" || entry["msg"] != "client closed request during budget check" ||
+				entry["request_id"] != rec.Header().Get(HeaderRequestID) || entry["tenant_id"] != "tn_acme" || entry["provider"] != "openai" {
+				t.Errorf("log line = %v, want INFO with the request ID, tenant and provider", entry)
+			}
+		})
 	}
 }
 
