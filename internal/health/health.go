@@ -1,5 +1,5 @@
-// Package health exposes the gateway's liveness endpoint, and checks in the
-// background the providers that ask for it.
+// Package health exposes the gateway's liveness and readiness endpoints, and
+// checks in the background the providers that ask for it.
 package health
 
 import (

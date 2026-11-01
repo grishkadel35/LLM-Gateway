@@ -17,8 +17,9 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-26
-**Stage:** Weeks 1 to 5 of 8 complete, checkpoints closed. Every provider
+**Last updated:** 2026-10-31
+**Stage:** Weeks 1 to 5 of 8 complete, checkpoints closed; Week 6
+(observability) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -35,6 +36,14 @@ the usage rows.
 
 ### What changed
 
+- **A readiness handler, not yet routed.** `health.ReadyHandler` will answer
+  `GET /ready`. It pings Postgres and Redis at the same time, each given a
+  second, and answers `200` with `"status":"ready"`, or `503` with
+  `"status":"not_ready"` and the failing check `down`.
+  - It never calls a provider.
+  - An error's text goes only to the log, at Warn, since the endpoint needs no
+    key.
+  - The gateway starts serving it later this week. `/health` doesn't change.
 - **Week 5 checkpoint closed.** Six tests in
   `cmd/gateway/budget_checkpoint_test.go`, through the real router against a
   real Postgres and Redis, show that a tenant with a $1 budget gets its first
