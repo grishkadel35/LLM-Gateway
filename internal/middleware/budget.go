@@ -82,6 +82,9 @@ func reservationFrom(ctx context.Context) *reservation {
 // Settle that fails is logged with a Warn, and leaves the reservation in the
 // spend in place of the charge.
 //
+// Each refusal, the 400, the 402 and the 503, is recorded on the request's
+// Record with its reason and provider. The 499 isn't a refusal.
+//
 // It needs the tenant from Auth and the Request from ReadBody, so it runs
 // after both. It goes inside any fallback, around each provider's own proxy,
 // so each attempt is reserved at the prices of the provider that serves it,
@@ -101,6 +104,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 				// is a wiring bug. Budgets guard money, so the request goes
 				// no further.
 				logger.Error("budget with no tenant or request; request refused", "request_id", id, "provider", provider)
+				recordRefusal(ctx, provider, "unavailable")
 				budgetUnavailable(w)
 				return
 			}
@@ -115,6 +119,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 				if req.Model == "" {
 					msg = fmt.Sprintf("the request names no model, so the gateway can't price it on provider %q", provider)
 				}
+				recordRefusal(ctx, provider, "unknown_model")
 				apierror.Write(w, http.StatusBadRequest, "unknown_model", msg, map[string]any{"provider": provider, "model": req.Model})
 				return
 			}
@@ -137,6 +142,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 					return
 				}
 				logger.Error("budget check failed; request refused", "request_id", id, "tenant_id", t.ID, "provider", provider, "error", err)
+				recordRefusal(ctx, provider, "unavailable")
 				budgetUnavailable(w)
 				return
 			case !res.Admitted:
@@ -149,6 +155,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 					"spent_micros", res.Spent,
 					"budget_micros", t.BudgetMicros,
 				)
+				recordRefusal(ctx, provider, "exceeded")
 				budgetExceeded(w, t.BudgetMicros, res.Spent, amount, req.Received)
 				return
 			}
@@ -217,6 +224,14 @@ func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, 
 			"charge_micros", charged,
 			"error", err,
 		)
+	}
+}
+
+// recordRefusal records on the Record of the request ctx belongs to that
+// Budget refused its attempt on provider, for reason.
+func recordRefusal(ctx context.Context, provider, reason string) {
+	if rec := RecordFrom(ctx); rec != nil {
+		rec.BudgetRefusal = &BudgetRefusal{Provider: provider, Reason: reason}
 	}
 }
 

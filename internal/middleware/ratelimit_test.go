@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -353,4 +354,34 @@ func TestRateLimitSettlesWhenAborted(t *testing.T) {
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	h.ServeHTTP(httptest.NewRecorder(), req)
 	t.Error("ServeHTTP returned; want the abort to go on up")
+}
+
+// TestRateLimitRecordsItsRefusal: the request's Record says when RateLimit
+// refused the request with its own 429. A provider's 429, and a request
+// admitted because the check failed, aren't its refusals.
+func TestRateLimitRecordsItsRefusal(t *testing.T) {
+	cases := []struct {
+		name     string
+		limiter  *fakeLimiter
+		upstream int // the status the provider answers with
+		status   int
+		want     bool
+	}{
+		{"refused", &fakeLimiter{}, http.StatusOK, http.StatusTooManyRequests, true},
+		{"admitted", &fakeLimiter{allowed: true}, http.StatusOK, http.StatusOK, false},
+		{"the provider's 429", &fakeLimiter{allowed: true}, http.StatusTooManyRequests, http.StatusTooManyRequests, false},
+		{"failed open", &fakeLimiter{err: errors.New("redis: connection refused")}, http.StatusOK, http.StatusOK, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(tc.upstream) })
+			req, record := withRecord(chatPost(`{"model":"gpt-4o","messages":[]}`))
+			rec := httptest.NewRecorder()
+			RequestID(asTenant(acme, usage.ReadBody(provider.FormatOpenAI, 1<<20)(RateLimit(tc.limiter, discard)(next)))).ServeHTTP(rec, req)
+
+			if rec.Code != tc.status || record.RateLimited != tc.want {
+				t.Errorf("status %d, Record's RateLimited %v; want %d, %v", rec.Code, record.RateLimited, tc.status, tc.want)
+			}
+		})
+	}
 }

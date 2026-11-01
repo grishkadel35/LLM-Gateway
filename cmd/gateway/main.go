@@ -126,13 +126,17 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	proxies := make(map[string]http.Handler, len(providers))
 	meters := make(map[string]usage.Callback, len(providers))
 	for _, p := range providers {
-		name := p.Name
+		name, free := p.Name, cfg.Providers[p.Name].Free
 		meter := func(ctx context.Context, r usage.Result) {
 			// For the rate limiter to settle the request's charge by, the
 			// budget the attempt's reservation, and the cache to decide by
 			// whether to store the response.
 			middleware.ReportUsage(ctx, name, r)
 			m.Tokens(name, r.Usage)
+			// For the request line.
+			if rec := middleware.RecordFrom(ctx); rec != nil {
+				rec.Usage = &middleware.UsageReport{Provider: name, Result: r, CostMicros: usageCost(ctx, name, free, r)}
+			}
 			if onUsage != nil {
 				onUsage(ctx, name, r)
 			}
@@ -181,8 +185,9 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 		// The cache keys ReadBody's body, so it goes inside ReadBody too. It
 		// wraps the rate limit, so a hit is never charged, nor reserved
 		// against a budget. A hit reports to the route's meter for its usage
-		// row, and for nothing else: ReportUsage finds no charge, reservation
-		// or pending miss on its request, and it has no tokens to count.
+		// row and its request line, and for nothing else: ReportUsage finds no
+		// charge, reservation or pending miss on its request, and it has no
+		// tokens to count.
 		if cacheStore != nil {
 			// A hit never reaches Fallback, so on a route with one it is given
 			// the headers Fallback puts on every other response.
@@ -192,11 +197,14 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			}
 			h = middleware.Cache(cacheStore, p.Name, meters[p.Name], hitHeader, logger)(h)
 		}
-		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(h)
+		// RecordRequest, just inside ReadBody, records the client's model and
+		// stream flag for the request line, whatever refuses the request next.
+		body := usage.ReadBody(p.Format, cfg.MaxRequestBytes)(middleware.RecordRequest(h))
 		metered := usage.RequireMetered(p.Format)(body)
 		// The request metrics go outermost, so requests the gateway refuses
-		// itself (401, 403, 413) are counted too.
-		mux.Handle(prefix+"/", m.Requests(p.Name)(tenantAuth(http.StripPrefix(prefix, metered))))
+		// itself (401, 403, 413) are counted too. Route records the route
+		// outside Auth, so their request lines name it too.
+		mux.Handle(prefix+"/", m.Requests(p.Name)(middleware.Route(p.Name)(tenantAuth(http.StripPrefix(prefix, metered)))))
 	}
 
 	// Anything that names no provider is rejected. There is deliberately no
@@ -481,4 +489,20 @@ func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, lo
 
 		w.Write(row)
 	}
+}
+
+// usageCost returns what r, provider's response to the request on ctx, cost
+// in µ$, or nil when that isn't known. free reports that provider costs
+// nothing. It prices r with exactly the inputs recordUsage gives
+// pricing.ResultCost, so the request line's cost is the usage row's.
+func usageCost(ctx context.Context, provider string, free bool, r usage.Result) *int64 {
+	req, ok := usage.RequestFrom(ctx)
+	if !ok {
+		req = &usage.Request{Received: time.Now()}
+	}
+	cost, known := pricing.ResultCost(provider, free, r, req.Model, req.Received)
+	if !known {
+		return nil
+	}
+	return &cost
 }

@@ -659,3 +659,61 @@ func TestDollars(t *testing.T) {
 		}
 	}
 }
+
+// TestBudgetRecordsRefusals: each refusal goes on the request's Record, with
+// its reason and the attempt's provider. A request Budget admits, a client
+// that left during the check (499) and a free provider's request record none.
+func TestBudgetRecordsRefusals(t *testing.T) {
+	const gpt4o = `{"model":"gpt-4o","messages":[]}`
+	tn := acmeWithBudget(50_000_000)
+	cases := []struct {
+		name     string
+		ledger   *fakeLedger
+		provider string
+		free     bool
+		tn       tenant.Tenant
+		body     string
+		status   int
+		want     *BudgetRefusal
+	}{
+		{"admitted", &fakeLedger{}, "openai", false, tn, gpt4o, http.StatusOK, nil},
+		{"exceeded", &fakeLedger{refuse: true}, "groq", false, tn, `{"model":"qwen/qwen3.8-27b","messages":[]}`,
+			http.StatusPaymentRequired, &BudgetRefusal{Provider: "groq", Reason: "exceeded"}},
+		{"unknown model", &fakeLedger{}, "openai", false, tn, `{"model":"gpt-9000","messages":[]}`,
+			http.StatusBadRequest, &BudgetRefusal{Provider: "openai", Reason: "unknown_model"}},
+		{"ledger fails", &fakeLedger{err: errors.New("redis: connection refused")}, "openai", false, tn, gpt4o,
+			http.StatusServiceUnavailable, &BudgetRefusal{Provider: "openai", Reason: "unavailable"}},
+		{"no tenant", &fakeLedger{}, "openai", false, tenant.Tenant{}, gpt4o,
+			http.StatusServiceUnavailable, &BudgetRefusal{Provider: "openai", Reason: "unavailable"}},
+		{"client leaves", &fakeLedger{started: make(chan struct{}, 1)}, "openai", false, tn, gpt4o, proxy.StatusClientClosedRequest, nil},
+		{"free provider", &fakeLedger{refuse: true}, "ollama", true, tn, `{"model":"qwen3.5:9b","messages":[]}`, http.StatusOK, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.ledger.started != nil {
+				// The client leaves once Reserve has started.
+				go func() {
+					select {
+					case <-tc.ledger.started:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+			h := usage.ReadBody(provider.FormatOpenAI, 1<<20)(Budget(tc.ledger, tc.provider, tc.free, discard)(next))
+			if tc.tn.ID != "" {
+				h = asTenant(tc.tn, h)
+			}
+			req, record := withRecord(httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body)))
+			rec := httptest.NewRecorder()
+			RequestID(h).ServeHTTP(rec, req)
+
+			if rec.Code != tc.status || !reflect.DeepEqual(record.BudgetRefusal, tc.want) {
+				t.Errorf("status %d, Record's refusal %+v; want %d, %+v", rec.Code, record.BudgetRefusal, tc.status, tc.want)
+			}
+		})
+	}
+}

@@ -34,7 +34,8 @@ func TenantFrom(ctx context.Context) (t tenant.Tenant, key tenant.APIKey, ok boo
 }
 
 // Auth returns middleware that admits only requests carrying a valid gateway
-// key, and attaches the key's tenant to the request context.
+// key, and attaches the key's tenant to the request context. It records the
+// tenant on the request's Record too.
 //
 // The key is read from whichever credential header the client's SDK sends:
 // Authorization (OpenAI and compatibles), X-Api-Key (Anthropic) or
@@ -64,6 +65,9 @@ func Auth(keys KeyLookup, logger *slog.Logger) func(http.Handler) http.Handler {
 				return
 			}
 
+			if rec := RecordFrom(r.Context()); rec != nil {
+				rec.TenantID = t.ID
+			}
 			ctx := context.WithValue(r.Context(), ctxKey{}, principal{tenant: t, key: k})
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})

@@ -36,6 +36,19 @@ the usage rows.
 
 ### What changed
 
+- **Each request line says who sent the request, where it went and what it
+  cost.** On a provider route, the line adds:
+  - `tenant_id`, `provider` (the route), `model` as the client named it, and
+    `streamed`
+  - once an attempt has ended, its usage: `input_tokens`,
+    `cached_input_tokens`, `cache_write_tokens`, `output_tokens`,
+    `cost_micros` (`null` when the cost isn't known) and `cached`, plus
+    `fallback_provider` when another provider answered. These repeat the
+    request's last usage row, which `request_id` joins.
+
+  Each field appears only once it is known, so a `401` names only the route,
+  and a `429` or `402` has no usage. Lines for the admin API, `/health` and
+  unknown paths don't change.
 - **A port for `/metrics`, not yet served.** `metrics_port` (default 9091,
   on the gateway's `host`) is where `/metrics` will be served, alone and
   behind the admin key.

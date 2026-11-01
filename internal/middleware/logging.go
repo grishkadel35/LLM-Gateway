@@ -2,12 +2,15 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
 )
 
 // Logging returns middleware that logs one structured JSON line per request.
+// It creates the request's Record, which the layers inside fill in, and the
+// line carries what they recorded (see Record).
 //
 // Go note: the shape `func(http.Handler) http.Handler` is the standard
 // middleware signature. You take a handler and return a new one that does
@@ -23,6 +26,7 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 		// itself. That's how a function satisfies an interface in Go.
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
+			record := &Record{Start: start}
 
 			// http.ResponseWriter won't tell us what status was written, so we
 			// wrap it in a recorder that remembers.
@@ -49,10 +53,10 @@ func Logging(logger *slog.Logger) func(http.Handler) http.Handler {
 				if id := r.Header.Get(HeaderRequestID); id != "" {
 					attrs = append(attrs, "client_request_id", id)
 				}
-				logger.Info("request", attrs...)
+				logger.Info("request", record.attrs(attrs)...)
 			}()
 
-			next.ServeHTTP(rec, r)
+			next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), recordKey{}, record)))
 		})
 	}
 }

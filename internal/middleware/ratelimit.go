@@ -81,8 +81,8 @@ func ReportUsage(ctx context.Context, provider string, r usage.Result) {
 
 // RateLimit returns middleware that charges each request's estimated tokens
 // (see cost) to its tenant's bucket before any provider sees it. A request
-// the bucket can't cover gets a 429 rate_limited with Retry-After, and goes
-// no further.
+// the bucket can't cover gets a 429 rate_limited with Retry-After, recorded on
+// its Record, and goes no further.
 //
 // Once an admitted request is over, its charge is settled by the usage
 // reported for it (see settle): the bucket gets back what the request didn't
@@ -126,6 +126,9 @@ func RateLimit(limiter Limiter, logger *slog.Logger) func(http.Handler) http.Han
 			case err != nil:
 				logger.Warn("rate limit check failed; request admitted", "request_id", id, "tenant_id", t.ID, "error", err)
 			case !allowed:
+				if rec := RecordFrom(ctx); rec != nil {
+					rec.RateLimited = true
+				}
 				secs := retryAfterSeconds(wait)
 				logger.Info("request rate limited",
 					"request_id", id,

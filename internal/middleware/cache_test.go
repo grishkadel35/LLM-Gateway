@@ -483,3 +483,36 @@ func TestCacheWithoutTenant(t *testing.T) {
 		t.Errorf("log line = %v, want ERROR", entry)
 	}
 }
+
+// TestCacheRecordsDecision: the request's Record has the cache's decision. A
+// failed lookup is error, though its response says miss, and a bad
+// X-Gateway-Cache is no decision at all.
+func TestCacheRecordsDecision(t *testing.T) {
+	hit := cache.Entry{Status: http.StatusOK, ContentType: "application/json", Model: "m-snapshot", Body: []byte(`{"cached":true}`)}
+	cases := []struct {
+		name         string
+		store        *fakeCache
+		header, body string
+		want, sent   string // the Record's decision, and the response's HeaderCache
+	}{
+		{"hit", &fakeCache{found: &hit}, "", cacheable, "hit", "hit"},
+		{"miss", &fakeCache{}, "", cacheable, "miss", "miss"},
+		{"bypass", &fakeCache{}, "", `{"model":"m","messages":[]}`, "bypass", "bypass"},
+		{"a failed lookup", &fakeCache{getErr: errors.New("redis: i/o timeout")}, "", cacheable, "error", "miss"},
+		{"a bad X-Gateway-Cache", &fakeCache{}, "maybe", cacheable, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, record := withRecord(chatPost(tc.body))
+			if tc.header != "" {
+				req.Header.Set(HeaderCache, tc.header)
+			}
+			rec := httptest.NewRecorder()
+			withCache(tc.store, discard, answer("ollama", http.StatusOK, completeUsage)).ServeHTTP(rec, req)
+
+			if record.Cache != tc.want || rec.Header().Get(HeaderCache) != tc.sent {
+				t.Errorf("Record's decision %q, %s %q; want %q, %q", record.Cache, HeaderCache, rec.Header().Get(HeaderCache), tc.want, tc.sent)
+			}
+		})
+	}
+}

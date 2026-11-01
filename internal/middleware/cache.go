@@ -73,12 +73,13 @@ func pendingFrom(ctx context.Context) *pending {
 //     Content-Encoding (see storable).
 //
 // Any other request is a bypass: it goes on, with no lookup and no store.
-// HeaderCache tells the client which of the three each response was.
+// HeaderCache tells the client which of the three each response was, and the
+// request's Record has it too.
 //
 // The cache fails open. When a lookup fails (Redis is down, or slower than
 // cacheTimeout), the request is a miss, logged with a Warn, and its response
-// isn't stored. A store that fails is a Warn too, and changes nothing the
-// client gets.
+// isn't stored. Its Record says error. A store that fails is a Warn too, and
+// changes nothing the client gets.
 //
 // It needs the tenant from Auth and the body from ReadBody, so it runs after
 // both. It goes outside RateLimit, so a hit is never charged.
@@ -111,6 +112,7 @@ func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader 
 				key, eligible = cacheKey(t.ID, provider, r)
 			}
 			if !eligible {
+				recordCache(ctx, "bypass")
 				next.ServeHTTP(newCacheWriter(w, "bypass", false), r)
 				return
 			}
@@ -123,9 +125,11 @@ func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader 
 				// A miss that is never stored: with Redis failing, the store
 				// would most likely fail too, after another cacheTimeout.
 				logger.Warn("cache lookup failed; request not cached", "request_id", id, "tenant_id", t.ID, "error", err)
+				recordCache(ctx, "error")
 				next.ServeHTTP(newCacheWriter(w, "miss", false), r)
 				return
 			case found:
+				recordCache(ctx, "hit")
 				// A copy, so no two responses share hitHeader's values.
 				maps.Copy(w.Header(), hitHeader.Clone())
 				if e.ContentType != "" {
@@ -140,6 +144,7 @@ func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader 
 				return
 			}
 
+			recordCache(ctx, "miss")
 			p := &pending{}
 			cw := newCacheWriter(w, "miss", true)
 			next.ServeHTTP(cw, r.WithContext(context.WithValue(ctx, pendingKey{}, p)))
@@ -159,6 +164,14 @@ func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader 
 				logger.Warn("cache store failed", "request_id", id, "tenant_id", t.ID, "error", err)
 			}
 		})
+	}
+}
+
+// recordCache records decision, the cache's for the request ctx belongs to, on
+// its Record.
+func recordCache(ctx context.Context, decision string) {
+	if rec := RecordFrom(ctx); rec != nil {
+		rec.Cache = decision
 	}
 }
 

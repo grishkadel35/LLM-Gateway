@@ -162,6 +162,30 @@ func TestAuthLookupFailureIsNot401(t *testing.T) {
 	assertErrorType(t, rec, "auth_unavailable")
 }
 
+// TestAuthRecordsTenant: the tenant Auth admits goes on the request's Record.
+// A request Auth refuses records none.
+func TestAuthRecordsTenant(t *testing.T) {
+	cases := []struct {
+		name, key string
+		keys      fakeKeys
+		want      string
+	}{
+		{"admitted", "Bearer gw_good", testKeys, "tn_acme"},
+		{"401", "Bearer gw_unknown", testKeys, ""},
+		{"503 auth_unavailable", "Bearer gw_good", fakeKeys{err: errors.New("connection refused")}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, rec := withRecord(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+			req.Header.Set("Authorization", tc.key)
+			Auth(tc.keys, discard)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(httptest.NewRecorder(), req)
+			if rec.TenantID != tc.want {
+				t.Errorf("Record's tenant = %q, want %q", rec.TenantID, tc.want)
+			}
+		})
+	}
+}
+
 func TestTenantFromUnauthenticatedContext(t *testing.T) {
 	if _, _, ok := TenantFrom(context.Background()); ok {
 		t.Error("TenantFrom() found a tenant in a context Auth never touched")
