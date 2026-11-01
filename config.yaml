@@ -15,6 +15,12 @@
 # Port the gateway itself listens on.
 port: 8080
 
+# Port that serves /metrics and nothing else. It listens on host, like port.
+# Every request needs the admin key as a Bearer token; a tenant key, or none,
+# gets 401. Prometheus scrapes this port with that key. It must differ from
+# port. The default is 9091.
+metrics_port: 9091
+
 # Address to bind to. Loopback by default and on purpose: the gateway holds
 # real provider keys. Tenant keys guard them and budgets limit what they can
 # spend, but there is no TLS yet and /metrics needs no key, so binding wider is

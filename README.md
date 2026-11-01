@@ -36,6 +36,13 @@ the usage rows.
 
 ### What changed
 
+- **A port for `/metrics`, not yet served.** `metrics_port` (default 9091,
+  on the gateway's `host`) is where `/metrics` will be served, alone and
+  behind the admin key.
+  - A value outside 1–65535, or equal to `port`, stops startup with an error
+    that names it.
+  - Until the listener lands later this week, `/metrics` stays on the main
+    port with no key.
 - **A readiness handler, not yet routed.** `health.ReadyHandler` will answer
   `GET /ready`. It pings Postgres and Redis at the same time, each given a
   second, and answers `200` with `"status":"ready"`, or `503` with

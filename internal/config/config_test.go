@@ -49,6 +49,7 @@ func TestLoadReadsAllFields(t *testing.T) {
 	path := writeConfig(t, `
 port: 9090
 host: 0.0.0.0
+metrics_port: 9191
 max_request_bytes: 1048576
 providers:
   anthropic:
@@ -78,6 +79,12 @@ providers:
 	if got := cfg.Addr(); got != "0.0.0.0:9090" {
 		t.Errorf("Addr() = %q, want %q", got, "0.0.0.0:9090")
 	}
+	if cfg.MetricsPort != 9191 {
+		t.Errorf("MetricsPort = %d, want 9191", cfg.MetricsPort)
+	}
+	if got := cfg.MetricsAddr(); got != "0.0.0.0:9191" {
+		t.Errorf("MetricsAddr() = %q, want %q", got, "0.0.0.0:9191")
+	}
 
 	pc := cfg.Providers["anthropic"]
 	if pc.URL != "https://api.anthropic.com" {
@@ -94,8 +101,8 @@ providers:
 	}
 }
 
-// TestLoadAppliesDefaults checks that absent keys fall back: port, host, and
-// each provider's timeout.
+// TestLoadAppliesDefaults checks that absent keys fall back: port,
+// metrics_port, host, and each provider's timeout.
 func TestLoadAppliesDefaults(t *testing.T) {
 	setTestKey(t)
 
@@ -106,6 +113,12 @@ func TestLoadAppliesDefaults(t *testing.T) {
 
 	if cfg.Port != DefaultPort {
 		t.Errorf("Port = %d, want the default %d", cfg.Port, DefaultPort)
+	}
+	if cfg.MetricsPort != DefaultMetricsPort {
+		t.Errorf("MetricsPort = %d, want the default %d", cfg.MetricsPort, DefaultMetricsPort)
+	}
+	if got := cfg.MetricsAddr(); got != "127.0.0.1:9091" {
+		t.Errorf("MetricsAddr() = %q, want %q", got, "127.0.0.1:9091")
 	}
 	if cfg.Host != DefaultHost {
 		t.Errorf("Host = %q, want the default %q", cfg.Host, DefaultHost)
@@ -378,6 +391,47 @@ func TestLoadCacheTTL(t *testing.T) {
 	}
 }
 
+// TestLoadMetricsPort: metrics_port defaults to 9091, takes 1 through 65535,
+// and may not be the gateway's own port. A value that fails Load does so with
+// a message naming the field.
+func TestLoadMetricsPort(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string // the top-level lines as written; "" for none
+		want    int    // for a config that loads
+		wantErr string // a substring of Load's error, for one that fails
+	}{
+		{name: "left out", want: 9091},
+		{name: "set", yaml: "metrics_port: 9191\n", want: 9191},
+		{name: "the lowest", yaml: "metrics_port: 1\n", want: 1},
+		{name: "the highest", yaml: "metrics_port: 65535\n", want: 65535},
+		{name: "zero", yaml: "metrics_port: 0\n", wantErr: "metrics_port must be between 1 and 65535, got 0"},
+		{name: "too large", yaml: "metrics_port: 65536\n", wantErr: "metrics_port must be between 1 and 65535, got 65536"},
+		{name: "the same as port", yaml: "port: 9191\nmetrics_port: 9191\n", wantErr: "metrics_port must differ from port, got 9191 for both"},
+		// Left out, it is the default, which the gateway's own port may hold.
+		{name: "left out, and port is 9091", yaml: "port: 9091\n", wantErr: "metrics_port must differ from port, got 9091 for both"},
+	}
+
+	setTestKey(t)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, tc.yaml+minimalProvider))
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() = %v, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() returned error: %v", err)
+			}
+			if cfg.MetricsPort != tc.want {
+				t.Errorf("MetricsPort = %d, want %d", cfg.MetricsPort, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadAuthNoneNeedsNoKey: a keyless upstream such as a local Ollama is
 // configured with auth none and no key line at all.
 func TestLoadAuthNoneNeedsNoKey(t *testing.T) {
@@ -434,6 +488,11 @@ func TestLoadOnRepoConfig(t *testing.T) {
 	// The committed cache block spells out the default.
 	if got := cfg.Cache.TTL(); got != time.Hour {
 		t.Errorf("cache ttl = %v, want 1h", got)
+	}
+
+	// The committed metrics_port is the default.
+	if cfg.MetricsPort != 9091 {
+		t.Errorf("metrics_port = %d, want 9091", cfg.MetricsPort)
 	}
 
 	// Groq's base path is what makes it a useful test case; don't let it be

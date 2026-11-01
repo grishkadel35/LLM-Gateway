@@ -26,6 +26,8 @@ import (
 // Default values used when a key is absent from config.yaml.
 const (
 	DefaultPort = 8080
+	// DefaultMetricsPort is where /metrics is served, on a port of its own.
+	DefaultMetricsPort = 9091
 	// DefaultTimeoutSeconds bounds the wait for a provider's response headers.
 	// A non-streaming completion sends no headers until generation finishes,
 	// which can take minutes, so this matches the official SDKs' own 10-minute
@@ -73,6 +75,9 @@ var reservedNames = map[string]bool{
 type Config struct {
 	Port int    `yaml:"port"`
 	Host string `yaml:"host"`
+	// MetricsPort is the port that serves /metrics and nothing else, on Host,
+	// behind the admin key. It must differ from Port.
+	MetricsPort int `yaml:"metrics_port"`
 	// MaxRequestBytes is the largest request body the gateway reads; larger
 	// ones get 413. The gateway buffers each body to meter and rewrite it.
 	MaxRequestBytes int64                     `yaml:"max_request_bytes"`
@@ -156,6 +161,7 @@ func Default() *Config {
 	return &Config{
 		Port:            DefaultPort,
 		Host:            DefaultHost,
+		MetricsPort:     DefaultMetricsPort,
 		MaxRequestBytes: DefaultMaxRequestBytes,
 		Providers:       map[string]ProviderConfig{},
 		Cache:           CacheConfig{TTLSeconds: DefaultCacheTTLSeconds},
@@ -333,6 +339,13 @@ func (c *Config) Validate() error {
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("port must be between 1 and 65535, got %d", c.Port)
 	}
+	if c.MetricsPort < 1 || c.MetricsPort > 65535 {
+		return fmt.Errorf("metrics_port must be between 1 and 65535, got %d", c.MetricsPort)
+	}
+	// Both listen on host, so the same port would be taken twice.
+	if c.MetricsPort == c.Port {
+		return fmt.Errorf("metrics_port must differ from port, got %d for both", c.Port)
+	}
 	if c.Host == "" {
 		return fmt.Errorf("host must not be empty")
 	}
@@ -486,4 +499,11 @@ func (c *Config) BuildProviders() ([]provider.Provider, error) {
 // Addr returns the listen address in the form net/http expects.
 func (c *Config) Addr() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// MetricsAddr returns the metrics listen address, built as Addr is. That
+// includes its limit: an IPv6 host isn't bracketed, so a host of ::1 gives
+// "::1:9091", which can't be listened on.
+func (c *Config) MetricsAddr() string {
+	return fmt.Sprintf("%s:%d", c.Host, c.MetricsPort)
 }
