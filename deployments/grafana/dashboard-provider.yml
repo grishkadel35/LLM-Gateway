@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: llm-gateway
+    type: file
+    # The UI can't save over the file. Change dashboard.json instead and run
+    # `make obs-up`: a running Grafana didn't re-read the folder when tested.
+    allowUiUpdates: false
+    options:
+      # Where docker-compose.yml mounts this folder, dashboard.json included.
+      path: /etc/grafana/provisioning/dashboards

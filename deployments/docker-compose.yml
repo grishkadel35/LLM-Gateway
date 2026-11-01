@@ -1,9 +1,11 @@
-# Local dev stack. Week 3: Postgres and Redis; later weeks add Prometheus,
-# Grafana and the gateway itself.
+# Local dev stack. Week 3: Postgres and Redis. Week 6 adds Prometheus and
+# Grafana; later weeks add the gateway itself.
 #
 #   make db-up      # start Postgres and Redis and wait until both are healthy
 #   make migrate    # apply schema migrations
-#   make db-down    # stop them (Postgres data survives in the pgdata volume)
+#   make obs-up     # start Prometheus and Grafana and wait until both are healthy
+#   make obs-down   # stop those two
+#   make db-down    # stop everything (Postgres data survives in the pgdata volume)
 
 # Without a name, Compose would call the project "deployments", after this
 # file's directory.
@@ -47,5 +49,66 @@ services:
       timeout: 5s
       retries: 15
 
+  prometheus:
+    # The newest stable release on github.com/prometheus/prometheus/releases,
+    # checked 2026-10-31.
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    # The gateway's admin key, which /metrics requires, as a file at
+    # /run/secrets/gateway_admin_key. See the secrets block below.
+    secrets:
+      - gateway_admin_key
+    # prometheus.yml scrapes the gateway on the host. Colima already resolves
+    # host.docker.internal; Linux Docker needs this line.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # The mock provider holds 9090 on the host, so Prometheus is on 9092. Bound
+    # to loopback like Postgres and Redis.
+    ports:
+      - "127.0.0.1:9092:9090"
+    # No volume, like Redis: the data lasts until `docker compose down`.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  grafana:
+    # The newest stable release on github.com/grafana/grafana/releases, checked
+    # 2026-10-31.
+    image: grafana/grafana:13.3.0
+    environment:
+      # Dev-only default, like Postgres'. The port below is bound to loopback,
+      # so nothing off this machine can reach the login.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Anyone who reaches the port may view the dashboard without a login,
+      # which also lets a headless browser take its screenshot.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      # Only the two folders Grafana provisions from, so its other, empty
+      # provisioning folders stay in place: without them it logs an error for
+      # each. The first holds the dashboard provider and dashboard.json; its
+      # datasources folder is not read there.
+      - ./grafana:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    # No volume either: nothing here is worth keeping, since the datasource and
+    # the dashboard are provisioned from the repo.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
 volumes:
   pgdata:
+
+secrets:
+  # Read from your environment when the container is created, so the key is
+  # never in git or in a file in the repo. `make obs-up` supplies it.
+  gateway_admin_key:
+    environment: GATEWAY_ADMIN_KEY

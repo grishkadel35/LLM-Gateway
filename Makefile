@@ -15,7 +15,7 @@ MOCK_ADMIN_KEY := mock-admin-key-for-local-testing-only
 
 # .PHONY tells make these targets are commands, not files to be produced.
 # Without it, a file named "test" in the repo would stop `make test` working.
-.PHONY: build run mock run-mock db-up db-down migrate test vet fmt tidy clean all
+.PHONY: build run mock run-mock db-up db-down obs-up obs-down migrate test vet fmt tidy clean all
 
 all: fmt vet test build
 
@@ -36,12 +36,31 @@ run-mock: build
 		REDIS_URL='$(REDIS_URL)' GATEWAY_CONFIG=config.mock.yaml ./$(BINARY)
 
 # Local Postgres and Redis from deployments/docker-compose.yml. --wait blocks
-# until the healthchecks pass, so `make db-up migrate` works in one go.
+# until the healthchecks pass, so `make db-up migrate` works in one go. Naming
+# the two keeps Prometheus and Grafana off, so the tests and run-mock stay
+# light on the 2 GiB Colima VM; obs-up starts those.
 db-up:
-	docker compose -f deployments/docker-compose.yml up -d --wait
+	docker compose -f deployments/docker-compose.yml up -d --wait postgres redis
 
+# Stops everything in the file, Prometheus and Grafana too; obs-down stops
+# only those.
 db-down:
 	docker compose -f deployments/docker-compose.yml down
+
+# Prometheus and Grafana, with the dashboard from deployments/grafana.
+# Prometheus scrapes the gateway's /metrics with the admin key: your
+# GATEWAY_ADMIN_KEY, or the mock's when that is unset. The default applies in
+# this recipe only, so `make run` never gets one. Compose doesn't notice a
+# changed key, so both containers are recreated each time; Prometheus keeps
+# its data through that.
+obs-up:
+	GATEWAY_ADMIN_KEY=$${GATEWAY_ADMIN_KEY:-$(MOCK_ADMIN_KEY)} \
+		docker compose -f deployments/docker-compose.yml up -d --wait \
+		--force-recreate prometheus grafana
+
+# Stops Prometheus and Grafana; Postgres and Redis keep running.
+obs-down:
+	docker compose -f deployments/docker-compose.yml stop prometheus grafana
 
 # Apply pending migrations from internal/db/migrations.
 migrate:

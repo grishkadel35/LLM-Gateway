@@ -36,6 +36,21 @@ the usage rows.
 
 ### What changed
 
+- **Prometheus and Grafana join the compose stack.** `make obs-up` starts
+  them and waits until both are healthy, and `make obs-down` stops them.
+  `make db-up` still starts only Postgres and Redis.
+  - **Prometheus,** on `127.0.0.1:9092`, scrapes the gateway's metrics port
+    every 5 seconds with the admin key. Its data lasts until
+    `docker compose down`.
+  - **Grafana,** on `127.0.0.1:3000`, has the Prometheus datasource and the
+    "LLM Gateway" dashboard provisioned from `deployments/grafana/`. Anyone
+    who can reach the port may view it without a login. The dashboard can't
+    be saved from the UI.
+  - **The key** comes from a compose secret filled from `GATEWAY_ADMIN_KEY`,
+    or from the mock's key when that is unset, in `obs-up` only. It is never
+    in git or in a file in the repo.
+  - **No data yet:** the gateway doesn't serve its metrics port, so the scrape
+    target shows as down for now.
 - **Each request line says who sent the request, where it went and what it
   cost.** On a provider route, the line adds:
   - `tenant_id`, `provider` (the route), `model` as the client named it, and

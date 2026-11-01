@@ -1,0 +1,21 @@
+# Prometheus for the local dev stack: docker-compose.yml mounts this file into
+# the container, and `make obs-up` picks up a change.
+
+global:
+  # The dashboard takes rates over a minute, which this interval fills with
+  # about 12 samples.
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: gateway
+    # /metrics needs the admin key, as a Bearer token. The file is a compose
+    # secret that docker-compose.yml fills from GATEWAY_ADMIN_KEY, so the key
+    # never lands in git. Prometheus reads it again on every scrape.
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/gateway_admin_key
+    static_configs:
+      # The gateway on your Mac, where `make run` starts it; host.docker.internal
+      # is the Mac as a container sees it. Week 7 runs the gateway in compose,
+      # and this becomes gateway:9091.
+      - targets: ["host.docker.internal:9091"]
