@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"errors"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -219,6 +220,7 @@ func TestHistogramsCarryNoTenantOrModel(t *testing.T) {
 	m := New()
 	serveRecorded(m, "openai", middleware.Record{TenantID: "t1", Request: &usage.Request{Model: "gpt-4o"}, Cache: "miss"}, http.StatusOK)
 	m.ConcurrencyWait("openai")(time.Millisecond)
+	handOff(t, "openai", 0, m.Overhead(m.UpstreamTTFB("openai", answer(http.StatusOK))))
 
 	families, err := m.registry.Gather()
 	if err != nil {
@@ -235,7 +237,12 @@ func TestHistogramsCarryNoTenantOrModel(t *testing.T) {
 			}
 		}
 	}
-	want := map[string][]string{"gateway_request_duration_seconds": {"provider"}, "gateway_concurrency_wait_seconds": {"provider"}}
+	want := map[string][]string{
+		"gateway_request_duration_seconds": {"provider"},
+		"gateway_concurrency_wait_seconds": {"provider"},
+		"gateway_overhead_seconds":         {"provider"},
+		"gateway_upstream_ttfb_seconds":    {"provider"},
+	}
 	if !maps.EqualFunc(labels, want, slices.Equal) {
 		t.Errorf("histograms' labels = %v, want %v", labels, want)
 	}
@@ -321,5 +328,133 @@ func TestFallback(t *testing.T) {
 	m.Fallback("ollama", "groq", "timeout")
 	if got := testutil.ToFloat64(m.fallbacks.WithLabelValues("ollama", "groq", "timeout")); got != 1 {
 		t.Errorf("gateway_fallbacks_total = %v, want 1", got)
+	}
+}
+
+// answer is a provider's transport that answers every request at once, with
+// status.
+func answer(status int) http.RoundTripper {
+	return roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: status, Body: http.NoBody}, nil
+	})
+}
+
+// handOff serves a request on route through Logging, which puts a Record on
+// it, and Route. After work, the gateway's own work on the request, it hands
+// the request to each of transports in turn, as a fallback hands a failed
+// request on to another provider's proxy.
+func handOff(t *testing.T, route string, work time.Duration, transports ...http.RoundTripper) {
+	t.Helper()
+	h := middleware.Route(route)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(work)
+		for _, next := range transports {
+			if _, err := next.RoundTrip(r); err != nil {
+				t.Errorf("RoundTrip() returned error: %v", err)
+			}
+		}
+	}))
+	middleware.Logging(slog.New(slog.DiscardHandler))(h).ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+}
+
+// observed returns, for each series of the histogram name, how many
+// observations it has and their sum, by its provider label.
+func observed(t *testing.T, m *Metrics, name string) (counts map[string]uint64, sums map[string]float64) {
+	t.Helper()
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts, sums = map[string]uint64{}, map[string]float64{}
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, s := range f.GetMetric() {
+			provider := s.GetLabel()[0].GetValue()
+			counts[provider], sums[provider] = s.GetHistogram().GetSampleCount(), s.GetHistogram().GetSampleSum()
+		}
+	}
+	return counts, sums
+}
+
+// TestOverhead: a request is timed once, from its Record's Start to its
+// first handoff to a provider's transport, under the route on the Record: a
+// fallback's handoff to another provider's transport isn't timed again. A
+// request without a Record isn't timed.
+func TestOverhead(t *testing.T) {
+	m := New()
+	// As router() wraps them: the route's provider's transport, and its
+	// fallback's.
+	primary, fallback := m.Overhead(answer(http.StatusInternalServerError)), m.Overhead(answer(http.StatusOK))
+	handOff(t, "flaky", 20*time.Millisecond, primary, fallback)
+	if _, err := primary.RoundTrip(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)); err != nil {
+		t.Fatalf("RoundTrip() without a Record returned error: %v", err)
+	}
+
+	counts, sums := observed(t, m, "gateway_overhead_seconds")
+	if !maps.Equal(counts, map[string]uint64{"flaky": 1}) || sums["flaky"] < 0.02 {
+		t.Errorf("gateway_overhead_seconds: counts %v, sums %v; want one observation, under flaky, of 20 ms or more", counts, sums)
+	}
+}
+
+// TestUpstreamTTFB: each attempt that gets a response, of any status, is
+// timed to its headers, under the provider whose transport it is. One that
+// gets none, such as a failed dial, isn't.
+func TestUpstreamTTFB(t *testing.T) {
+	m := New()
+	slow := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		time.Sleep(20 * time.Millisecond)
+		return &http.Response{StatusCode: http.StatusInternalServerError, Body: http.NoBody}, nil
+	})
+	refused := roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp 127.0.0.1:1: connect: connection refused")
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	for _, next := range []http.RoundTripper{answer(http.StatusOK), slow} {
+		if _, err := m.UpstreamTTFB("ollama", next).RoundTrip(req); err != nil {
+			t.Fatalf("RoundTrip() returned error: %v", err)
+		}
+	}
+	if _, err := m.UpstreamTTFB("groq", refused).RoundTrip(req); err == nil {
+		t.Fatal("RoundTrip() of a failed dial returned no error")
+	}
+
+	counts, sums := observed(t, m, "gateway_upstream_ttfb_seconds")
+	if !maps.Equal(counts, map[string]uint64{"ollama": 2, "groq": 0}) || sums["ollama"] < 0.02 {
+		t.Errorf("gateway_upstream_ttfb_seconds: counts %v, sums %v; want ollama's 2 answers, 20 ms or more in all, and nothing for groq's failed dial",
+			counts, sums)
+	}
+}
+
+// TestTimingBuckets: TTFB's buckets run from 25 ms to 600 s, the default
+// provider timeout, and overhead's from 0.1 ms to 2.5 s, past a 2 s budget
+// rebuild. Each has 12 to 15.
+func TestTimingBuckets(t *testing.T) {
+	m := New()
+	handOff(t, "ollama", 0, m.Overhead(m.UpstreamTTFB("ollama", answer(http.StatusOK))))
+
+	families, err := m.registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][2]float64{"gateway_upstream_ttfb_seconds": {0.025, 600}, "gateway_overhead_seconds": {0.0001, 2.5}}
+	for _, f := range families {
+		bounds, ok := want[f.GetName()]
+		if !ok {
+			continue
+		}
+		delete(want, f.GetName())
+		var les []float64
+		for _, b := range f.GetMetric()[0].GetHistogram().GetBucket() {
+			les = append(les, b.GetUpperBound())
+		}
+		if n := len(les); n < 12 || n > 15 || les[0] != bounds[0] || les[n-1] != bounds[1] {
+			t.Errorf("%s's buckets are %v, want 12 to 15 from %v to %v", f.GetName(), les, bounds[0], bounds[1])
+		}
+	}
+	if len(want) > 0 {
+		t.Errorf("not gathered: %v", want)
 	}
 }

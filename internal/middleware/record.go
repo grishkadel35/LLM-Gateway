@@ -21,6 +21,7 @@ import (
 //   - Cache: its decision
 //   - RateLimit: its 429
 //   - Budget: a refusal, and why, and the tenant's spend and budget
+//   - metrics.Overhead, on each provider's transport: the first handoff
 //   - cmd/gateway's meter: the usage last reported, and what it cost
 //
 // A fact no layer learned stays at its zero value: a request no provider route
@@ -67,6 +68,10 @@ type Record struct {
 	// attempt reports last. nil if the ledger reported none: no attempt
 	// reached it, or it failed.
 	BudgetSpend *BudgetSpend
+	// HandedOff reports that one of the request's attempts was handed to a
+	// provider's transport, which ends the gateway's overhead. The first
+	// handoff sets it, so a fallback's attempt isn't timed again.
+	HandedOff bool
 	// Usage is the usage last reported for the request: the response the
 	// client got, from a provider or the cache, or the proxy's report of a
 	// provider that never answered (502, 504, or 499 for a client gone

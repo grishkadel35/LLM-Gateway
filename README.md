@@ -36,6 +36,17 @@ the usage rows.
 
 ### What changed
 
+- **Upstream TTFB and the gateway's own overhead.**
+  `gateway_upstream_ttfb_seconds{provider}` times each attempt from its
+  handoff to the provider's transport, after any wait for a concurrency slot,
+  to the response headers: a stream's start, or about the whole generation
+  for a non-streaming request. Each attempt that got a response counts under
+  its own provider, so a fallback after a `5xx` counts twice.
+  `gateway_overhead_seconds{provider}` times the gateway's own work before a
+  provider sees the request (auth, the body read, the cache lookup, the
+  rate-limit and budget checks), once per request, under the route. Cache
+  hits and refused requests have neither, and the wait for a slot is in
+  `gateway_concurrency_wait_seconds` alone.
 - **Budget gauges per tenant.** `gateway_budget_spent_micros{tenant}` and
   `gateway_budget_micros{tenant}` show each tenant's spend for the month,
   reservations in flight included, and its budget, as the ledger reported

@@ -45,11 +45,23 @@ var durationBuckets = []float64{0.001, 0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5, 
 // default 30-second queue timeout, and past it for a longer one.
 var waitBuckets = []float64{0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
+// ttfbBuckets span the time to a provider's response headers: from a stream's,
+// which come as it starts, to a non-streaming generation's, which come once
+// it is done, up to the default 600-second provider timeout.
+var ttfbBuckets = []float64{0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+
+// overheadBuckets span the gateway's own work on a request before a provider
+// sees it: from a fraction of a millisecond to a budget rebuild, which can
+// take up to 2 s.
+var overheadBuckets = []float64{0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5}
+
 // Metrics holds every metric the gateway exports.
 type Metrics struct {
 	registry       *prometheus.Registry
 	requests       *prometheus.CounterVec
 	duration       *prometheus.HistogramVec
+	overhead       *prometheus.HistogramVec
+	ttfb           *prometheus.HistogramVec
 	tokens         *prometheus.CounterVec
 	cost           *prometheus.CounterVec
 	cache          *prometheus.CounterVec
@@ -74,6 +86,16 @@ func New() *Metrics {
 			Name:    "gateway_request_duration_seconds",
 			Help:    "Time to serve a request on each provider route, a streamed body included. provider is the route the client called, even when a fallback answered. No tenant or model label, since each value would multiply the buckets.",
 			Buckets: durationBuckets,
+		}, []string{"provider"}),
+		overhead: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_overhead_seconds",
+			Help:    "The gateway's own work on a request before a provider sees it (auth, the body read, the cache lookup, the rate-limit and budget checks): from its arrival on a provider route to its first attempt's handoff to a provider's transport, before any wait for a concurrency slot. Observed once per request handed off, so not for a cache hit or a request refused before then. provider is the route the client called, even when a fallback answered.",
+			Buckets: overheadBuckets,
+		}, []string{"provider"}),
+		ttfb: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "gateway_upstream_ttfb_seconds",
+			Help:    "Time from each attempt's handoff to its provider's transport, after any wait for a concurrency slot, to the provider's response headers: a stream's come as it starts, a non-streaming response's once it is generated. Only attempts that got a response, of any status, are observed, not a failed dial, a timeout or a client gone. provider is the provider the attempt went to, so after a fallback each attempt counts under its own.",
+			Buckets: ttfbBuckets,
 		}, []string{"provider"}),
 		tokens: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_tokens_total",
@@ -117,7 +139,7 @@ func New() *Metrics {
 			Help: "Requests handed from a failed provider to its fallback, by why it failed: unreachable, timeout or server_error.",
 		}, []string{"from", "to", "reason"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.cost, m.cache, m.rateLimits, m.budgetRefusals, m.budgetSpent, m.budget, m.wait, m.up, m.fallbacks)
+	m.registry.MustRegister(m.requests, m.duration, m.overhead, m.ttfb, m.tokens, m.cost, m.cache, m.rateLimits, m.budgetRefusals, m.budgetSpent, m.budget, m.wait, m.up, m.fallbacks)
 	return m
 }
 
@@ -243,6 +265,61 @@ func (m *Metrics) ConcurrencyWait(provider string) func(time.Duration) {
 	wait := m.wait.WithLabelValues(provider)
 	return func(d time.Duration) { wait.Observe(d.Seconds()) }
 }
+
+// Overhead wraps next, the transport of a provider's proxy, to time the
+// gateway's own work on each request: from its Record's Start to its first
+// attempt's handoff to a provider's transport, this one or another's, under
+// the route on the Record. A fallback's attempt isn't timed again, and a
+// request without a Record isn't timed at all.
+//
+// It goes outside any concurrency limiter, so the wait for a slot isn't
+// timed. A request handed to the limiter is timed even if it gets no slot.
+func (m *Metrics) Overhead(next http.RoundTripper) http.RoundTripper {
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		// The proxy's outbound request carries the inbound one's context, and
+		// with it the Record.
+		if rec := middleware.RecordFrom(req.Context()); rec != nil && !rec.HandedOff {
+			// No lock: ReverseProxy calls RoundTrip on the goroutine serving
+			// the request, so the Record is still touched from that one alone.
+			rec.HandedOff = true
+			m.overhead.WithLabelValues(rec.Provider).Observe(time.Since(rec.Start).Seconds())
+		}
+		return next.RoundTrip(req)
+	})
+}
+
+// UpstreamTTFB wraps next, the transport of provider's proxy, to time each
+// attempt that gets a response, of any status: from its handoff to next to
+// the response headers. An attempt that gets none (a failed dial, a timeout,
+// a client gone) isn't timed.
+//
+// It goes inside any concurrency limiter, so the wait for a slot isn't timed.
+func (m *Metrics) UpstreamTTFB(provider string, next http.RoundTripper) http.RoundTripper {
+	ttfb := m.ttfb.WithLabelValues(provider)
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		start := time.Now()
+		resp, err := next.RoundTrip(req)
+		if err == nil {
+			ttfb.Observe(time.Since(start).Seconds())
+		}
+		return resp, err
+	})
+}
+
+// roundTripFunc adapts a function to http.RoundTripper.
+//
+// Go note: http.RoundTripper is the interface behind each outbound request.
+// Its one method, RoundTrip, sends a request and returns as soon as the
+// response headers are in, leaving the body to be read after. A wrapper holds
+// the next RoundTripper and does its work around next.RoundTrip, as handler
+// middleware does around next.ServeHTTP, so timing around the call times the
+// wait for the headers, for a stream too. net/http has no adapter like
+// http.HandlerFunc for RoundTrippers, so this is one: a function type whose
+// RoundTrip method calls the function itself (see middleware.Logging's note
+// on http.HandlerFunc).
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 // ProviderUp records the result of provider's latest health check.
 func (m *Metrics) ProviderUp(provider string, up bool) {

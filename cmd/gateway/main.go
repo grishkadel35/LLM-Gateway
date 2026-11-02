@@ -152,11 +152,18 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			}
 		}
 		rp := proxy.New(p, logger, meter)
+		// Each attempt's TTFB is timed right around the provider's transport,
+		// inside the limiter, so it starts once the attempt has a slot.
+		rp.Transport = m.UpstreamTTFB(p.Name, rp.Transport)
 		// The limiter wraps the transport, so a slot is held only while the
 		// upstream is working on the request.
 		if p.MaxConcurrency > 0 {
 			rp.Transport = concurrency.Limit(rp.Transport, p.MaxConcurrency, p.QueueTimeout, m.ConcurrencyWait(p.Name))
 		}
+		// The request's overhead is timed outermost, to its first attempt's
+		// handoff, before the limiter: the wait for a slot is in neither
+		// timing.
+		rp.Transport = m.Overhead(rp.Transport)
 		proxies[p.Name] = rp
 		// Budget wraps the proxy itself, so each attempt is reserved at the
 		// prices of the provider that serves it, on its own route or as
