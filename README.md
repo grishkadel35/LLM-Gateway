@@ -17,7 +17,7 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-10-31
+**Last updated:** 2026-11-01
 **Stage:** Weeks 1 to 5 of 8 complete, checkpoints closed; Week 6
 (observability) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
@@ -36,6 +36,26 @@ the usage rows.
 
 ### What changed
 
+- **Metrics by tenant and model, and four new counters.**
+  `gateway_requests_total` and `gateway_tokens_total` gain `tenant` and
+  `model` labels, and these are new:
+  - `gateway_cost_micros_total{tenant,provider,model}`: what responses cost,
+    as their usage rows have it
+  - `gateway_cache_requests_total{tenant,provider,result}`: the cache's
+    decision, `hit`, `miss`, `bypass` or `error`
+  - `gateway_ratelimit_rejections_total{tenant,provider}`: the gateway's own
+    `429`s, not a provider's
+  - `gateway_budget_rejections_total{tenant,provider,reason}`: `exceeded`
+    (`402`), `unknown_model` (`400`) or `unavailable` (`503`)
+
+  `model` is the price table's name, so `gpt-4o-2024-08-06` counts as
+  `gpt-4o` and a snapshot with a price of its own keeps its name. Any other
+  name, every Ollama model included, is `other`. `tenant` is `none` for a
+  request refused before its tenant was known. So clients can't add series:
+  tenants come from the admin API, and models from the price table.
+  Histograms keep only `provider`, and `gateway_request_duration_seconds`
+  now starts at 1 ms, about a cache hit's time. A `1xx` sent ahead of the
+  final status no longer becomes the request line's status.
 - **Prometheus and Grafana join the compose stack.** `make obs-up` starts
   them and waits until both are healthy, and `make obs-down` stops them.
   `make db-up` still starts only Postgres and Redis.

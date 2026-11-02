@@ -173,12 +173,13 @@ func TestMetricsThroughGateway(t *testing.T) {
 
 	got := scrapeMetrics(t, r)
 	for _, want := range []string{
-		`gateway_requests_total{provider="ollama",status="200"} 1`,
-		`gateway_requests_total{provider="ollama",status="401"} 1`,
+		`gateway_requests_total{model="other",provider="ollama",status="200",tenant="tn_test"} 1`,
+		// Refused before a tenant was known.
+		`gateway_requests_total{model="other",provider="ollama",status="401",tenant="none"} 1`,
 		`gateway_request_duration_seconds_count{provider="ollama"} 2`,
 		// chat.json's usage: 19 prompt tokens, none cached, 1 completion token.
-		`gateway_tokens_total{provider="ollama",type="input"} 19`,
-		`gateway_tokens_total{provider="ollama",type="output"} 1`,
+		`gateway_tokens_total{model="other",provider="ollama",tenant="tn_test",type="input"} 19`,
+		`gateway_tokens_total{model="other",provider="ollama",tenant="tn_test",type="output"} 1`,
 	} {
 		if !strings.Contains(got, want+"\n") {
 			t.Errorf("/metrics lacks %s", want)
@@ -252,7 +253,7 @@ func TestConcurrencyCapTimesOut(t *testing.T) {
 	got := scrapeMetrics(t, r)
 	for _, want := range []string{
 		`gateway_concurrency_wait_seconds_count{provider="ollama"} 2`,
-		`gateway_requests_total{provider="ollama",status="503"} 1`,
+		`gateway_requests_total{model="other",provider="ollama",status="503",tenant="tn_test"} 1`,
 	} {
 		if !strings.Contains(got, want+"\n") {
 			t.Errorf("/metrics lacks %s", want)
@@ -317,7 +318,7 @@ providers:
 	for _, want := range []string{
 		`gateway_fallbacks_total{from="ollama",reason="server_error",to="groq"} 1`,
 		// The route the client called, with the status it got.
-		`gateway_requests_total{provider="ollama",status="200"} 1`,
+		`gateway_requests_total{model="other",provider="ollama",status="200",tenant="tn_test"} 1`,
 	} {
 		if !strings.Contains(got, want+"\n") {
 			t.Errorf("/metrics lacks %s", want)

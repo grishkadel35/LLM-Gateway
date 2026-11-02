@@ -3,8 +3,24 @@
 //
 // Every metric is registered on the gateway's own registry, not Prometheus'
 // global one: router() is built many times in tests, and registering a metric
-// twice on one registry panics. Labels never carry a tenant or a model: clients
-// choose model names, so the number of series would be theirs to grow.
+// twice on one registry panics.
+//
+// A provider label is a provider's name in config.yaml, and each metric's
+// Help says which one: the route the client called, or the provider that
+// served an attempt, which after a fallback is the fallback's.
+//
+// The counters of requests, cache decisions, refusals, tokens and cost also
+// carry the tenant, and those of requests, tokens and cost the model.
+// Histograms never carry either: each label value there multiplies about 15
+// buckets. Neither label lets a client grow the number of series:
+//   - tenant is the tenant's ID, or none for a request refused before a
+//     tenant was known (a 401, or 503 auth_unavailable). Tenants are created
+//     through the admin API, so their number is the operator's.
+//   - model is the price table's name for the model (pricing.Name), or other.
+//     Clients choose model names, but only the table's become label values:
+//     an unpriced name is other, and so is every model of a provider the
+//     table has no prices for, such as a free Ollama, and a request that
+//     names none.
 package metrics
 
 import (
@@ -15,12 +31,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/grishkadel/llm-gateway/internal/middleware"
+	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
-// durationBuckets span LLM calls: from a refused or tiny request well under a
-// second to a non-streaming generation of several minutes.
-var durationBuckets = []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
+// durationBuckets span requests: from a cache hit, which takes about 1 ms,
+// and a refused request to a non-streaming generation of several minutes.
+var durationBuckets = []float64{0.001, 0.005, 0.025, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600}
 
 // waitBuckets span a wait for a concurrency slot: from none at all to the
 // default 30-second queue timeout, and past it for a longer one.
@@ -28,13 +46,17 @@ var waitBuckets = []float64{0.001, 0.01, 0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60}
 
 // Metrics holds every metric the gateway exports.
 type Metrics struct {
-	registry  *prometheus.Registry
-	requests  *prometheus.CounterVec
-	duration  *prometheus.HistogramVec
-	tokens    *prometheus.CounterVec
-	wait      *prometheus.HistogramVec
-	up        *prometheus.GaugeVec
-	fallbacks *prometheus.CounterVec
+	registry       *prometheus.Registry
+	requests       *prometheus.CounterVec
+	duration       *prometheus.HistogramVec
+	tokens         *prometheus.CounterVec
+	cost           *prometheus.CounterVec
+	cache          *prometheus.CounterVec
+	rateLimits     *prometheus.CounterVec
+	budgetRefusals *prometheus.CounterVec
+	wait           *prometheus.HistogramVec
+	up             *prometheus.GaugeVec
+	fallbacks      *prometheus.CounterVec
 }
 
 // New returns the gateway's metrics, on a registry of their own.
@@ -43,17 +65,33 @@ func New() *Metrics {
 		registry: prometheus.NewRegistry(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_requests_total",
-			Help: "Requests on each provider route, by the HTTP status the client received. provider is the route the client called, even when a fallback answered.",
-		}, []string{"provider", "status"}),
+			Help: "Requests on each provider route, by the HTTP status the client received. provider is the route the client called, even when a fallback answered. tenant is the tenant's ID, or none before one was known (a 401, or 503 auth_unavailable); the operator creates tenants. model is the price table's name for the model the client asked of the route's provider, or other, so clients can't add series.",
+		}, []string{"tenant", "provider", "model", "status"}),
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gateway_request_duration_seconds",
-			Help:    "Time to serve a request on each provider route, a streamed body included. provider is the route the client called, even when a fallback answered.",
+			Help:    "Time to serve a request on each provider route, a streamed body included. provider is the route the client called, even when a fallback answered. No tenant or model label, since each value would multiply the buckets.",
 			Buckets: durationBuckets,
 		}, []string{"provider"}),
 		tokens: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "gateway_tokens_total",
-			Help: "Tokens the providers reported, by type. provider is the one that produced them, so after a fallback it is the fallback target.",
-		}, []string{"provider", "type"}),
+			Help: "Tokens the providers reported, by type. provider is the one that produced them, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants. model is the price table's name for the model that priced them, or other, so clients can't add series.",
+		}, []string{"tenant", "provider", "model", "type"}),
+		cost: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_cost_micros_total",
+			Help: "What the providers' responses cost in micro-dollars, as their usage rows have it; a response whose cost isn't known adds nothing. provider is the one that produced them, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants. model is the price table's name for the model that priced them, so clients can't add series.",
+		}, []string{"tenant", "provider", "model"}),
+		cache: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_cache_requests_total",
+			Help: "Requests the response cache looked at, by its decision: hit, miss, bypass, or error for a lookup that failed. provider is the route the client called. tenant is the tenant's ID; the operator creates tenants.",
+		}, []string{"tenant", "provider", "result"}),
+		rateLimits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_ratelimit_rejections_total",
+			Help: "Requests the gateway refused with its own 429 rate_limited; a provider's 429 isn't one. provider is the route the client called. tenant is the tenant's ID; the operator creates tenants.",
+		}, []string{"tenant", "provider"}),
+		budgetRefusals: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_budget_rejections_total",
+			Help: "Attempts a tenant's budget refused, by reason: exceeded (402), unknown_model (400) or unavailable (503). provider is the attempt's, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants.",
+		}, []string{"tenant", "provider", "reason"}),
 		wait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gateway_concurrency_wait_seconds",
 			Help:    "Time requests waited for a concurrency slot on a provider with max_concurrency, whether or not one came free.",
@@ -68,7 +106,7 @@ func New() *Metrics {
 			Help: "Requests handed from a failed provider to its fallback, by why it failed: unreachable, timeout or server_error.",
 		}, []string{"from", "to", "reason"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.wait, m.up, m.fallbacks)
+	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.cost, m.cache, m.rateLimits, m.budgetRefusals, m.wait, m.up, m.fallbacks)
 	return m
 }
 
@@ -79,6 +117,11 @@ func (m *Metrics) Handler() http.Handler {
 
 // Requests returns middleware that counts and times each request on
 // provider's route, by the status the client received.
+//
+// It goes inside middleware.Logging, and reads the request's Record once the
+// route is done: the tenant, the model the client asked for, the cache's
+// decision, the gateway's own 429, and a budget's refusal. Without a Record,
+// a request counts under tenant none and model other, and nothing else.
 func (m *Metrics) Requests(provider string) func(http.Handler) http.Handler {
 	duration := m.duration.WithLabelValues(provider)
 	return func(next http.Handler) http.Handler {
@@ -90,7 +133,7 @@ func (m *Metrics) Requests(provider string) func(http.Handler) http.Handler {
 			// ReverseProxy aborts with panic(http.ErrAbortHandler) when a
 			// client disconnects mid-stream.
 			defer func() {
-				m.requests.WithLabelValues(provider, strconv.Itoa(rec.status())).Inc()
+				m.request(provider, rec.status(), middleware.RecordFrom(r.Context()))
 				duration.Observe(time.Since(start).Seconds())
 			}()
 
@@ -99,9 +142,41 @@ func (m *Metrics) Requests(provider string) func(http.Handler) http.Handler {
 	}
 }
 
-// Tokens counts one response's tokens for provider, the provider that
-// produced them.
-func (m *Metrics) Tokens(provider string, u usage.Usage) {
+// request counts a request on provider's route that ended with status, by
+// what record, its Record, says of it: nil for none.
+func (m *Metrics) request(provider string, status int, record *middleware.Record) {
+	if record == nil {
+		record = &middleware.Record{}
+	}
+	tenant := tenantLabel(record.TenantID)
+	asked := ""
+	if record.Request != nil {
+		asked = record.Request.Model
+	}
+	m.requests.WithLabelValues(tenant, provider, modelLabel(provider, asked), strconv.Itoa(status)).Inc()
+	// The Record leaves these empty for a request refused for a bad
+	// X-Gateway-Cache, a provider's own 429, and a client gone during the
+	// budget check (499).
+	if record.Cache != "" {
+		m.cache.WithLabelValues(tenant, provider, record.Cache).Inc()
+	}
+	if record.RateLimited {
+		m.rateLimits.WithLabelValues(tenant, provider).Inc()
+	}
+	if b := record.BudgetRefusal; b != nil {
+		m.budgetRefusals.WithLabelValues(tenant, b.Provider, b.Reason).Inc()
+	}
+}
+
+// Usage counts one usage report from provider, the provider that produced
+// it, for the tenant with ID tenantID: u's tokens by type, and costMicros,
+// what it cost, when that is known and above 0.
+//
+// The model is the price table's name for u's model, else for requested, the
+// model the request asked provider for: the names pricing.Cost tries, so it
+// names the rate that priced costMicros.
+func (m *Metrics) Usage(tenantID, provider string, u usage.Usage, requested string, costMicros *int64) {
+	tenant, model := tenantLabel(tenantID), modelLabel(provider, u.Model, requested)
 	for _, t := range []struct {
 		typ string
 		n   int64
@@ -116,9 +191,31 @@ func (m *Metrics) Tokens(provider string, u usage.Usage) {
 		// series. > rather than != because Add panics on a negative number,
 		// and Input is the provider's own subtraction.
 		if t.n > 0 {
-			m.tokens.WithLabelValues(provider, t.typ).Add(float64(t.n))
+			m.tokens.WithLabelValues(tenant, provider, model, t.typ).Add(float64(t.n))
 		}
 	}
+	// A cache hit and a free provider's response cost 0, and add no series.
+	if costMicros != nil && *costMicros > 0 {
+		m.cost.WithLabelValues(tenant, provider, model).Add(float64(*costMicros))
+	}
+}
+
+// tenantLabel is the tenant label for the tenant with ID id, which is ""
+// before a tenant was known.
+func tenantLabel(id string) string {
+	if id == "" {
+		return "none"
+	}
+	return id
+}
+
+// modelLabel is the model label for a model of provider's, named by the
+// first of models the price table names it by, or other.
+func modelLabel(provider string, models ...string) string {
+	if name, ok := pricing.Name(provider, models...); ok {
+		return name
+	}
+	return "other"
 }
 
 // ConcurrencyWait returns the function that observes each wait for one of

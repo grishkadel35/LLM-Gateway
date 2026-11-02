@@ -312,6 +312,26 @@ func ResultCost(provider string, free bool, r usage.Result, requested string, at
 	return Cost(provider, r.Usage, requested, at)
 }
 
+// Name returns the price table's name for a model of provider's: the first
+// of models that provider has a rate for, as given or with any date suffix
+// stripped, tried in the order Cost tries them. ok is false when there is
+// none. Given Cost's names (the response's model, then the requested one), it
+// names the model whose rate priced the cost.
+//
+// A rate's date doesn't matter: a name with any rate is the table's, so a
+// model keeps its name when a new price takes effect.
+func Name(provider string, models ...string) (name string, ok bool) {
+	byModel := index[provider]
+	for _, model := range models {
+		for _, n := range []string{model, normalize(model)} {
+			if n != "" && len(byModel[n]) > 0 {
+				return n, true
+			}
+		}
+	}
+	return "", false
+}
+
 // MaxMicros is the most a reservation can be: the largest budget,
 // tenant.MaxBudgetMicros ($1 billion), since a bigger one could never fit
 // any. The budget ledger's Lua scripts compare these amounts as doubles,

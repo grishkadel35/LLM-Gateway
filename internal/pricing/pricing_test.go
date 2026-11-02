@@ -231,6 +231,43 @@ func TestRatesHaveMaxOutput(t *testing.T) {
 	}
 }
 
+// TestName: a model's name in the table is the first of the names given that
+// the provider prices, as given or without its date: the rate Cost prices
+// those names by. A snapshot with a rate of its own keeps its name.
+func TestName(t *testing.T) {
+	cases := []struct {
+		provider string
+		models   []string
+		want     string // "" when not priced
+	}{
+		{"openai", []string{"gpt-4o"}, "gpt-4o"},
+		{"openai", []string{"gpt-4o-2024-08-06"}, "gpt-4o"},
+		{"openai", []string{"gpt-4o-2024-05-13"}, "gpt-4o-2024-05-13"},
+		{"anthropic", []string{"claude-sonnet-4-20250514"}, "claude-sonnet-4"},
+		// The response's model first, then the requested one.
+		{"openai", []string{"gpt-4o-mini", "gpt-4o"}, "gpt-4o-mini"},
+		{"openai", []string{"gpt-9", "gpt-4o-2024-08-06"}, "gpt-4o"},
+		{"openai", []string{"", "gpt-4o"}, "gpt-4o"},
+		{"groq", []string{"llama-3.3-70b-versatile"}, ""},
+		{"openai", []string{"gpt-9", ""}, ""},
+		{"openai", nil, ""},
+		// Prices are per provider, and a free one has none.
+		{"groq", []string{"gpt-4o"}, ""},
+		{"ollama", []string{"qwen3.5:9b"}, ""},
+	}
+	for _, tc := range cases {
+		got, ok := Name(tc.provider, tc.models...)
+		if got != tc.want || ok != (tc.want != "") {
+			t.Errorf("Name(%s, %q) = %q, %v; want %q", tc.provider, tc.models, got, ok, tc.want)
+		}
+		// The name is the model of the rate lookup finds, whenever one is in
+		// force.
+		if r, priced := lookup(tc.provider, oct2026, tc.models...); priced && r.Model != got {
+			t.Errorf("Name(%s, %q) = %q, but the rate in force is %s's", tc.provider, tc.models, got, r.Model)
+		}
+	}
+}
+
 func TestNormalize(t *testing.T) {
 	cases := map[string]string{
 		"gpt-4o-2024-08-06":         "gpt-4o",

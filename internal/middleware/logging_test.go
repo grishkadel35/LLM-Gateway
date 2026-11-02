@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 )
 
@@ -105,6 +106,48 @@ func TestLoggingDefaultsToStatus200(t *testing.T) {
 	}
 	if got := entry["bytes"]; got != float64(2) {
 		t.Errorf("logged bytes = %v, want 2", got)
+	}
+}
+
+// TestLoggingSkips1xx: an informational response goes through to the client,
+// and the line logs the final status after it, as gateway_requests_total
+// counts it.
+func TestLoggingSkips1xx(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		sent    []string // each status the client was sent, as headerLog logs it
+		want    int
+	}{
+		{"then a status", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusEarlyHints)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}, []string{"103 []", "503 []"}, http.StatusServiceUnavailable},
+		// A body without WriteHeader implies a 200.
+		{"then a body", func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusEarlyHints)
+			_, _ = io.WriteString(w, "ok")
+		}, []string{"103 []"}, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			// headerLog (cache_test.go) sees every 1xx, as
+			// httptest.ResponseRecorder doesn't.
+			sent := &headerLog{ResponseRecorder: httptest.NewRecorder()}
+			Logging(slog.New(slog.NewJSONHandler(&logs, nil)))(tc.handler).ServeHTTP(sent, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+
+			if !slices.Equal(sent.sent, tc.sent) || sent.Code != tc.want {
+				t.Errorf("sent %q, final status %d; want %q, %d", sent.sent, sent.Code, tc.sent, tc.want)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+				t.Fatalf("log output %q is not valid JSON: %v", logs.String(), err)
+			}
+			if got := entry["status"]; got != float64(tc.want) {
+				t.Errorf("logged status = %v, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

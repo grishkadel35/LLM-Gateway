@@ -132,10 +132,20 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			// budget the attempt's reservation, and the cache to decide by
 			// whether to store the response.
 			middleware.ReportUsage(ctx, name, r)
-			m.Tokens(name, r.Usage)
+			// Priced once, as recordUsage prices the usage row, for the
+			// metrics and the request line alike. The model label comes from
+			// the names it was priced by: the response's model, then the one
+			// this attempt asked for.
+			cost := usageCost(ctx, name, free, r)
+			t, _, _ := middleware.TenantFrom(ctx)
+			requested := ""
+			if req, ok := usage.RequestFrom(ctx); ok {
+				requested = req.Model
+			}
+			m.Usage(t.ID, name, r.Usage, requested, cost)
 			// For the request line.
 			if rec := middleware.RecordFrom(ctx); rec != nil {
-				rec.Usage = &middleware.UsageReport{Provider: name, Result: r, CostMicros: usageCost(ctx, name, free, r)}
+				rec.Usage = &middleware.UsageReport{Provider: name, Result: r, CostMicros: cost}
 			}
 			if onUsage != nil {
 				onUsage(ctx, name, r)

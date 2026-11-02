@@ -75,7 +75,10 @@ type responseRecorder struct {
 }
 
 func (r *responseRecorder) WriteHeader(code int) {
-	if !r.wroteHeader {
+	// A 1xx is informational: it goes to the client, and the final status
+	// follows it. The line logs the final one, as gateway_requests_total
+	// counts it.
+	if !r.wroteHeader && code >= 200 {
 		r.code = code
 		r.wroteHeader = true
 	}
