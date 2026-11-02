@@ -114,7 +114,7 @@ providers:
 // cachedRouter builds the gateway from cacheConfig in front of upstream, over
 // fakeStore, with responses cached in store, rate limited by limiter unless
 // it is nil.
-func cachedRouter(t *testing.T, upstream string, store middleware.CacheStore, limiter middleware.Limiter, logger *slog.Logger) http.Handler {
+func cachedRouter(t *testing.T, upstream string, store middleware.CacheStore, limiter middleware.Limiter, logger *slog.Logger) routerWithMetrics {
 	t.Helper()
 	t.Setenv("TEST_MOCK_KEY", "mock")
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -125,11 +125,12 @@ func cachedRouter(t *testing.T, upstream string, store middleware.CacheStore, li
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, nil, limiter, store, nil, metrics.New(), nil, logger)
+	m := metrics.New()
+	r, err := router(cfg, fakeStore{}, testAdminKey, nil, limiter, store, nil, m, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
-	return r
+	return routerWithMetrics{r, m}
 }
 
 // discardLogger is for tests that don't read the logs.
@@ -623,7 +624,8 @@ func TestCacheHitUsageRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := usage.NewWriter(conn, discardLogger)
-	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, discardLogger), nil, &fakeCache{}, nil, metrics.New(), nil, discardLogger)
+	m := metrics.New()
+	r, err := router(mockConfig(t), store, testAdminKey, recordUsage(writer, nil, discardLogger), nil, &fakeCache{}, nil, m, nil, nil, discardLogger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,7 +644,7 @@ func TestCacheHitUsageRow(t *testing.T) {
 	// tokens returns the gateway_tokens_total samples on /metrics.
 	tokens := func() []string {
 		var samples []string
-		for line := range strings.Lines(scrapeMetrics(t, r)) {
+		for line := range strings.Lines(scrapeMetrics(t, m)) {
 			if strings.HasPrefix(line, "gateway_tokens_total{") {
 				samples = append(samples, line)
 			}
@@ -746,7 +748,7 @@ providers:
 
 // fallbackRouter builds the gateway from fallbackConfig over fakeStore, with
 // responses cached in store.
-func fallbackRouter(t *testing.T, ollama, groq string, store middleware.CacheStore) http.Handler {
+func fallbackRouter(t *testing.T, ollama, groq string, store middleware.CacheStore) routerWithMetrics {
 	t.Helper()
 	t.Setenv("TEST_GROQ_KEY", "sk-groq")
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -757,11 +759,12 @@ func fallbackRouter(t *testing.T, ollama, groq string, store middleware.CacheSto
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, nil, nil, store, nil, metrics.New(), nil, discardLogger)
+	m := metrics.New()
+	r, err := router(cfg, fakeStore{}, testAdminKey, nil, nil, store, nil, m, nil, nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
-	return r
+	return routerWithMetrics{r, m}
 }
 
 // qwenAtZero is a chat body at temperature 0 for the model ollama's fallback
@@ -798,7 +801,7 @@ func TestCacheNeverStoresAFallbacksAnswer(t *testing.T) {
 				t.Errorf("Set calls = %+v, want none", sets)
 			}
 			fallbacks := fmt.Sprintf(`gateway_fallbacks_total{from="ollama",reason=%q,to="groq"} 2`, tc.reason)
-			if !strings.Contains(scrapeMetrics(t, r), fallbacks+"\n") || groqCalls.Load() != 2 {
+			if !strings.Contains(scrapeMetrics(t, r.metrics), fallbacks+"\n") || groqCalls.Load() != 2 {
 				t.Errorf("groq got %d requests; want 2, each after ollama failed, with /metrics showing %s", groqCalls.Load(), fallbacks)
 			}
 		})
@@ -904,7 +907,7 @@ func newCacheGateway(t *testing.T, upstream string) *cacheGateway {
 	// An entry lasts a minute: far longer than any test here takes, and the
 	// shared Redis is rid of it soon after.
 	r, err := router(mockConfigAt(t, upstream), g.store, testAdminKey, recordUsage(g.writer, nil, logger),
-		g.limiter, cache.New(rdb, time.Minute), nil, metrics.New(), nil, logger)
+		g.limiter, cache.New(rdb, time.Minute), nil, metrics.New(), nil, nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}

@@ -105,21 +105,30 @@ the usage rows.
   Each field appears only once it is known, so a `401` names only the route,
   and a `429` or `402` has no usage. Lines for the admin API, `/health` and
   unknown paths don't change.
-- **A port for `/metrics`, not yet served.** `metrics_port` (default 9091,
-  on the gateway's `host`) is where `/metrics` will be served, alone and
-  behind the admin key.
-  - A value outside 1–65535, or equal to `port`, stops startup with an error
-    that names it.
-  - Until the listener lands later this week, `/metrics` stays on the main
-    port with no key.
-- **A readiness handler, not yet routed.** `health.ReadyHandler` will answer
-  `GET /ready`. It pings Postgres and Redis at the same time, each given a
-  second, and answers `200` with `"status":"ready"`, or `503` with
+- **`/metrics` on a port of its own, behind the admin key.** `metrics_port`
+  (default 9091, on the gateway's `host`) serves `/metrics` and nothing else.
+  A scrape needs the admin key as a Bearer token: without it, or with a
+  tenant's key, it gets `401 invalid_admin_key`, and so does every scrape
+  when no admin key is set. Prometheus from `make obs-up` sends the key. The
+  main port no longer serves `/metrics`, so it answers `404` there.
+  - A `metrics_port` outside 1–65535, equal to `port`, or held by another
+    process stops startup with an error that names it.
+  - The startup line, `gateway listening`, names both addresses: `addr` and
+    `metrics_addr`.
+- **`GET /ready`.** It pings Postgres and Redis at the same time, each given
+  a second, and answers `200` with `"status":"ready"`, or `503` with
   `"status":"not_ready"` and the failing check `down`.
   - It never calls a provider.
   - An error's text goes only to the log, at Warn, since the endpoint needs no
     key.
-  - The gateway starts serving it later this week. `/health` doesn't change.
+  - `/health` doesn't change.
+- **go-redis's own lines are JSON.** Its messages, such as `failed to dial`
+  while Redis is down, are logged at Warn with `"component":"go-redis"` from
+  startup on, not as plain text on stderr.
+- **The usage writer's metrics.** `gateway_usage_writer_queue_depth`, the
+  rows waiting in the writer's queue, and
+  `gateway_usage_writer_dropped_total`, the rows it dropped, are read at each
+  scrape.
 - **Week 5 checkpoint closed.** Six tests in
   `cmd/gateway/budget_checkpoint_test.go`, through the real router against a
   real Postgres and Redis, show that a tenant with a $1 budget gets its first

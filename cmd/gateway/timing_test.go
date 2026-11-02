@@ -37,7 +37,7 @@ func TestTimingThroughGateway(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body %s", rec.Code, http.StatusOK, rec.Body)
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	ttfb, ttfbCounts := timing(t, got, "gateway_upstream_ttfb_seconds")
 	overhead, overheadCounts := timing(t, got, "gateway_overhead_seconds")
 	checkSamples(t, "gateway_upstream_ttfb_seconds_count", ttfbCounts, map[string]float64{"ollama": 1})
@@ -70,7 +70,7 @@ func TestTimingLeavesOutTheConcurrencyWait(t *testing.T) {
 		}
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	wait, waitCounts := timing(t, got, "gateway_concurrency_wait_seconds")
 	ttfb, ttfbCounts := timing(t, got, "gateway_upstream_ttfb_seconds")
 	overhead, overheadCounts := timing(t, got, "gateway_overhead_seconds")
@@ -140,7 +140,7 @@ func TestTimingAcrossAFallback(t *testing.T) {
 					rec.Code, rec.Header().Get("X-Gateway-Fallback"), rec.Body)
 			}
 
-			got := scrapeMetrics(t, r)
+			got := scrapeMetrics(t, r.metrics)
 			_, overheadCounts := timing(t, got, "gateway_overhead_seconds")
 			_, ttfbCounts := timing(t, got, "gateway_upstream_ttfb_seconds")
 			checkSamples(t, "gateway_overhead_seconds_count", overheadCounts, map[string]float64{"ollama": 1})
@@ -173,7 +173,7 @@ func TestTTFBOfAStream(t *testing.T) {
 		t.Fatalf("status %d, body %q; want 200 and the whole stream", rec.Code, rec.Body)
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	ttfb, ttfbCounts := timing(t, got, "gateway_upstream_ttfb_seconds")
 	duration, _ := timing(t, got, "gateway_request_duration_seconds")
 	checkSamples(t, "gateway_upstream_ttfb_seconds_count", ttfbCounts, map[string]float64{"ollama": 1})
@@ -209,7 +209,7 @@ func TestTimingSkipsCacheHitsAndRefusals(t *testing.T) {
 		t.Fatalf("%d requests reached the provider, want the miss alone", n)
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	_, overheadCounts := timing(t, got, "gateway_overhead_seconds")
 	_, ttfbCounts := timing(t, got, "gateway_upstream_ttfb_seconds")
 	checkSamples(t, "gateway_overhead_seconds_count", overheadCounts, map[string]float64{"openai": 1})

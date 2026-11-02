@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -92,14 +93,15 @@ type budgetLedger interface {
 
 // router builds the gateway's handler: one reverse proxy per configured
 // provider behind tenant auth, the response cache, rate limiting and budgets,
-// the admin API behind the admin key, /health, /metrics, and a catch-all that
+// the admin API behind the admin key, /health, /ready, and a catch-all that
 // rejects unknown prefixes, all behind the request ID and logging middleware.
 // A nil limiter means no rate limiting, a nil cacheStore no response cache,
-// and a nil ledger no budgets and no budget report in the admin API.
+// a nil ledger no budgets and no budget report in the admin API, and a nil
+// ready no /ready. /metrics isn't here: it has a port of its own.
 //
 // It's separated from run() so tests can exercise routing without starting a
 // real server or handling signals.
-func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, ledger budgetLedger, m *metrics.Metrics, checker *health.Checker, logger *slog.Logger) (http.Handler, error) {
+func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usageFunc, limiter middleware.Limiter, cacheStore middleware.CacheStore, ledger budgetLedger, m *metrics.Metrics, checker *health.Checker, ready http.Handler, logger *slog.Logger) (http.Handler, error) {
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return nil, err
@@ -109,9 +111,11 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 	// wins, so "/health" beats "/openai/" beats the catch-all "/".
 	mux := http.NewServeMux()
 	mux.Handle("/health", health.Handler(checker))
-	// Unauthenticated for now; roadmap Week 6 decides between admin auth and a
-	// separate port.
-	mux.Handle("/metrics", m.Handler())
+	// Handle panics on a nil handler, so no handler means no route, and the
+	// catch-all answers.
+	if ready != nil {
+		mux.Handle("/ready", ready)
+	}
 
 	// One subtree behind AdminAuth, not a pattern per admin route: with
 	// per-route patterns, ServeMux would answer an unauthenticated request for
@@ -245,6 +249,16 @@ func unknownProvider(names []string) http.Handler {
 	})
 }
 
+// metricsHandler returns the handler of the metrics port: m's metrics and
+// nothing else, behind the admin key. A request without it as a Bearer token,
+// or with a tenant's key, gets the admin API's 401.
+//
+// It has no request ID and no request line: Prometheus scrapes it every few
+// seconds, and a line for each scrape would bury the log.
+func metricsHandler(m *metrics.Metrics, adminKey string) http.Handler {
+	return middleware.AdminAuth(adminKey)(m.Handler())
+}
+
 // run wires everything together and blocks until the process is asked to stop.
 //
 // Go note: keeping the real work in run() instead of main() means it returns an
@@ -262,6 +276,10 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	defer conn.Close()
 
+	// go-redis's own log lines go through logger. This is process-wide and
+	// goes before the first connection, so a dial that fails at startup is
+	// logged as JSON too.
+	redis.SetLogger(redisLogger{logger})
 	rdb, err := openRedis(os.Getenv("REDIS_URL"))
 	if err != nil {
 		return err
@@ -283,13 +301,19 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}()
 
 	m := metrics.New()
+	m.UsageWriter(writer.Queued, writer.Dropped)
 	providers, err := cfg.BuildProviders()
 	if err != nil {
 		return err
 	}
 	checker := health.NewChecker(providers, m.ProviderUp, logger)
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), budget.New(rdb, conn, writer.Pending), m, checker, logger)
+	ready := health.ReadyHandler(map[string]func(context.Context) error{
+		"postgres": conn.PingContext,
+		"redis":    func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
+	}, logger)
+
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), budget.New(rdb, conn, writer.Pending), m, checker, ready, logger)
 	if err != nil {
 		return err
 	}
@@ -306,22 +330,46 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		// us from a provider that never responds.
 		IdleTimeout: 120 * time.Second,
 	}
+	// /metrics has a port of its own, behind the admin key.
+	metricsSrv := &http.Server{
+		Addr:    cfg.MetricsAddr(),
+		Handler: metricsHandler(m, adminKey),
+		// As the main server's.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	// Go note: ListenAndServe is net.Listen followed by Serve. Doing the two
+	// by hand opens both ports before either server serves, so a port that is
+	// taken ends startup here, with an error naming its address, and not in a
+	// goroutine after the gateway has said it is listening. Serve closes the
+	// listener it is given when it returns, so a listener is closed by hand
+	// only when its server never starts.
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return fmt.Errorf("gateway listener: %w", err)
+	}
+	metricsLn, err := net.Listen("tcp", metricsSrv.Addr)
+	if err != nil {
+		ln.Close()
+		return fmt.Errorf("metrics listener: %w", err)
+	}
+	logger.Info("gateway listening",
+		"addr", srv.Addr,
+		"metrics_addr", metricsSrv.Addr,
+		"providers", cfg.ProviderNames(),
+	)
 
 	// Go note: a channel is a typed pipe used to pass values between
-	// goroutines. Here it carries the server's exit error out of the goroutine
-	// we start it in. Buffered with size 1 so the send never blocks, even if
-	// nobody is reading yet.
-	serverErr := make(chan error, 1)
+	// goroutines. Here it carries the servers' exit errors out of the
+	// goroutines we start them in. Buffered with size 2, one send for each
+	// server, so a send never blocks, even if nobody is reading yet.
+	serverErr := make(chan error, 2)
 
-	// `go f()` runs f concurrently. ListenAndServe blocks forever, so it goes on
-	// its own goroutine while main waits for a shutdown signal.
-	go func() {
-		logger.Info("gateway listening",
-			"addr", srv.Addr,
-			"providers", cfg.ProviderNames(),
-		)
-		serverErr <- srv.ListenAndServe()
-	}()
+	// `go f()` runs f concurrently. Serve blocks until its server is shut down,
+	// so each goes on its own goroutine while main waits for a shutdown signal.
+	go func() { serverErr <- srv.Serve(ln) }()
+	go func() { serverErr <- metricsSrv.Serve(metricsLn) }()
 
 	// signal.NotifyContext gives us a context that is cancelled on Ctrl-C or on
 	// the TERM signal Docker/Kubernetes send.
@@ -332,15 +380,15 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	defer stop()
 
 	// The provider checks run until ctx ends: at a shutdown signal, or when
-	// run returns because the server failed.
+	// run returns because a server failed.
 	go checker.Run(ctx)
 
 	// select waits on several channel operations at once and proceeds with
 	// whichever is ready first.
 	select {
 	case err := <-serverErr:
-		// ErrServerClosed is the expected error after a graceful Shutdown, so
-		// it isn't a real failure.
+		// From either server. ErrServerClosed is the expected error after a
+		// graceful Shutdown, so it isn't a real failure.
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
@@ -353,8 +401,14 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 		defer cancel()
 
 		// Shutdown stops accepting new connections and waits for in-flight
-		// requests to finish, up to the deadline above.
-		if err := srv.Shutdown(shutdownCtx); err != nil {
+		// requests to finish, up to the deadline above. Both servers get that
+		// one deadline. The main server drains first, so a scrape still works
+		// while it does, and the metrics server goes down after it even if the
+		// main one ran out of time.
+		//
+		// Go note: errors.Join returns one error holding every non-nil error
+		// it is given, or nil when there are none.
+		if err := errors.Join(srv.Shutdown(shutdownCtx), metricsSrv.Shutdown(shutdownCtx)); err != nil {
 			return err
 		}
 

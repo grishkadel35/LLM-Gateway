@@ -336,6 +336,33 @@ func (m *Metrics) Fallback(from, to, reason string) {
 	m.fallbacks.WithLabelValues(from, to, reason).Inc()
 }
 
+// UsageWriter registers the usage writer's two metrics, which read the writer
+// as each scrape happens: queued, how many rows wait in its queue, and
+// dropped, how many rows it has dropped, which must only ever go up. They are
+// functions, not the writer, so the writer needs no metrics and the metrics no
+// writer. Call it once: registering a metric twice panics.
+//
+// Go note: prometheus.NewGaugeFunc and NewCounterFunc make metrics that store
+// nothing. The registry calls the function every time it is scraped, so the
+// number is the writer's own, with no second copy to keep in step, as a
+// Gauge's Set or a Counter's Add would need. The function runs on the
+// scrape's goroutine while the writer keeps working, so it must be safe to
+// call at the same time: len of a channel and an atomic Load both are. A
+// counter that goes down reads to Prometheus as a restart, which is why
+// dropped must not.
+func (m *Metrics) UsageWriter(queued func() int, dropped func() int64) {
+	m.registry.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "gateway_usage_writer_queue_depth",
+			Help: "Usage rows waiting in the usage writer's queue for their batch insert, read when scraped. The queue is bounded, and a row that finds it full is dropped (see gateway_usage_writer_dropped_total). A batch being inserted has left the queue and isn't counted.",
+		}, func() float64 { return float64(queued()) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "gateway_usage_writer_dropped_total",
+			Help: "Usage rows the usage writer dropped because its queue was full, or because it had closed, read when scraped. A dropped row never reaches usage_logs. A row Postgres rejects is logged, not counted here.",
+		}, func() float64 { return float64(dropped()) }),
+	)
+}
+
 // statusRecorder remembers the status a handler sent.
 type statusRecorder struct {
 	http.ResponseWriter

@@ -280,7 +280,7 @@ func TestMetricsThroughGatewayExactly(t *testing.T) {
 		t.Fatalf("no tokens (%v) or no cost (%v) in the usage rows", tokens, cost)
 	}
 
-	got := scrapeMetrics(t, g)
+	got := scrapeMetrics(t, g.metrics)
 	checkSamples(t, "gateway_requests_total", samples(t, got, "gateway_requests_total", "tenant", "provider", "model", "status"), requests)
 	checkSamples(t, "gateway_cache_requests_total", samples(t, got, "gateway_cache_requests_total", "tenant", "provider", "result"), cache)
 	checkSamples(t, "gateway_ratelimit_rejections_total", samples(t, got, "gateway_ratelimit_rejections_total", "tenant", "provider"), limited)
@@ -311,7 +311,7 @@ func TestBudgetGaugesThroughGateway(t *testing.T) {
 	// what, are spent and budget.
 	checkGauges := func(t *testing.T, what string, spent, budget map[string]float64) {
 		t.Helper()
-		got := scrapeMetrics(t, g)
+		got := scrapeMetrics(t, g.metrics)
 		checkSamples(t, "gateway_budget_spent_micros after "+what, samples(t, got, "gateway_budget_spent_micros", "tenant"), spent)
 		checkSamples(t, "gateway_budget_micros after "+what, samples(t, got, "gateway_budget_micros", "tenant"), budget)
 	}
@@ -365,7 +365,7 @@ func TestMetricsRandomModels(t *testing.T) {
 		}
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	for _, m := range regexp.MustCompile(`model="[^"]*"`).FindAllString(got, -1) {
 		if m != `model="other"` {
 			t.Errorf("a series with %s", m)

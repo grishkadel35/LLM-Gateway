@@ -147,7 +147,7 @@ func loadConfig(t *testing.T, yaml string) *config.Config {
 // and rate limited by limiter and caching in cacheStore unless they are nil.
 func budgetRouter(t *testing.T, cfg *config.Config, store tenantStore, ledger budgetLedger, limiter middleware.Limiter, cacheStore middleware.CacheStore) http.Handler {
 	t.Helper()
-	r, err := router(cfg, store, testAdminKey, nil, limiter, cacheStore, ledger, metrics.New(), nil, discardLogger)
+	r, err := router(cfg, store, testAdminKey, nil, limiter, cacheStore, ledger, metrics.New(), nil, nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestBudgetReserveFailsThroughGateway(t *testing.T) {
 			var logs lockedBuffer
 			limiter := &fakeLimiter{allowed: true}
 			r, err := router(mockConfigAt(t, upstream), budgetedStore{micros: fiftyDollars}, testAdminKey, nil, limiter, nil, tc.ledger,
-				metrics.New(), nil, slog.New(slog.NewJSONHandler(&logs, nil)))
+				metrics.New(), nil, nil, slog.New(slog.NewJSONHandler(&logs, nil)))
 			if err != nil {
 				t.Fatalf("router() returned error: %v", err)
 			}
@@ -647,7 +647,7 @@ func rowsTenant(t *testing.T) (store stores, conn *sql.DB, writer *usage.Writer,
 func rowsGateway(t *testing.T, cfg *config.Config, ledger budgetLedger) (r http.Handler, conn *sql.DB, writer *usage.Writer, key string) {
 	t.Helper()
 	store, conn, writer, k := rowsTenant(t)
-	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
+	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
@@ -889,7 +889,7 @@ func TestBudgetReportThroughGateway(t *testing.T) {
 	t.Cleanup(func() { rdb.Del(context.Background(), hash, hash+":missed") })
 
 	cfg := mockConfig(t)
-	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, discardLogger)
+	r, err := router(cfg, store, testAdminKey, recordUsage(writer, cfg.Providers, discardLogger), nil, nil, ledger, metrics.New(), nil, nil, discardLogger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}

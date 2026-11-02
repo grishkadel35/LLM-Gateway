@@ -40,11 +40,12 @@ import (
 // limiter and the budget ledger in Redis, on the client openRedis builds.
 type lineGateway struct {
 	http.Handler
-	conn   *sql.DB
-	rdb    *redis.Client
-	store  stores
-	writer *usage.Writer
-	logs   *lockedBuffer
+	conn    *sql.DB
+	rdb     *redis.Client
+	store   stores
+	writer  *usage.Writer
+	logs    *lockedBuffer
+	metrics *metrics.Metrics
 }
 
 // newLineGateway builds a lineGateway from cfg on a fresh database. Without
@@ -65,7 +66,7 @@ func newLineGateway(t *testing.T, cfg *config.Config, warns map[string]int) *lin
 		t.Fatalf("Migrate() returned error: %v", err)
 	}
 
-	g := &lineGateway{conn: conn, rdb: rdb, store: stores{tenant.NewStore(conn), usage.NewReports(conn)}, logs: &lockedBuffer{}}
+	g := &lineGateway{conn: conn, rdb: rdb, store: stores{tenant.NewStore(conn), usage.NewReports(conn)}, logs: &lockedBuffer{}, metrics: metrics.New()}
 	logger := slog.New(slog.NewJSONHandler(g.logs, nil))
 	t.Cleanup(func() { checkWarns(t, g.logs.String(), warns) })
 	g.writer = usage.NewWriter(conn, logger)
@@ -74,7 +75,7 @@ func newLineGateway(t *testing.T, cfg *config.Config, warns map[string]int) *lin
 	t.Cleanup(func() { g.writer.Close(context.Background()) })
 
 	r, err := router(cfg, g.store, testAdminKey, recordUsage(g.writer, cfg.Providers, logger), ratelimit.New(rdb),
-		cache.New(rdb, time.Minute), budget.New(rdb, conn, g.writer.Pending), metrics.New(), nil, logger)
+		cache.New(rdb, time.Minute), budget.New(rdb, conn, g.writer.Pending), g.metrics, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}

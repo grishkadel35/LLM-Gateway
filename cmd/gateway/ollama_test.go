@@ -94,9 +94,17 @@ providers:
     format: openai
 `
 
+// routerWithMetrics is a router together with the metrics it reports to. The
+// metrics have a port of their own, so a test scrapes them with
+// scrapeMetrics(t, r.metrics), not through the router.
+type routerWithMetrics struct {
+	http.Handler
+	metrics *metrics.Metrics
+}
+
 // routerFor builds the gateway from a config file's text, over fakeStore,
 // rate limited by limiter unless it is nil.
-func routerFor(t *testing.T, yaml string, onUsage usageFunc, limiter middleware.Limiter) http.Handler {
+func routerFor(t *testing.T, yaml string, onUsage usageFunc, limiter middleware.Limiter) routerWithMetrics {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -107,11 +115,12 @@ func routerFor(t *testing.T, yaml string, onUsage usageFunc, limiter middleware.
 	if err != nil {
 		t.Fatalf("config.Load() returned error: %v", err)
 	}
-	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, limiter, nil, nil, metrics.New(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	m := metrics.New()
+	r, err := router(cfg, fakeStore{}, testAdminKey, onUsage, limiter, nil, nil, m, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}
-	return r
+	return routerWithMetrics{r, m}
 }
 
 // chatRequest is a tenant's non-streaming chat request on route.
@@ -148,11 +157,12 @@ func receive[T any](t *testing.T, ch <-chan T, what string) T {
 	}
 }
 
-// scrapeMetrics returns GET /metrics, which needs no key.
-func scrapeMetrics(t *testing.T, r http.Handler) string {
+// scrapeMetrics returns GET /metrics from m.Handler(), which run() serves
+// on the metrics port behind the admin key (see metricsHandler).
+func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("GET /metrics: status = %d, want %d", rec.Code, http.StatusOK)
 	}
@@ -171,7 +181,7 @@ func TestMetricsThroughGateway(t *testing.T) {
 	refused.Header.Set("Authorization", "Bearer gw_not-a-key")
 	r.ServeHTTP(httptest.NewRecorder(), refused)
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	for _, want := range []string{
 		`gateway_requests_total{model="other",provider="ollama",status="200",tenant="tn_test"} 1`,
 		// Refused before a tenant was known.
@@ -250,7 +260,7 @@ func TestConcurrencyCapTimesOut(t *testing.T) {
 	default:
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	for _, want := range []string{
 		`gateway_concurrency_wait_seconds_count{provider="ollama"} 2`,
 		`gateway_requests_total{model="other",provider="ollama",status="503",tenant="tn_test"} 1`,
@@ -314,7 +324,7 @@ providers:
 		t.Errorf("request IDs = %q, want one ID for both attempts", ids)
 	}
 
-	got := scrapeMetrics(t, r)
+	got := scrapeMetrics(t, r.metrics)
 	for _, want := range []string{
 		`gateway_fallbacks_total{from="ollama",reason="server_error",to="groq"} 1`,
 		// The route the client called, with the status it got.

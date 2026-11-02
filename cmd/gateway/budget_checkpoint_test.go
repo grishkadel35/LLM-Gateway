@@ -119,9 +119,10 @@ const warned80 = "tenant's spend has reached 80% of its monthly budget"
 // tenant.
 type budgetGateway struct {
 	http.Handler
-	conn   *sql.DB
-	rdb    *redis.Client
-	writer *usage.Writer
+	conn    *sql.DB
+	rdb     *redis.Client
+	writer  *usage.Writer
+	metrics *metrics.Metrics
 	// tenantID and key are the tenant's ID and gateway key.
 	tenantID, key string
 	// hash is the tenant's hash for this month in the ledger.
@@ -159,6 +160,7 @@ func newBudgetGateway(t *testing.T, cfg *config.Config) *budgetGateway {
 	g := &budgetGateway{
 		conn:     conn,
 		rdb:      rdb,
+		metrics:  metrics.New(),
 		tenantID: tn.ID,
 		key:      key.Plaintext,
 		hash:     "budget:{" + tn.ID + "}:" + start.Format("2006-01"),
@@ -177,7 +179,7 @@ func newBudgetGateway(t *testing.T, cfg *config.Config) *budgetGateway {
 	// No request here sets a temperature, so the cache takes none, and an
 	// entry would last a minute anyway.
 	r, err := router(cfg, store, testAdminKey, recordUsage(g.writer, cfg.Providers, logger), ratelimit.New(rdb),
-		cache.New(rdb, time.Minute), budget.New(rdb, conn, g.writer.Pending), metrics.New(), nil, logger)
+		cache.New(rdb, time.Minute), budget.New(rdb, conn, g.writer.Pending), g.metrics, nil, nil, logger)
 	if err != nil {
 		t.Fatalf("router() returned error: %v", err)
 	}

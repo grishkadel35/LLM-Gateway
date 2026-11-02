@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -328,6 +329,44 @@ func TestFallback(t *testing.T) {
 	m.Fallback("ollama", "groq", "timeout")
 	if got := testutil.ToFloat64(m.fallbacks.WithLabelValues("ollama", "groq", "timeout")); got != 1 {
 		t.Errorf("gateway_fallbacks_total = %v, want 1", got)
+	}
+}
+
+// TestUsageWriter: the usage writer's two metrics, a gauge and a counter
+// without labels, are whatever the writer's functions say as each scrape
+// happens. The queue's depth can fall, and the dropped count only rises.
+func TestUsageWriter(t *testing.T) {
+	m := New()
+	var queued int
+	var dropped int64
+	m.UsageWriter(func() int { return queued }, func() int64 { return dropped })
+
+	for _, tc := range []struct {
+		queued  int
+		dropped int64
+	}{{0, 0}, {7, 3}, {2, 5}} {
+		queued, dropped = tc.queued, tc.dropped
+		got := scrape(t, m)
+		for _, want := range []string{
+			fmt.Sprintf("gateway_usage_writer_queue_depth %d", tc.queued),
+			fmt.Sprintf("gateway_usage_writer_dropped_total %d", tc.dropped),
+		} {
+			if !strings.Contains(got, "\n"+want+"\n") {
+				t.Errorf("with %d queued and %d dropped, the scrape lacks %q:\n%s", tc.queued, tc.dropped, want, got)
+			}
+		}
+	}
+
+	got := scrape(t, m)
+	for _, want := range []string{
+		"# TYPE gateway_usage_writer_queue_depth gauge\n",
+		"# TYPE gateway_usage_writer_dropped_total counter\n",
+		"# HELP gateway_usage_writer_queue_depth Usage rows waiting",
+		"# HELP gateway_usage_writer_dropped_total Usage rows the usage writer dropped",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the scrape lacks %q", want)
+		}
 	}
 }
 

@@ -198,6 +198,60 @@ func TestWriterNeverBlocks(t *testing.T) {
 	}
 }
 
+// TestWriterQueued: Queued is how many rows wait in the queue. A lock on the
+// table holds the insert up, so the batch the writer is inserting has left the
+// queue, the rows after it fill the queue, and one that finds it full is
+// dropped without changing it. Close drains it.
+func TestWriterQueued(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	// Two rows fill the batch, so the writer flushes at once. The queue holds
+	// three.
+	w := newWriter(conn, discard(), 3, 2, time.Hour)
+	w.start()
+	defer w.Close(context.Background())
+
+	lock, err := conn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	if _, err := lock.Exec(`LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	w.Write(testRow(tn, key, "req_1"))
+	w.Write(testRow(tn, key, "req_2"))
+	waitForBlockedInsert(t, conn)
+	if got := w.Queued(); got != 0 {
+		t.Errorf("with the first batch in its insert, Queued() = %d, want 0", got)
+	}
+
+	for i := 3; i <= 5; i++ {
+		w.Write(testRow(tn, key, "req_"+strconv.Itoa(i)))
+	}
+	if got := w.Queued(); got != 3 {
+		t.Errorf("with the queue full, Queued() = %d, want 3", got)
+	}
+
+	w.Write(testRow(tn, key, "req_6")) // the queue is full
+	if queued, dropped := w.Queued(), w.Dropped(); queued != 3 || dropped != 1 {
+		t.Errorf("after a row found the queue full, Queued() = %d and Dropped() = %d, want 3 and 1", queued, dropped)
+	}
+
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Queued(); got != 0 {
+		t.Errorf("after Close, Queued() = %d, want 0", got)
+	}
+	if n := countRows(t, conn); n != 5 {
+		t.Errorf("usage_logs has %d rows, want the 5 that were queued", n)
+	}
+}
+
 // TestWriterStoresEveryField reads a row back, NULLs included.
 func TestWriterStoresEveryField(t *testing.T) {
 	conn, tn, key := newWriterDB(t)

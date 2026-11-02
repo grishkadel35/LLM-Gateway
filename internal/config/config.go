@@ -35,8 +35,9 @@ const (
 	DefaultTimeoutSeconds = 600
 	// DefaultHost is deliberately loopback-only. The gateway holds real
 	// provider API keys; tenant keys guard them, but exposing the port beyond
-	// this machine (no TLS yet, and /metrics needs no key) is a decision the
-	// operator has to make explicitly.
+	// this machine (no TLS yet, and the metrics port, on this host too, has
+	// only the admin key to guard it) is a decision the operator has to make
+	// explicitly.
 	DefaultHost = "127.0.0.1"
 	// DefaultMaxRequestBytes caps a request body at 32 MiB, Anthropic's own
 	// request limit: room for base64 images and PDFs, while a runaway client

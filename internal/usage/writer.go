@@ -117,6 +117,12 @@ func (w *Writer) Write(r Row) {
 // Dropped reports how many rows Write has dropped.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 
+// Queued reports how many rows are waiting in the queue: queued by Write, and
+// not yet taken off it by the writer's goroutine. The queue holds DefaultQueue
+// rows, and Write drops a row that finds it full. A batch the goroutine has
+// taken and is inserting has left the queue, so it isn't counted.
+func (w *Writer) Queued() int { return len(w.rows) }
+
 // Pending returns the cost, in micro-dollars, of the tenant's rows that Write
 // has queued and no insert has finished with. A row counts from Write until its
 // insert commits, or until the writer gives it up (usage row lost). A row with
