@@ -11,15 +11,19 @@ response bodies, so new provider features work the day they ship. Adding a
 provider is a block of YAML, not code.
 
 > **⚠️ Keep it on loopback for now.** Every provider route requires a tenant
-> key and is held to the tenant's budget, but there is no TLS yet and
-> `/metrics` needs no key, so the gateway binds to `127.0.0.1` by default.
-> Binding wider is your call to make deliberately.
+> key and is held to the tenant's budget, but there is no TLS yet, and
+> `/metrics`, on a port of its own, has only the admin key to guard it.
+> Prometheus holds that key in a compose secret, and the same key creates
+> tenants and mints keys. So the gateway binds to `127.0.0.1` by default, and
+> `metrics_port` binds to the same `host`. Binding wider is your call to make
+> deliberately. Whether a Prometheus container can reach a gateway on loopback
+> depends on the container runtime; see [The dashboard](#the-dashboard).
 
 ## Project status
 
 **Last updated:** 2026-11-01
-**Stage:** Weeks 1 to 5 of 8 complete, checkpoints closed; Week 6
-(observability) is under way. Every provider
+**Stage:** Weeks 1 to 6 of 8 complete; Week 6's checkpoint passed and awaits
+its review. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -32,10 +36,34 @@ request is also held to its tenant's monthly budget: before the provider is
 called, the gateway reserves the most the request could cost, and a tenant whose
 budget can't cover that gets `402`. Of 50 requests sent at once against room for
 10, exactly 10 reach the provider, and a month lost with Redis is rebuilt from
-the usage rows.
+the usage rows. Each request on a provider route now also leaves one JSON line
+that names its tenant, provider and model and carries its tokens and cost.
+Prometheus metrics by tenant and model are served on a port of their own,
+behind the admin key, `GET /ready` checks Postgres and Redis, and `make obs-up`
+starts Prometheus and Grafana with a provisioned dashboard. In a 15-minute
+live run against Groq, Gemini and Ollama, every panel of the dashboard showed
+data, and the metrics agreed with the responses, the usage rows and the admin
+API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **Week 6 checkpoint.** `TestObservabilityCheckpoint` in
+  `cmd/gateway/observability_test.go`, through the real router against a real
+  Postgres and Redis, sends a fixed mix of requests for two tenants to a mock
+  provider whose answers are known. It then checks that the metrics, the usage
+  rows and the request lines it captured agree: every counter's samples,
+  tokens and cost against the rows' sums by tenant, provider and model, the
+  budget gauge against `Ledger.Spent`, each line's tokens and cost against its
+  row, and the counts of the overhead and TTFB observations.
+  It passed 90 of 90 runs under `-race` with `-cpu 1,2,4`. Of 43 mutations
+  that each remove one metric's recording, or a line that feeds one, it fails
+  for 41; `TestUsageWriter` and `TestBudgetRecordsTheSpend` fail for the other
+  two. In a 15-minute live run against Groq,
+  Gemini and Ollama, with Prometheus and Grafana from `make obs-up`, every
+  panel showed data, and the metrics' cost, 10,985 µ$, equalled the usage
+  rows'. The screenshot is in [The dashboard](#the-dashboard). See
+  [Week 6 deliverables](#week-6-deliverables--observability-) and
+  [Observability](#observability).
 - **Upstream TTFB and the gateway's own overhead.**
   `gateway_upstream_ttfb_seconds{provider}` times each attempt from its
   handoff to the provider's transport, after any wait for a concurrency slot,
@@ -90,8 +118,6 @@ the usage rows.
   - **The key** comes from a compose secret filled from `GATEWAY_ADMIN_KEY`,
     or from the mock's key when that is unset, in `obs-up` only. It is never
     in git or in a file in the repo.
-  - **No data yet:** the gateway doesn't serve its metrics port, so the scrape
-    target shows as down for now.
 - **Each request line says who sent the request, where it went and what it
   cost.** On a provider route, the line adds:
   - `tenant_id`, `provider` (the route), `model` as the client named it, and
@@ -106,7 +132,7 @@ the usage rows.
   and a `429` or `402` has no usage. Lines for the admin API, `/health` and
   unknown paths don't change.
 - **`/metrics` on a port of its own, behind the admin key.** `metrics_port`
-  (default 9091, on the gateway's `host`) serves `/metrics` and nothing else.
+  (default 9091, on the gateway's `host`) serves the metrics and nothing else.
   A scrape needs the admin key as a Bearer token: without it, or with a
   tenant's key, it gets `401 invalid_admin_key`, and so does every scrape
   when no admin key is set. Prometheus from `make obs-up` sends the key. The
@@ -322,7 +348,8 @@ the usage rows.
   `queue_timeout` runs out; a background check of `health_path` shows in
   `/health`; and an optional `fallback` retries a failed non-streaming request
   on another provider (Groq), off by default because it spends real money.
-  `GET /metrics` serves Prometheus metrics. A live check against Ollama 0.40.2
+  `GET /metrics` serves Prometheus metrics (since Week 6, on `metrics_port`
+  and behind the admin key). A live check against Ollama 0.40.2
   with `qwen3.5:9b` showed that it thinks by default, which is slow and counts
   as output tokens, and that a model that isn't loaded takes about 30 s to
   load. See [Running with Ollama](#running-with-ollama).
@@ -849,6 +876,152 @@ equal to `spent_micros`, and one 80% Warn. An earlier run that day, on another
 tenant, had one capped request time out as a `504`, which kept its 994 µ$
 reservation, as above.
 
+### Week 6 deliverables — observability ✅
+
+Goal: every request on a provider route leaves one JSON line that says who sent
+it, where it went and what it cost, and Prometheus metrics by tenant and model
+show the same facts, in a Grafana dashboard.
+
+- [x] One record per request — `middleware.Logging` creates it and the layers
+  inside fill in what only they know: the route, the tenant, the model the
+  client asked for, the cache's decision, a `429`, a budget refusal and the
+  ledger's spend, and the usage with its cost. The request line and the
+  route's metrics both read it, so they can't disagree
+- [x] The request line — on a provider route it adds `tenant_id`, `provider`,
+  `model` and `streamed`, and once an attempt has ended its tokens,
+  `cost_micros`, `cached` and `fallback_provider`, each only when known
+- [x] Metrics by tenant and model — requests, tokens and the new cost counter
+  carry `tenant` and `model`, which is the price table's name or `other`, so
+  clients can't add series. The cache's decisions, the gateway's own `429`s
+  and the budget's refusals are counters too
+- [x] Timing — `gateway_upstream_ttfb_seconds` for each attempt that got a
+  response, and `gateway_overhead_seconds` for the gateway's own work before a
+  provider sees a request
+- [x] Budget gauges — `gateway_budget_spent_micros` and
+  `gateway_budget_micros` for each tenant, from the spend the ledger reports to
+  each request, which `settle.lua` now returns
+- [x] The usage writer's queue depth and its dropped rows, read at each scrape
+- [x] `/metrics` on `metrics_port` (9091), behind the admin key; the main port
+  answers `404` for it
+- [x] `GET /ready` — Postgres and Redis, never a provider
+- [x] go-redis's own log lines as JSON, through `slog`
+- [x] Prometheus and Grafana in the compose stack — `make obs-up` and
+  `make obs-down`, with the admin key as a compose secret
+- [x] The dashboard — 13 panels and a row heading, provisioned from
+  `deployments/grafana/dashboard.json`
+- [x] The checkpoint test and the live run, below
+
+[Observability](#observability) has each of these in full.
+
+The Week 6 checkpoint is "a live Grafana dashboard, with a screenshot in the
+README." `TestObservabilityCheckpoint` in `cmd/gateway/observability_test.go`
+checks that what the dashboard draws is true. It runs the real router, built
+from the parts `main` uses: Postgres for the tenants and the usage rows, and
+Redis for the cache, the rate limiter and the budget ledger. The provider is a
+mock whose answers are known. The test sends a fixed mix of requests for two
+tenants, then reads the metrics, the usage rows and the request lines it
+captured, and checks that they agree:
+
+- every counter's samples
+- tokens and cost, against the usage rows' sums by tenant, provider and model
+- the budget gauge, against `Ledger.Spent`
+- each request line's tokens and cost, against its usage row
+- the counts of the overhead and TTFB observations
+
+It needs `DATABASE_URL` and `REDIS_URL`: without them it skips.
+
+The first tenant has the default limits. Its requests cover every type of
+token, a stream, a dated model, a cache miss, hit and failed lookup, a
+provider's own `429`, a fallback, and an unpriced model. The second is held to
+one token a minute and 1,000 µ$. It sends a fallback the budget refuses, a
+request to a free provider, and one the gateway's `429` refuses. A bad key
+completes the mix, along with one more hit after the usage writer has closed,
+whose row is dropped.
+
+It passed 90 of 90 runs of `go test -race -count=30 -cpu 1,2,4 -run
+'Observability' ./cmd/gateway/`, with no data race. 43 mutations each removed
+one metric's recording, or a line that feeds one, from the production code:
+
+- every counter's increment, and the duration, overhead and TTFB histograms'
+  observations
+- the budget gauges' sets, and the usage writer's queue depth and dropped count
+- a token type, and the `none` and `other` labels
+- the meter's usage and cost, and both transport wrappers
+- each of the cache's decisions, and the rate limit's and the budget's records
+- the request's model, route and tenant on the record
+- the 1-hour cache writes in the request line and in the usage row
+- the fallback's report
+
+Two metrics are outside the mix: `gateway_concurrency_wait_seconds`, since no
+route here has a concurrency limit, and `gateway_provider_up`, which only
+`run()`'s health checker sets. Their own tests cover them, `TestProviderUp`
+among them.
+
+The test fails for 41 of the 43 mutations. It can't see the other two, and
+other tests catch them:
+
+- The queue depth reads 0 by the time it looks, once the writer has closed.
+  `TestUsageWriter` catches it.
+- The spend recorded at admission is recorded again at settlement.
+  `TestBudgetRecordsTheSpend` catches it.
+
+The live run uses a binary built from a clean tree and started on
+`config.local.yaml`, so Groq, Gemini and, if it's running, Ollama answer.
+Prometheus and Grafana come from `make obs-up`. A script sends a mix for about
+15 minutes, at a rate inside the free tiers: cache hits, a tenant held to a low
+rate limit, and a tenant with a small budget. The run checks that every panel
+shows data and that the metrics' cost matches the usage rows, and the
+screenshot in [The dashboard](#the-dashboard) is taken headless from the
+anonymous dashboard.
+
+The run was on 2026-11-01, from 22:18 to 22:33 (UTC−5), on a binary built from
+the clean tree at 42a623e, with Ollama serving `qwen3.5:9b`. Prometheus and
+Grafana came from `make obs-up`, with a fresh admin key. A round of requests
+every 20 seconds for 15 minutes made 506 requests from three tenants:
+
+- A plain tenant sent Groq `openai/gpt-oss-20b`, plain and streamed; the same
+  `openai/gpt-oss-120b` request twice at temperature 0, a cache miss and then a
+  hit (45 of each); Gemini `gemini-3.5-flash-lite`, plain and, every third
+  round, streamed; and Ollama. Every third round also sent an unpriced model
+  (`400 unknown_model`) and a bad key (`401`).
+- A tenant held to 300 tokens a minute sent two requests a round. 61 of its 90
+  got the gateway's `429`.
+- A tenant with a 500 µ$ budget sent, each round, one small request and one it
+  could never afford. It got 71 `402`s, and its spend reached 494 µ$.
+
+The Ollama route ran with two settings `config.local.yaml` reads from the
+environment: `OLLAMA_FALLBACK_ENABLED=true` and `OLLAMA_TIMEOUT_SECONDS=5`.
+Every fourth round asked Ollama for a long answer. Each one timed out and fell
+back to Groq's `qwen/qwen3.8-27b`, so the Fallbacks panel has real data. 18
+requests fell back: the 11 long ones, and 7 short ones that the local model
+didn't answer within 5 seconds. `gemini-3.8-flash` didn't answer within 60 seconds that
+evening, so the run used `gemini-3.5-flash-lite`.
+
+Every panel showed data. Each of the dashboard's 23 queries returned series
+over the run's window, and the screenshot shows each panel drawn.
+
+The metrics agreed with the responses the script got, the usage rows and the
+admin API in all 53 comparisons, with no difference:
+
+- requests by tenant, route and status
+- the cache's decisions, the `429`s and the `402`s
+- tokens by tenant, provider and type, and cost by tenant, provider and model
+- the overhead and TTFB counts, and the fallbacks
+- both budget gauges, against `GET /admin/tenants/{id}/budget`, for the three
+  tenants
+
+The cost counter came to 10,985 µ$ ($0.011), the same as the usage rows. Each
+of the 344 request lines with a usage row repeated that row's tokens and cost,
+and every log line was JSON. The usage writer dropped nothing.
+
+The run led to no change to `dashboard.json`. Two things it showed about
+reading the dashboard:
+
+- A stat panel such as Provider up reads the last moment of the time range,
+  so it says "No data" for a range that ends after the gateway stopped.
+- A counter's series appears with its first event, so a rate doesn't count
+  that first event, such as the first fallback.
+
 ## Quick start
 
 Start Postgres and Redis and create the schema (see [Database](#database)):
@@ -962,7 +1135,7 @@ colima docker docker-compose` then `colima start` is enough):
 ```sh
 make db-up      # Postgres 18 on 127.0.0.1:5432 and Redis 8 on 127.0.0.1:6379, waits until healthy
 make migrate    # apply pending migrations
-make db-down    # stop both; Postgres data survives in the llm-gateway_pgdata volume
+make db-down    # stop everything, Prometheus and Grafana too; Postgres data survives in the llm-gateway_pgdata volume
 ```
 
 Migrations live in `internal/db/migrations` and are embedded into the binary,
@@ -1002,6 +1175,7 @@ Without them, `go test ./...` skips those tests and needs nothing running.
 
 ```yaml
 port: 8080          # port the gateway listens on
+metrics_port: 9091  # port that serves /metrics, behind the admin key
 host: 127.0.0.1     # bind address — loopback by default; see the note at the top
 
 cache:
@@ -1024,8 +1198,8 @@ providers:
       anthropic-version: "2023-06-01"
 ```
 
-`port`, `host`, `max_request_bytes` (default 32 MiB) and each provider's
-`timeout` are optional, and so are the provider settings `free`,
+`port`, `metrics_port`, `host`, `max_request_bytes` (default 32 MiB) and each
+provider's `timeout` are optional, and so are the provider settings `free`,
 `max_concurrency`, `queue_timeout`, `health_path` and `fallback`, described in
 [Running with Ollama](#running-with-ollama). `url`, `auth` and `format` are
 required per provider, and so is `key` unless `auth` is `none`.
@@ -1075,6 +1249,12 @@ non-streaming request with temperature 0 or the header `X-Gateway-Cache: on`;
 `X-Gateway-Cache: off` opts a request out. A typo under `cache:`, or a `ttl`
 below 1, is a startup error. [The cache contract](#the-cache-contract) has the
 details.
+
+`metrics_port` is where `/metrics` is served: a listener of its own, on `host`
+like `port`, that serves the metrics and nothing else, behind the admin key.
+The default is 9091. A value outside 1–65535 or equal to `port` is a startup
+error, and so is a port that another process holds, with its address in the
+message. [Metrics](#metrics) has the details.
 
 Budgets are not configuration. A tenant's monthly budget is its `budget_micros`
 in Postgres ($50.00 by default), changed with `PATCH /admin/tenants/{id}`; the
@@ -1208,9 +1388,12 @@ instead of Groq's answer, and a mapped model with no price gets
 **Docker.** The gateway has no compose service yet (Week 7). Once it runs in a
 container, set `OLLAMA_BASE_URL=http://host.docker.internal:11434` and add
 `extra_hosts: ["host.docker.internal:host-gateway"]` to its service. Under
-Colima (see [Database](#database)), containers can't reach services bound to
-the Mac's `127.0.0.1`, so Ollama has to listen beyond loopback (its own
-`OLLAMA_HOST` setting). Binding `0.0.0.0` exposes Ollama's unauthenticated API
+Colima, a container reached a service bound to the Mac's `127.0.0.1` when
+tested (see [The dashboard](#the-dashboard)), so Ollama may not need to listen
+beyond loopback. An earlier test with Ollama found that a container couldn't
+reach it; the cause is unknown, and Ollama's own host checks are one
+possibility. Check Ollama's case in Week 7 before setting `OLLAMA_HOST`
+(Ollama's own setting) to `0.0.0.0`. That exposes Ollama's unauthenticated API
 to the network: bind it to the Colima bridge address or firewall it.
 
 ## Endpoints
@@ -1218,7 +1401,8 @@ to the network: bind it to the Colima bridge address or firewall it.
 | Path                              | Behavior                                                                                  |
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
-| `GET /metrics`                    | Prometheus text format. Handled locally, no key needed. See [Metrics](#metrics).          |
+| `GET /ready`                      | `200` with `{"status":"ready","checks":{"postgres":"ok","redis":"ok"}}` while Postgres and Redis both answer within a second; otherwise `503` with `"status":"not_ready"` and the failing check `down`. Handled locally, no key needed, and never calls a provider. See [GET /ready](#get-ready). |
+| `GET /metrics`                    | Not on this port: it gets the `404` of the last row. It is served on `metrics_port` (9091 by default), where it needs the admin key. See [Metrics](#metrics). |
 | `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)) and, on a paid provider, with room in its monthly budget for what the request could cost (`402` otherwise, see [The budget contract](#the-budget-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit, the budget or the provider (see [The cache contract](#the-cache-contract)). |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
@@ -1236,9 +1420,9 @@ Metered endpoints, the only ones forwarded:
 | `anthropic` | `POST /v1/messages`                                                                |
 | `gemini`    | `POST /v1/models/{model}:generateContent`, `:streamGenerateContent` (also `/v1beta/`) |
 
-Every response carries an `X-Request-ID`. Key plaintext appears only in the
-`201` that issues it, with `Cache-Control: no-store`. Any `/admin/` request
-without the admin key gets `401`, whatever the path or method.
+Every response on this port carries an `X-Request-ID`. Key plaintext appears
+only in the `201` that issues it, with `Cache-Control: no-store`. Any `/admin/`
+request without the admin key gets `401`, whatever the path or method.
 
 There is deliberately **no default provider**. A request must name one, so a
 typo in a base URL can never silently send traffic — and spend — somewhere
@@ -1598,31 +1782,34 @@ refuses any other.
 
 ## Make targets
 
-| Command         | What it does                           |
-| --------------- | -------------------------------------- |
-| `make build`    | Compile to `./bin/gateway`             |
-| `make run`      | Build, then run                        |
-| `make mock`     | Run the mock provider on :9090         |
-| `make run-mock` | Run the gateway against the mock       |
-| `make db-up`    | Start local Postgres and Redis         |
-| `make db-down`  | Stop local Postgres and Redis          |
-| `make migrate`  | Apply pending database migrations      |
-| `make test`     | Run all tests (needs `make db-up`)     |
-| `make vet`      | Run `go vet` (catches suspicious code) |
-| `make fmt`      | Format all source files                |
-| `make tidy`     | Sync `go.mod` / `go.sum`               |
-| `make clean`    | Remove `./bin`                         |
-| `make all`      | fmt, vet, test, build                  |
+| Command         | What it does                                                      |
+| --------------- | ----------------------------------------------------------------- |
+| `make build`    | Compile to `./bin/gateway`                                        |
+| `make run`      | Build, then run                                                   |
+| `make mock`     | Run the mock provider on :9090                                    |
+| `make run-mock` | Run the gateway against the mock                                  |
+| `make db-up`    | Start local Postgres and Redis                                    |
+| `make db-down`  | Stop the whole stack: Postgres, Redis, Prometheus, Grafana        |
+| `make obs-up`   | Start Prometheus and Grafana; see [The dashboard](#the-dashboard) |
+| `make obs-down` | Stop Prometheus and Grafana; Postgres and Redis keep running      |
+| `make migrate`  | Apply pending database migrations                                 |
+| `make test`     | Run all tests (needs `make db-up`)                                |
+| `make vet`      | Run `go vet` (catches suspicious code)                            |
+| `make fmt`      | Format all source files                                           |
+| `make tidy`     | Sync `go.mod` / `go.sum`                                          |
+| `make clean`    | Remove `./bin`                                                    |
+| `make all`      | fmt, vet, test, build                                             |
 
 ## Layout
 
 ```
 cmd/gateway/main.go       entry point: loads config, builds routes, serves
+cmd/gateway/redislog.go   go-redis's own log lines, routed through slog
 internal/config/          YAML config loading and validation
 internal/provider/        per-provider auth styles and header handling
 internal/proxy/           the httputil.ReverseProxy, its hooks and the fallback
-internal/middleware/      request IDs, request logging, tenant key auth, response cache, rate limiting, budgets
-internal/health/          GET /health
+internal/middleware/      request IDs, request logging and the per-request record, tenant key auth, response cache, rate limiting, budgets
+internal/health/          GET /health and GET /ready
 internal/concurrency/     per-provider request limit and its queue
 internal/metrics/         Prometheus metrics
 internal/mockprovider/    fake OpenAI/Groq/Anthropic/Gemini APIs for testing
@@ -1639,7 +1826,8 @@ internal/redistest/       Redis client for tests
 internal/admin/           admin API: create tenants, change their limits, issue and revoke keys, report usage and budgets
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
-deployments/              docker compose dev stack (Postgres, Redis)
+deployments/              docker compose dev stack (Postgres, Redis, Prometheus, Grafana), and prometheus.yml
+deployments/grafana/      the dashboard and its screenshot, and what provisions them
 .github/workflows/ci.yml  vet + race-enabled tests against Postgres and Redis
 ```
 
@@ -1683,45 +1871,305 @@ A miss learns how its response ended from the same usage callback
 (`middleware.ReportUsage`), and is stored once the request is over. The budget
 check sits inside the cache too, so a hit is never reserved or charged.
 
-Week 6, observability, hooks in at the same points. `internal/metrics` is
-already wired in `router()` in `main.go`: `Requests` wraps each provider route,
-and the usage callback feeds `Tokens`. That callback also prices each usage row
-(`recordUsage`), so it is where a cost counter goes. The refusals to count are
-each answered in one place, and each already logs one line: the rate limit's
-`429` in `middleware.RateLimit` and the budget's `402` in `middleware.Budget`.
-The cache's `hit`, `miss` and `bypass` are decided in `middleware.Cache`, the
-provider's time to first byte is known in `modifyResponse`, and the usage writer
-already counts the rows it drops (`Writer.Dropped`). A tenant's budget
-utilization is what `Ledger.Spent` reads for `GET /admin/tenants/{id}/budget`.
+Observability hooks in at the same points. Each request has a `Record`
+([internal/middleware/record.go](internal/middleware/record.go)): `Logging`
+creates it and puts a pointer to it on the context, and the layers inside fill
+in what only they know. `Route` records the route, `Auth` the tenant, and
+`RecordRequest`, just inside `ReadBody`, the model and stream flag the client
+asked for. `Cache` records its decision, `RateLimit` its own `429`, and
+`Budget` a refusal and its reason, and the ledger's spend with the tenant's
+budget. The meter in `router()` in `main.go` records the usage last reported,
+priced as its usage row is (`usageCost`). `Logging` reads the `Record` for the
+request line, and `metrics.Requests`, which wraps each provider route, reads
+the same one when the route ends, so the line and the metrics can't disagree.
+A new fact is a new field on the `Record`, set by the layer that learns it and
+read in those two places. Everything that touches it runs on the goroutine
+serving the request, so it needs no lock.
+
+The two timings wrap each provider's transport instead, where the response
+headers arrive: `m.UpstreamTTFB` innermost, inside any concurrency limit, and
+`m.Overhead` outermost, before it. The usage writer's two metrics are read at
+each scrape (`m.UsageWriter`), so the writer knows nothing of metrics.
+
+In Week 7, when the gateway runs in the compose stack, Prometheus is to scrape
+`gateway:9091` over the compose network with the same secret, and the metrics
+port needn't be published.
 
 ## Observability
 
-Each request produces one JSON line on stdout:
+The gateway reports on itself three ways: one JSON line for each request,
+Prometheus metrics on a port of their own, and a Grafana dashboard that draws
+the metrics. [`GET /ready`](#get-ready) says whether it can serve at all.
+
+### The request line
+
+Every request produces one JSON line on stdout. This one is a non-streaming
+request to Groq, from the Week 6 live run:
 
 ```json
-{"time":"2026-09-20T18:20:00Z","level":"INFO","msg":"request","request_id":"req_2d10cec6dc4299d10f08dbf141ebffb9","method":"POST","path":"/openai/v1/chat/completions","status":200,"duration_ms":842.11,"bytes":1204,"remote_addr":"127.0.0.1:52233"}
+{"time":"2026-11-01T22:21:27.958418-05:00","level":"INFO","msg":"request","request_id":"req_a3496c2963c0d0ebcbba12fbe60f2514","method":"POST","path":"/groq/v1/chat/completions","status":200,"duration_ms":224.206,"bytes":883,"remote_addr":"127.0.0.1:63195","tenant_id":"tn_3494fc7bb5f6aae1","provider":"groq","model":"openai/gpt-oss-20b","input_tokens":94,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":64,"cost_micros":26,"cached":false,"streamed":false}
 ```
 
 `request_id` is the `X-Request-ID` returned to the client. When the client
 sent its own `X-Request-ID`, it is logged as `client_request_id`.
 
-Plus one line per upstream response, recording which provider answered, the
-status, content length, and whether the response was streamed.
+On a provider route (`/<provider>/...`) the line adds these fields, each only
+once it is known:
+
+- `tenant_id`: the tenant whose key the request carried. A `401` has none.
+- `provider`: the route the client called, even when another provider
+  answered.
+- `model`: the model as the client named it, unchanged. The metrics' `model`
+  label is the price table's name for it.
+- `streamed`: whether the response was streamed. A request refused after its
+  body was read has it too, as whether the client asked for a stream.
+- Once an attempt has ended, its usage: `input_tokens`, `cached_input_tokens`,
+  `cache_write_tokens` (the 5-minute and 1-hour writes together, as the usage
+  row stores them), `output_tokens`, `cost_micros` and `cached`. These repeat
+  the request's last usage row, which `request_id` joins. `cost_micros` is 0
+  for a cache hit and for a free provider, and `null` when the cost isn't
+  known, such as for a response cut short.
+- `fallback_provider`, when a provider other than the route answered.
+
+The usage fields appear for any attempt that ended: a provider's answer, a
+cache hit, or the proxy's `502`, `504` or `499` for an attempt that got no
+answer. A request the gateway refused itself has none: a `401` line names only
+the route, and a `429` or `402` line has the tenant, provider, model and
+`streamed`, but no usage. In two rare fallback cases the line keeps the failed
+first attempt's usage, which has no tokens: the client leaves during the
+fallback's budget check (`499`), or the fallback finds no concurrency slot
+(`503 provider_busy`). Lines for the admin API, `/health`, `/ready` and unknown
+paths have none of these fields.
+
+The proxy also logs a line, `upstream response`, for each response a provider
+sends: the `provider` that answered, the `status`, the `content_length` (`-1`
+when chunked), the `content_type` and whether it is `streaming`. go-redis's own
+messages, such as `failed to dial` while Redis is down, are JSON lines too, at
+Warn with `"component":"go-redis"`.
 
 ### Metrics
 
-`GET /metrics` serves Prometheus text format and needs no key. The gateway binds
-to loopback by default, so only this machine can read it; Week 6 decides between
-admin auth and a separate port. No metric has a tenant or model label.
+The gateway serves Prometheus text format at `GET /metrics` on `metrics_port`
+(9091 by default), a listener of its own that serves the metrics and nothing
+else: it doesn't look at the path, so with the key every path answers with
+them. It listens on `host`, like the main port, which no longer serves
+`/metrics` and answers `404` there.
 
-| Metric                                       | Meaning                                                                                 |
-| -------------------------------------------- | --------------------------------------------------------------------------------------- |
-| `gateway_requests_total{provider,status}`    | Requests per route and HTTP status, `401`–`403`, `413`, `429` and `503` included.       |
-| `gateway_request_duration_seconds{provider}` | Histogram of the whole response, streaming included.                                    |
-| `gateway_tokens_total{provider,type}`        | Tokens by `type`: `input`, `cached_input`, `cache_write`, `cache_write_1h` or `output`. |
-| `gateway_concurrency_wait_seconds{provider}` | Histogram of time spent waiting for a slot.                                             |
-| `gateway_provider_up{provider}`              | `1` or `0`, from the health check.                                                      |
-| `gateway_fallbacks_total{from,to,reason}`    | Fallbacks taken; `reason` is `unreachable`, `timeout` or `server_error`.                |
+A scrape needs the admin key as a Bearer token:
 
-Tokens are labelled with the provider that produced them, so a fallback's tokens
-count under `groq` while its request counts under `ollama`.
+```sh
+curl -H "Authorization: Bearer $GATEWAY_ADMIN_KEY" http://127.0.0.1:9091/metrics
+```
+
+Without the key, or with a tenant's key, it gets `401 invalid_admin_key`, as
+any `/admin/` request does. The listener writes no request lines, since
+Prometheus scrapes every few seconds. The admin key also creates tenants and
+mints keys, so whatever holds it to scrape holds that power too: Prometheus
+from `make obs-up` does (see [The dashboard](#the-dashboard)).
+
+| Metric                                                    | Type      | What it counts                                                                                                                              |
+| --------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gateway_requests_total{tenant,provider,model,status}`    | counter   | Requests on a provider route, when they end, by the status the client got. `401`–`403`, `413`, `429` and `503` are included.                |
+| `gateway_request_duration_seconds{provider}`              | histogram | The same requests' whole time, a streamed body included.                                                                                    |
+| `gateway_overhead_seconds{provider}`                      | histogram | The gateway's own time before a provider sees a request, once per request handed to a provider's transport. See [Timing](#timing).          |
+| `gateway_upstream_ttfb_seconds{provider}`                 | histogram | Each attempt that got a response: from its handoff to the transport until the response headers. See [Timing](#timing).                      |
+| `gateway_tokens_total{tenant,provider,model,type}`        | counter   | Tokens the providers reported, by `type`: `input`, `cached_input`, `cache_write`, `cache_write_1h` or `output`. A type of 0 adds no series. |
+| `gateway_cost_micros_total{tenant,provider,model}`        | counter   | What responses cost in micro-dollars, as their usage rows have it. A cache hit, a free provider and a cost that isn't known add nothing.    |
+| `gateway_cache_requests_total{tenant,provider,result}`    | counter   | The cache's decision: `hit`, `miss`, `bypass`, or `error` for a lookup that failed (the response header says `miss`).                       |
+| `gateway_ratelimit_rejections_total{tenant,provider}`     | counter   | The gateway's own `429 rate_limited`; a provider's `429` isn't counted.                                                                     |
+| `gateway_budget_rejections_total{tenant,provider,reason}` | counter   | Budget refusals: `reason` is `exceeded` (`402`), `unknown_model` (`400`) or `unavailable` (`503`).                                          |
+| `gateway_budget_spent_micros{tenant}`                     | gauge     | The tenant's spend for the month, reservations in flight included. See [Budget gauges](#budget-gauges).                                     |
+| `gateway_budget_micros{tenant}`                           | gauge     | The tenant's monthly budget. See [Budget gauges](#budget-gauges).                                                                           |
+| `gateway_usage_writer_queue_depth`                        | gauge     | Usage rows waiting in the writer's queue, read at each scrape. The queue holds 10,000; a row that finds it full is dropped.                 |
+| `gateway_usage_writer_dropped_total`                      | counter   | Usage rows the writer dropped, read at each scrape.                                                                                         |
+| `gateway_concurrency_wait_seconds{provider}`              | histogram | Time spent waiting for a concurrency slot.                                                                                                  |
+| `gateway_provider_up{provider}`                           | gauge     | `1` or `0`, from the health check.                                                                                                          |
+| `gateway_fallbacks_total{from,to,reason}`                 | counter   | Fallbacks taken; `reason` is `unreachable`, `timeout` or `server_error`.                                                                    |
+
+The histograms' buckets run from 1 ms to 600 s for the request duration, from
+0.1 ms to 2.5 s for the overhead, from 25 ms to 600 s for the upstream TTFB,
+and from 1 ms to 60 s for the concurrency wait. Tokens are labelled with the
+provider that produced them, so a fallback's tokens count under `groq` while
+its request counts under `ollama`.
+
+### Metric labels
+
+- **`provider`** is a provider's name in `config.yaml`.
+  - On requests, duration, overhead, and the cache's and the rate limit's
+    counters, it is the route the client called, even when a fallback answered.
+  - On TTFB, tokens, cost and budget refusals, it is the attempt's provider,
+    which after a fallback is the fallback's.
+- **`tenant`** is the tenant's ID. It is `none` for a request refused before a
+  tenant was known: a `401`, or `503 auth_unavailable`.
+- **`model`** is the price table's name for the model, or `other`.
+  - On requests, it is the model the client asked its route for, looked up in
+    that provider's table as given and with any date suffix stripped. So
+    `gpt-4o-2024-08-06` is `gpt-4o`, and a snapshot with a price of its own
+    keeps its name.
+  - On tokens and cost, it is looked up as the price is: the model the response
+    names, then the one requested.
+  - A free provider's models, every Ollama model included, aren't in the
+    table, so they are `other`. So is a request that names no model.
+- **`status`** is the status the client received. A `1xx` sent ahead of it
+  doesn't count.
+
+`tenant` and `model` are on counters, and `tenant` on the budget gauges. The
+histograms keep `provider` alone, since each label value there multiplies about
+15 buckets. A client can't add series: tenants come from the admin API, so
+their number is the operator's, and a model name becomes a label value only if
+the price table has it. A counter's series exists once a request has produced
+it, so `gateway_requests_total` holds one for each combination of tenant,
+provider, model and status that has occurred, and the series grow with the
+number of tenants and the models and providers they use.
+
+### Timing
+
+`gateway_overhead_seconds` is the gateway's own work before a provider sees a
+request: auth, the body read, the cache lookup, and the rate-limit and budget
+checks. It runs from the request's arrival to the moment its first attempt is
+handed to the provider's transport, before any wait for a concurrency slot.
+That wait is `gateway_concurrency_wait_seconds`, and a failed first attempt is
+a fallback's cost, so neither is overhead. It is observed once per request,
+under the route; a cache hit, or a request refused before the handoff, has
+none. The response path is not in it. That path only copies bytes through, and
+the settlements hold the last bytes for at most a Redis call each; Week 8 is to
+measure both against the mock.
+
+`gateway_upstream_ttfb_seconds` times each attempt that got a response, of any
+status: from its handoff to the transport, after any concurrency slot, to the
+response headers. For a stream that is the time to the stream's start. For a
+non-streaming request it is about the whole generation, since providers send
+headers when they're done. An attempt that got no response (a failed dial, a
+timeout, a client that left) isn't observed, and after a fallback each attempt
+counts under its own provider.
+
+### Budget gauges
+
+`gateway_budget_spent_micros{tenant}` and `gateway_budget_micros{tenant}` are
+set when a request to a paid provider ends, to the month's spend (settled costs
+plus the reservations in flight) and the tenant's budget, as the ledger
+reported them to that request: after its reservation, admitted or refused, and
+after its settlement. The dashboard divides one by the other.
+`GET /admin/tenants/{id}/budget` stays the exact figure. The gauges have these
+limits:
+
+- A tenant shows up once one of its requests to a paid provider has reached
+  the ledger after the gateway starts. A free provider's request and a cache
+  hit never reach it.
+- A tenant idle since the month began keeps showing last month's figure until
+  its next request.
+- A settlement that finds the month missing, because Redis lost it, reports no
+  spend. The gauge then keeps the figure its reservation reported, which
+  includes that reservation, until the tenant's next request.
+- The gauges show whichever of a tenant's requests ended last, not the newest
+  figure in the ledger. So a request that began before a budget `PATCH` and
+  ends after the next request sets `gateway_budget_micros` back to the old
+  budget until the tenant's next request ends. Concurrent requests behave the
+  same way.
+
+### GET /ready
+
+`GET /ready` on the main port says whether the gateway can serve. It pings
+Postgres and Redis at the same time, and gives them a second together. It needs
+no key, like `/health`. When both answer, it is `200`:
+
+```json
+{"status":"ready","checks":{"postgres":"ok","redis":"ok"}}
+```
+
+When one doesn't answer in time or fails, it is `503`, and names that check:
+
+```json
+{"status":"not_ready","checks":{"postgres":"ok","redis":"down"}}
+```
+
+The body never carries an error's text, since the endpoint needs no key: each
+failure is logged at Warn, as `readiness check failed`, with the check's name
+and the error. It never calls a provider, so a provider outage can't make it
+fail. `/health` stays a liveness check that always answers `200`. A method other
+than `GET` gets `405` with `Allow: GET`.
+
+### The dashboard
+
+`make obs-up` starts Prometheus and Grafana from the compose stack, with
+Grafana's datasource and dashboard provisioned, and waits until both are
+healthy. Run it in the shell the gateway runs in, so that both hold the same
+admin key:
+
+```sh
+export GATEWAY_ADMIN_KEY=...   # the key the gateway runs with
+make obs-up
+```
+
+- **Grafana** is on `127.0.0.1:3000`. Anyone who can reach the port may view it
+  without a login, so the "LLM Gateway" dashboard opens at
+  `http://127.0.0.1:3000/d/llm-gateway`. Its datasource and the dashboard are
+  provisioned from `deployments/grafana/`, so the UI can't save over them. Its
+  admin password comes from `GRAFANA_ADMIN_PASSWORD`, `admin` by default.
+- **Prometheus** is on `127.0.0.1:9092`, because the mock provider holds 9090.
+  It scrapes `host.docker.internal:9091` every 5 seconds, sending the admin key
+  as a Bearer token from a compose secret that is filled from
+  `GATEWAY_ADMIN_KEY`. The key is never in git or in a file in the repo.
+- **The key.** `make obs-up` passes your `GATEWAY_ADMIN_KEY` through. When it is
+  unset, it passes the mock's key, the one `make run-mock` uses, in that
+  recipe only, so `make run` never gets a default key. With another key than
+  the gateway's, the scrape gets a `401` and the target shows as down. Running
+  `make obs-up` again with a different key makes Prometheus use it.
+- `make obs-down` stops both; Postgres and Redis keep running.
+
+The dashboard (`deployments/grafana/dashboard.json`) refreshes every 10 seconds
+and shows the last 30 minutes. Its panels are:
+
+- requests per second, by provider
+- error rate by provider: 5xx, and the gateway's own refusals, apart
+- latency p50, p95 and p99, by provider
+- gateway overhead against upstream TTFB, p50, p95 and p99 of each
+- cache hit rate: `hit` over `hit` plus `miss`, with bypasses and failed
+  lookups left out
+- token throughput, by type and by model
+- budget utilization per tenant: spent over budget, with a tenant whose budget
+  is 0 left out
+- spend per hour by tenant
+- a row of gateway health: refusals by kind, the usage writer's queue and
+  drops, provider up, and fallbacks
+
+![The LLM Gateway dashboard](deployments/grafana/dashboard.png)
+
+*The Week 6 live run (see [Week 6 deliverables](#week-6-deliverables--observability-)),
+from 40 seconds in until 15 seconds after it ended: 2026-11-01, 22:19 to 22:33
+(UTC−5). Headless Chrome took it from the anonymous dashboard. The late
+start keeps the one-minute rates from reaching back before the run.*
+
+**Reaching a gateway on loopback.** Prometheus runs in a container and scrapes
+`host.docker.internal`. The compose file maps that name to `host-gateway` for
+it, which Colima doesn't need and Linux Docker does. Whether the container then
+reaches a gateway bound to `127.0.0.1` depends on the runtime:
+
+- **Colima:** it does. On 2026-10-31, on Colima's default profile (the macOS
+  Virtualization.Framework VM, with no vmnet address), a container fetched from
+  one listener on the Mac's `127.0.0.1` and from another on `0.0.0.0`, through
+  `host.docker.internal` (192.168.5.2), with and without `host-gateway`. So the
+  default `host: 127.0.0.1` works here. Other Colima setups weren't tested.
+- **Linux Docker:** it doesn't. `host-gateway` resolves to the bridge IP, so a
+  gateway bound to `127.0.0.1` isn't reachable from the Prometheus container.
+  The gateway would have to listen on an address the bridge can reach, which
+  means a `host` beyond loopback for both ports, since `metrics_port` listens
+  on `host` too. Read the warning at the top first.
+- In Week 7, when the gateway runs in the compose stack, Prometheus is to
+  scrape `gateway:9091` over the compose network.
+
+Some things to know about the stack:
+
+- The first scrape comes about 10 seconds after `make obs-up` returns.
+- Grafana doesn't re-read `dashboard.json` while it runs. Edit the file, then
+  run `make obs-up`, which recreates both containers in about 10 seconds.
+  Prometheus keeps its data: its anonymous volume is reattached.
+- Plain `docker compose up` with `GATEWAY_ADMIN_KEY` unset fails, since
+  Prometheus's secret needs it. `make db-up`, `docker compose config`, `ps` and
+  `stop` don't.
+- `docker compose down`, which `make db-down` runs, leaves Prometheus's
+  anonymous `/prometheus` volume behind, one for each `down`.
+- Grafana preinstalls plugins at every start, which needs the network. One
+  download failed once with a `level=error` line. Setting
+  `GF_PLUGINS_PREINSTALL_DISABLED=true` would stop it; the compose file doesn't
+  set it.
