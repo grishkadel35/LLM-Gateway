@@ -1951,9 +1951,9 @@ Warn with `"component":"go-redis"`.
 
 The gateway serves Prometheus text format at `GET /metrics` on `metrics_port`
 (9091 by default), a listener of its own that serves the metrics and nothing
-else: it doesn't look at the path, so with the key every path answers with
-them. It listens on `host`, like the main port, which no longer serves
-`/metrics` and answers `404` there.
+else: with the key, any other path gets `404 not_found`. It listens on
+`host`, like the main port, which no longer serves `/metrics` and answers
+`404` there.
 
 A scrape needs the admin key as a Bearer token:
 
@@ -1961,8 +1961,8 @@ A scrape needs the admin key as a Bearer token:
 curl -H "Authorization: Bearer $GATEWAY_ADMIN_KEY" http://127.0.0.1:9091/metrics
 ```
 
-Without the key, or with a tenant's key, it gets `401 invalid_admin_key`, as
-any `/admin/` request does. The listener writes no request lines, since
+Without the key, or with a tenant's key, any path gets `401 invalid_admin_key`,
+as any `/admin/` request does. The listener writes no request lines, since
 Prometheus scrapes every few seconds. The admin key also creates tenants and
 mints keys, so whatever holds it to scrape holds that power too: Prometheus
 from `make obs-up` does (see [The dashboard](#the-dashboard)).

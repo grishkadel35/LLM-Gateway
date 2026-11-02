@@ -90,6 +90,49 @@ func TestMetricsPortNeedsTheAdminKey(t *testing.T) {
 	}
 }
 
+// TestMetricsPortServesOnlyMetrics: with the admin key, the metrics port gives
+// the metrics at /metrics alone, and any other path a JSON 404 without them.
+// The key is checked before the path, as under /admin/, so without it every
+// path gets 401.
+func TestMetricsPortServesOnlyMetrics(t *testing.T) {
+	m := metrics.New()
+	m.ProviderUp("ollama", true)
+	h := metricsHandler(m, testAdminKey)
+	admin := "Bearer " + testAdminKey
+
+	cases := []struct {
+		name, path, authorization string
+		status                    int
+		errorType                 string
+	}{
+		{"metrics", "/metrics", admin, http.StatusOK, ""},
+		{"metrics with a query", "/metrics?debug=1", admin, http.StatusOK, ""},
+		{"the root", "/", admin, http.StatusNotFound, "not_found"},
+		{"a trailing slash", "/metrics/", admin, http.StatusNotFound, "not_found"},
+		{"an admin path", "/admin/tenants", admin, http.StatusNotFound, "not_found"},
+		{"another path without the key", "/", "", http.StatusUnauthorized, "invalid_admin_key"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			if tc.authorization != "" {
+				req.Header.Set("Authorization", tc.authorization)
+			}
+			rec := serve(h, req)
+			if rec.Code != tc.status {
+				t.Fatalf("GET %s: status = %d, want %d; body %s", tc.path, rec.Code, tc.status, rec.Body)
+			}
+			hasMetrics := strings.Contains(rec.Body.String(), `gateway_provider_up{provider="ollama"} 1`+"\n")
+			if hasMetrics != (tc.status == http.StatusOK) {
+				t.Errorf("GET %s: metrics shown: %v; body %s", tc.path, hasMetrics, rec.Body)
+			}
+			if got := errorType(rec); got != tc.errorType {
+				t.Errorf("GET %s: error %q, want %q", tc.path, got, tc.errorType)
+			}
+		})
+	}
+}
+
 // TestReadyThroughTheRouter: GET /ready is the readiness handler given to
 // router: 200 while every check passes, 503 naming the check that fails. With
 // no handler, the catch-all answers.

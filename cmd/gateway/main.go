@@ -249,14 +249,22 @@ func unknownProvider(names []string) http.Handler {
 	})
 }
 
-// metricsHandler returns the handler of the metrics port: m's metrics and
-// nothing else, behind the admin key. A request without it as a Bearer token,
-// or with a tenant's key, gets the admin API's 401.
+// metricsHandler returns the handler of the metrics port: m's metrics at
+// /metrics and nothing else, behind the admin key. A request without it as a
+// Bearer token, or with a tenant's key, gets the admin API's 401 whatever its
+// path, as under /admin/; with it, any other path gets a JSON 404.
 //
 // It has no request ID and no request line: Prometheus scrapes it every few
 // seconds, and a line for each scrape would bury the log.
 func metricsHandler(m *metrics.Metrics, adminKey string) http.Handler {
-	return middleware.AdminAuth(adminKey)(m.Handler())
+	serveMetrics := m.Handler()
+	return middleware.AdminAuth(adminKey)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/metrics" {
+			apierror.Write(w, http.StatusNotFound, "not_found", "this port serves only /metrics", nil)
+			return
+		}
+		serveMetrics.ServeHTTP(w, r)
+	}))
 }
 
 // run wires everything together and blocks until the process is asked to stop.
