@@ -12,6 +12,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/budget"
 	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
+	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
 )
 
@@ -23,10 +24,12 @@ type Ledger interface {
 	// budget. A refusal reserves nothing.
 	Reserve(ctx context.Context, tenantID string, budget, amount int64, at time.Time) (budget.Reservation, error)
 	// Settle swaps r's reservation for charge, what its request really
-	// cost, once the request is over. r must be admitted, and the request's
-	// usage row already queued: a ledger that finds the month missing counts
-	// the request from that row when it rebuilds.
-	Settle(ctx context.Context, r budget.Reservation, charge int64) error
+	// cost, once the request is over, and returns the month's spend after
+	// it, with known true. r must be admitted, and the request's usage row
+	// already queued: a ledger that finds the month missing counts the
+	// request from that row when it rebuilds, and knows no spend until then,
+	// so it returns known false.
+	Settle(ctx context.Context, r budget.Reservation, charge int64) (spent int64, known bool, err error)
 }
 
 // reservation is what Budget reserved for one attempt. It rides on the
@@ -83,7 +86,10 @@ func reservationFrom(ctx context.Context) *reservation {
 // spend in place of the charge.
 //
 // Each refusal, the 400, the 402 and the 503, is recorded on the request's
-// Record with its reason and provider. The 499 isn't a refusal.
+// Record with its reason and provider. The 499 isn't a refusal. The Record
+// also gets the month's spend each time the ledger reports it, with the
+// tenant's budget: after the reservation, admitted or refused, and after the
+// settlement.
 //
 // It needs the tenant from Auth and the Request from ReadBody, so it runs
 // after both. It goes inside any fallback, around each provider's own proxy,
@@ -155,10 +161,12 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 					"spent_micros", res.Spent,
 					"budget_micros", t.BudgetMicros,
 				)
+				recordSpend(ctx, res.Spent, t.BudgetMicros)
 				recordRefusal(ctx, provider, "exceeded")
 				budgetExceeded(w, t.BudgetMicros, res.Spent, amount, req.Received)
 				return
 			}
+			recordSpend(ctx, res.Spent, t.BudgetMicros)
 
 			// The ledger reports it once a month for each tenant, and again
 			// only after it rebuilds the month.
@@ -177,7 +185,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 			// RateLimit's settle, it holds the response's last bytes for one
 			// Redis call.
 			held := &reservation{Reservation: res}
-			defer settleReservation(ctx, ledger, logger, provider, t.ID, req, held)
+			defer settleReservation(ctx, ledger, logger, provider, t, req, held)
 			next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, reservationKey{}, held)))
 		})
 	}
@@ -202,7 +210,11 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 // client that has left must still be settled, so Settle gets it without its
 // cancellation, and the ledger bounds the call. A failed Settle is logged and
 // left: the response is already written.
-func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, provider, tenantID string, req *usage.Request, res *reservation) {
+//
+// The spend Settle returns is recorded on the request's Record, with t's
+// budget. A Settle that fails, or finds the month missing, returns none, and
+// leaves the reservation's.
+func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, provider string, t tenant.Tenant, req *usage.Request, res *reservation) {
 	var charged int64
 	if r := res.result; r != nil {
 		var known bool
@@ -216,14 +228,19 @@ func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, 
 		}
 	}
 
-	if err := ledger.Settle(context.WithoutCancel(ctx), res.Reservation, charged); err != nil {
+	spent, known, err := ledger.Settle(context.WithoutCancel(ctx), res.Reservation, charged)
+	if err != nil {
 		logger.Warn("budget settlement failed",
 			"request_id", RequestIDFrom(ctx),
-			"tenant_id", tenantID,
+			"tenant_id", t.ID,
 			"provider", provider,
 			"charge_micros", charged,
 			"error", err,
 		)
+		return
+	}
+	if known {
+		recordSpend(ctx, spent, t.BudgetMicros)
 	}
 }
 
@@ -232,6 +249,15 @@ func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, 
 func recordRefusal(ctx context.Context, provider, reason string) {
 	if rec := RecordFrom(ctx); rec != nil {
 		rec.BudgetRefusal = &BudgetRefusal{Provider: provider, Reason: reason}
+	}
+}
+
+// recordSpend records on the Record of the request ctx belongs to the
+// month's spend the ledger reported, spent, with the tenant's budget,
+// budgetMicros, both in µ$. It replaces any spend recorded before.
+func recordSpend(ctx context.Context, spent, budgetMicros int64) {
+	if rec := RecordFrom(ctx); rec != nil {
+		rec.BudgetSpend = &BudgetSpend{SpentMicros: spent, BudgetMicros: budgetMicros}
 	}
 }
 

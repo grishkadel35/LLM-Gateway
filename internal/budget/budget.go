@@ -85,6 +85,10 @@ const (
 	replyWarn    = 2
 )
 
+// settle.lua replies with this for a missing hash, and otherwise with the
+// hash's spent, which is never negative.
+const settleMissing = -1
+
 // Ledger keeps tenants' monthly spend in Redis, and rebuilds it from Postgres
 // when it's missing.
 type Ledger struct {
@@ -180,7 +184,9 @@ func (l *Ledger) Reserve(ctx context.Context, tenantID string, budget, amount in
 }
 
 // Settle swaps r's reservation for charge, what its request really cost, in
-// µ$: spent moves by charge - r.Amount. r must be admitted.
+// µ$: spent moves by charge - r.Amount. r must be admitted. It returns the
+// month's spend in µ$ as the settlement left it, with known true, or known
+// false when the hash is missing, as no spend is known then.
 //
 // If the hash was rebuilt since r was made, it doesn't hold the reservation,
 // and the whole charge is added. If it's missing, Settle writes no hash: the
@@ -192,16 +198,20 @@ func (l *Ledger) Reserve(ctx context.Context, tenantID string, budget, amount in
 // ctx should outlive the request, since a client that has left must still be
 // settled: context.WithoutCancel gives one. The script gets 100 ms. A
 // negative charge is an error and never reaches Redis.
-func (l *Ledger) Settle(ctx context.Context, r Reservation, charge int64) error {
+func (l *Ledger) Settle(ctx context.Context, r Reservation, charge int64) (spent int64, known bool, err error) {
 	if charge < 0 {
-		return fmt.Errorf("budget: charge must not be negative, got %d", charge)
+		return 0, false, fmt.Errorf("budget: charge must not be negative, got %d", charge)
 	}
 	ctx, cancel := context.WithTimeout(ctx, scriptTimeout)
 	defer cancel()
 	// r.Amount is between 0 and tenant.MaxBudgetMicros, so charge - r.Amount
 	// can't overflow.
 	keys := []string{r.key, missedKey(r.key)}
-	return settleScript.Run(ctx, l.rdb, keys, r.gen, charge-r.Amount, charge, r.expireAt).Err()
+	spent, err = settleScript.Run(ctx, l.rdb, keys, r.gen, charge-r.Amount, charge, r.expireAt).Int64()
+	if err != nil || spent == settleMissing {
+		return 0, false, err
+	}
+	return spent, true, nil
 }
 
 // Spent returns the tenant's spend for the month holding at, in µ$: settled

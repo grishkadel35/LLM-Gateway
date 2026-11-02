@@ -166,11 +166,15 @@ func (f *fixture) mustRefuse(t *testing.T, budget, amount int64) Reservation {
 	return r
 }
 
-func (f *fixture) mustSettle(t *testing.T, r Reservation, charge int64) {
+// mustSettle settles r for charge, and returns the spend Settle reports, and
+// whether it knows one.
+func (f *fixture) mustSettle(t *testing.T, r Reservation, charge int64) (spent int64, known bool) {
 	t.Helper()
-	if err := f.Settle(context.Background(), r, charge); err != nil {
+	spent, known, err := f.Settle(context.Background(), r, charge)
+	if err != nil {
 		t.Fatalf("Settle(charge %d) returned error: %v", charge, err)
 	}
+	return spent, known
 }
 
 func TestPeriodIsTheUTCMonth(t *testing.T) {
@@ -217,7 +221,7 @@ func TestBadArgumentsNeverReachRedis(t *testing.T) {
 			t.Errorf("Reserve(budget %d, amount %d) = %+v, %v; want an error", tc.budget, tc.amount, r, err)
 		}
 	}
-	if err := l.Settle(ctx, Reservation{Admitted: true}, -1); err == nil {
+	if _, _, err := l.Settle(ctx, Reservation{Admitted: true}, -1); err == nil {
 		t.Error("Settle(charge -1): want an error")
 	}
 }
@@ -506,7 +510,7 @@ func TestSettleDuringARebuild(t *testing.T) {
 					// Just after this read, the old request ends: its row is
 					// queued, and it settles against the missing hash.
 					queue.Store(120)
-					if err := f.Settle(context.Background(), old, 120); err != nil {
+					if _, _, err := f.Settle(context.Background(), old, 120); err != nil {
 						t.Errorf("Settle() returned error: %v", err)
 					}
 				}
@@ -541,7 +545,7 @@ func TestRebuildGivesUpAtTheTimeLimit(t *testing.T) {
 		// so it leaves t alone. A settle that failed would let a rebuild
 		// through, which the test reports.
 		if armed.Load() {
-			_ = f.Settle(context.Background(), old, 0)
+			_, _, _ = f.Settle(context.Background(), old, 0)
 		}
 		return 0
 	})
@@ -634,7 +638,7 @@ func TestRedisErrorIsNeverAnAdmission(t *testing.T) {
 		t.Error("Spent(): want an error")
 	}
 	r := Reservation{Admitted: true, Amount: 10, key: key("tn_test", start), gen: 1}
-	if err := l.Settle(ctx, r, 5); err == nil {
+	if _, _, err := l.Settle(ctx, r, 5); err == nil {
 		t.Error("Settle(): want an error")
 	}
 }
@@ -652,7 +656,7 @@ func TestHungRedisTimesOut(t *testing.T) {
 	for name, call := range map[string]func() error{
 		"Reserve": func() error { _, err := l.Reserve(ctx, "tn_test", 1_000, 10, at); return err },
 		"Spent":   func() error { _, err := l.Spent(ctx, "tn_test", at); return err },
-		"Settle":  func() error { return l.Settle(ctx, r, 5) },
+		"Settle":  func() error { _, _, err := l.Settle(ctx, r, 5); return err },
 	} {
 		begin := time.Now()
 		err := call()
@@ -726,6 +730,42 @@ func TestSettleAfterARebuildAddsTheWholeCharge(t *testing.T) {
 	}
 	f.mustSettle(t, r, 120)
 	f.wantSpent(t, 170)
+}
+
+// TestSettleReturnsTheSpend: Settle returns spent as it leaves the hash,
+// another request's reservation in flight included, whether the hash holds
+// the reservation it settles or was rebuilt without it.
+func TestSettleReturnsTheSpend(t *testing.T) {
+	f := newFixture(t, nil)
+	f.mustReserve(t, 1_000, 200) // another request's, still in flight
+	r := f.mustReserve(t, 1_000, 300)
+	if spent, known := f.mustSettle(t, r, 120); spent != 320 || !known {
+		t.Errorf("Settle() in the hash that holds the reservation = %d, %v; want 320, true", spent, known)
+	}
+	f.wantSpent(t, 320)
+
+	r = f.mustReserve(t, 1_000, 300)
+	f.deleteHash(t)
+	// Rebuilt from no rows and no queue, with another request's 50 in it.
+	f.mustReserve(t, 1_000, 50)
+	if spent, known := f.mustSettle(t, r, 120); spent != 170 || !known {
+		t.Errorf("Settle() in a rebuilt hash = %d, %v; want 170, true", spent, known)
+	}
+	f.wantSpent(t, 170)
+}
+
+// TestSettleOnAMissingHashKnowsNoSpend: with the hash missing, Settle reports
+// that it knows no spend, and writes no hash.
+func TestSettleOnAMissingHashKnowsNoSpend(t *testing.T) {
+	f := newFixture(t, nil)
+	r := f.mustReserve(t, 1_000, 300)
+	f.deleteHash(t)
+	if spent, known := f.mustSettle(t, r, 120); known {
+		t.Errorf("Settle() on a missing hash = %d, true; want no spend known", spent)
+	}
+	if n := f.rdb.Exists(context.Background(), f.hashKey()).Val(); n != 0 {
+		t.Errorf("Settle built the missing hash: %v", f.hash(t))
+	}
 }
 
 func TestWarnsOnceAt80Percent(t *testing.T) {

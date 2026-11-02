@@ -20,7 +20,7 @@ import (
 //   - RecordRequest, just inside ReadBody: the client's Request
 //   - Cache: its decision
 //   - RateLimit: its 429
-//   - Budget: a refusal, and why
+//   - Budget: a refusal, and why, and the tenant's spend and budget
 //   - cmd/gateway's meter: the usage last reported, and what it cost
 //
 // A fact no layer learned stays at its zero value: a request no provider route
@@ -61,6 +61,12 @@ type Record struct {
 	// if it refused none. A client gone during the budget check (499) isn't a
 	// refusal.
 	BudgetRefusal *BudgetRefusal
+	// BudgetSpend is the tenant's spend for the month as the ledger last
+	// reported it to Budget, after a reservation, admitted or refused, or a
+	// settlement, with the tenant's budget. After a fallback, the fallback's
+	// attempt reports last. nil if the ledger reported none: no attempt
+	// reached it, or it failed.
+	BudgetSpend *BudgetSpend
 	// Usage is the usage last reported for the request: the response the
 	// client got, from a provider or the cache, or the proxy's report of a
 	// provider that never answered (502, 504, or 499 for a client gone
@@ -78,6 +84,15 @@ type BudgetRefusal struct {
 	// Reason is why: exceeded (402 budget_exceeded), unknown_model (400) or
 	// unavailable (503 budget_unavailable).
 	Reason string
+}
+
+// BudgetSpend is a tenant's spend for the month and its monthly budget.
+type BudgetSpend struct {
+	// SpentMicros is the spend in µ$: the month's settled costs, plus the
+	// reservations in flight.
+	SpentMicros int64
+	// BudgetMicros is the budget in µ$.
+	BudgetMicros int64
 }
 
 // UsageReport is one report of a response's usage, with what it cost.

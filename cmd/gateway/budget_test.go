@@ -35,9 +35,10 @@ import (
 
 // fakeLedger stands in for the Redis ledger, so routing tests need no Redis.
 // Each Reserve fails with err when it is set, is refused at spent when refuse
-// is, and is admitted otherwise. It records each Reserve and Settle, under a
-// lock, so concurrent requests can share it. Spent reports spent, or fails
-// with err when it is set, and records nothing.
+// is, and is admitted otherwise. Each Settle reports spent plus its charge. It
+// records each Reserve and Settle, under a lock, so concurrent requests can
+// share it. Spent reports spent, or fails with err when it is set, and
+// records nothing.
 type fakeLedger struct {
 	err    error
 	refuse bool
@@ -88,11 +89,11 @@ type settleCall struct {
 }
 
 // Settle succeeds.
-func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) error {
+func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) (int64, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settles = append(f.settles, settleCall{r, charge, middleware.RequestIDFrom(ctx)})
-	return nil
+	return f.spent + charge, true, nil
 }
 
 func (f *fakeLedger) Spent(context.Context, string, time.Time) (int64, error) {

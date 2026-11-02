@@ -10,7 +10,8 @@
 // served an attempt, which after a fallback is the fallback's.
 //
 // The counters of requests, cache decisions, refusals, tokens and cost also
-// carry the tenant, and those of requests, tokens and cost the model.
+// carry the tenant, as do the budget gauges, and the counters of requests,
+// tokens and cost the model.
 // Histograms never carry either: each label value there multiplies about 15
 // buckets. Neither label lets a client grow the number of series:
 //   - tenant is the tenant's ID, or none for a request refused before a
@@ -54,6 +55,8 @@ type Metrics struct {
 	cache          *prometheus.CounterVec
 	rateLimits     *prometheus.CounterVec
 	budgetRefusals *prometheus.CounterVec
+	budgetSpent    *prometheus.GaugeVec
+	budget         *prometheus.GaugeVec
 	wait           *prometheus.HistogramVec
 	up             *prometheus.GaugeVec
 	fallbacks      *prometheus.CounterVec
@@ -92,6 +95,14 @@ func New() *Metrics {
 			Name: "gateway_budget_rejections_total",
 			Help: "Attempts a tenant's budget refused, by reason: exceeded (402), unknown_model (400) or unavailable (503). provider is the attempt's, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants.",
 		}, []string{"tenant", "provider", "reason"}),
+		budgetSpent: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_budget_spent_micros",
+			Help: "Each tenant's spend for the month in micro-dollars, reservations in flight included, as the budget ledger reported it to the tenant's latest request to a paid provider: after its reservation, admitted or refused, or its settlement. A tenant shows up once it sends one after the gateway starts, and one idle since the month began shows last month's spend until its next. tenant is the tenant's ID; the operator creates tenants.",
+		}, []string{"tenant"}),
+		budget: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "gateway_budget_micros",
+			Help: "Each tenant's monthly budget in micro-dollars, as the tenant's latest request to a paid provider found it, set with gateway_budget_spent_micros. A new budget shows from the tenant's next such request. tenant is the tenant's ID; the operator creates tenants.",
+		}, []string{"tenant"}),
 		wait: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "gateway_concurrency_wait_seconds",
 			Help:    "Time requests waited for a concurrency slot on a provider with max_concurrency, whether or not one came free.",
@@ -106,7 +117,7 @@ func New() *Metrics {
 			Help: "Requests handed from a failed provider to its fallback, by why it failed: unreachable, timeout or server_error.",
 		}, []string{"from", "to", "reason"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.cost, m.cache, m.rateLimits, m.budgetRefusals, m.wait, m.up, m.fallbacks)
+	m.registry.MustRegister(m.requests, m.duration, m.tokens, m.cost, m.cache, m.rateLimits, m.budgetRefusals, m.budgetSpent, m.budget, m.wait, m.up, m.fallbacks)
 	return m
 }
 
@@ -120,8 +131,9 @@ func (m *Metrics) Handler() http.Handler {
 //
 // It goes inside middleware.Logging, and reads the request's Record once the
 // route is done: the tenant, the model the client asked for, the cache's
-// decision, the gateway's own 429, and a budget's refusal. Without a Record,
-// a request counts under tenant none and model other, and nothing else.
+// decision, the gateway's own 429, a budget's refusal, and the tenant's spend
+// and budget for the budget gauges. Without a Record, a request counts under
+// tenant none and model other, and nothing else.
 func (m *Metrics) Requests(provider string) func(http.Handler) http.Handler {
 	duration := m.duration.WithLabelValues(provider)
 	return func(next http.Handler) http.Handler {
@@ -143,7 +155,8 @@ func (m *Metrics) Requests(provider string) func(http.Handler) http.Handler {
 }
 
 // request counts a request on provider's route that ended with status, by
-// what record, its Record, says of it: nil for none.
+// what record, its Record, says of it: nil for none. It sets the tenant's
+// budget gauges to the spend and budget on record, if there are any.
 func (m *Metrics) request(provider string, status int, record *middleware.Record) {
 	if record == nil {
 		record = &middleware.Record{}
@@ -165,6 +178,12 @@ func (m *Metrics) request(provider string, status int, record *middleware.Record
 	}
 	if b := record.BudgetRefusal; b != nil {
 		m.budgetRefusals.WithLabelValues(tenant, b.Provider, b.Reason).Inc()
+	}
+	// Only a paid provider's attempt records a spend, and only when the
+	// ledger reported one.
+	if s := record.BudgetSpend; s != nil {
+		m.budgetSpent.WithLabelValues(tenant).Set(float64(s.SpentMicros))
+		m.budget.WithLabelValues(tenant).Set(float64(s.BudgetMicros))
 	}
 }
 

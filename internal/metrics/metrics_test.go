@@ -31,14 +31,28 @@ func checkCounter(t *testing.T, name string, c *prometheus.CounterVec, want map[
 	}
 }
 
+// checkGauge fails the test unless g's samples are exactly want, as
+// checkCounter takes them.
+func checkGauge(t *testing.T, name string, g *prometheus.GaugeVec, want map[string]float64) {
+	t.Helper()
+	if got := testutil.CollectAndCount(g); got != len(want) {
+		t.Errorf("%s: %d series, want %d: %v", name, got, len(want), want)
+	}
+	for labels, v := range want {
+		if got := testutil.ToFloat64(g.WithLabelValues(strings.Split(labels, ",")...)); got != v {
+			t.Errorf("%s{%s} = %v, want %v", name, labels, got, v)
+		}
+	}
+}
+
 // serveRecorded serves one request on route through Logging, which puts a
 // Record on it, and m.Requests. The handler inside records what record
 // says, as the layers inside would, and answers with status.
 func serveRecorded(m *Metrics, route string, record middleware.Record, status int) {
 	h := m.Requests(route)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := middleware.RecordFrom(r.Context())
-		rec.TenantID, rec.Request, rec.Cache, rec.RateLimited, rec.BudgetRefusal =
-			record.TenantID, record.Request, record.Cache, record.RateLimited, record.BudgetRefusal
+		rec.TenantID, rec.Request, rec.Cache, rec.RateLimited, rec.BudgetRefusal, rec.BudgetSpend =
+			record.TenantID, record.Request, record.Cache, record.RateLimited, record.BudgetRefusal, record.BudgetSpend
 		w.WriteHeader(status)
 	}))
 	middleware.Logging(slog.New(slog.DiscardHandler))(h).ServeHTTP(httptest.NewRecorder(),
@@ -156,6 +170,27 @@ func TestRequestsReadsTheRecord(t *testing.T) {
 			checkCounter(t, "gateway_budget_rejections_total", m.budgetRefusals, tc.budget)
 		})
 	}
+}
+
+// TestRequestsSetsTheBudgetGauges: a request whose Record holds a spend sets
+// its tenant's two budget gauges to it and the budget, over what an earlier
+// request set. One with no spend recorded, such as a free provider's, sets
+// neither.
+func TestRequestsSetsTheBudgetGauges(t *testing.T) {
+	m := New()
+	spend := func(spent, budget int64) *middleware.BudgetSpend {
+		return &middleware.BudgetSpend{SpentMicros: spent, BudgetMicros: budget}
+	}
+	serveRecorded(m, "ollama", middleware.Record{TenantID: "t1"}, http.StatusOK)
+	checkGauge(t, "gateway_budget_spent_micros", m.budgetSpent, nil)
+	checkGauge(t, "gateway_budget_micros", m.budget, nil)
+
+	serveRecorded(m, "openai", middleware.Record{TenantID: "t1", BudgetSpend: spend(100, 1_000)}, http.StatusOK)
+	serveRecorded(m, "groq", middleware.Record{TenantID: "t2", BudgetSpend: spend(40, 50)}, http.StatusPaymentRequired)
+	serveRecorded(m, "openai", middleware.Record{TenantID: "t1", BudgetSpend: spend(300, 2_000)}, http.StatusOK)
+	serveRecorded(m, "ollama", middleware.Record{TenantID: "t1"}, http.StatusOK)
+	checkGauge(t, "gateway_budget_spent_micros", m.budgetSpent, map[string]float64{"t1": 300, "t2": 40})
+	checkGauge(t, "gateway_budget_micros", m.budget, map[string]float64{"t1": 2_000, "t2": 50})
 }
 
 // TestDurationBucketsStartAt1ms: a cache hit takes about 1 ms, so the first

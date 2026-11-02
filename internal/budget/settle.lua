@@ -9,11 +9,12 @@
 -- ARGV[3]  charge: what to add once the hash has been rebuilt without it
 -- ARGV[4]  when the hash expires, in Unix seconds, which its counter shares
 --
--- Go computes the adds and HINCRBY takes them as written, so no number here
--- passes through a Lua double.
+-- Go computes the adds and HINCRBY takes them as written, so no number written
+-- here passes through a Lua double.
 --
--- Returns 0. (A script that returns nothing replies nil, which go-redis
--- reports as the error redis.Nil.)
+-- Returns spent as HINCRBY leaves it, or -1, which no spend can be, for a
+-- missing hash. The spend comes back through a Lua double, which is exact up
+-- to 2^53 µ$, well past every budget: Go caps them at 1e15.
 
 local key = KEYS[1]
 local gen = redis.call('HGET', key, 'gen')
@@ -30,7 +31,7 @@ local gen = redis.call('HGET', key, 'gen')
 if not gen then
   redis.call('INCR', KEYS[2])
   redis.call('EXPIREAT', KEYS[2], ARGV[4])
-  return 0
+  return -1
 end
 
 -- Another gen means the hash was rebuilt since the reservation, so it doesn't
@@ -42,5 +43,4 @@ if gen == ARGV[1] then
 end
 -- The only write here. HINCRBY fails only if spent would leave the 64-bit
 -- range, and then writes nothing.
-redis.call('HINCRBY', key, 'spent', add)
-return 0
+return redis.call('HINCRBY', key, 'spent', add)

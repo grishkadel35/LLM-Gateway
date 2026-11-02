@@ -289,6 +289,57 @@ func TestMetricsThroughGatewayExactly(t *testing.T) {
 	checkSamples(t, "gateway_cost_micros_total", samples(t, got, "gateway_cost_micros_total", "tenant", "provider", "model"), cost)
 }
 
+// TestBudgetGaugesThroughGateway: through the gateway with main's parts, the
+// budget gauges show the tenant's spend and budget as its latest request to a
+// paid provider found them in the ledger:
+//   - Requests to free providers, answered or not, set neither gauge.
+//   - Once a paid request has settled, the spend is the ledger's, after a
+//     fallback too, whose attempt settles last.
+//   - After a 402, the spend is the 402's spent_micros.
+//   - The budget is the tenant's, and a new one shows from the next request.
+func TestBudgetGaugesThroughGateway(t *testing.T) {
+	mock := httptest.NewServer(mockprovider.Handler())
+	t.Cleanup(mock.Close)
+	ollama := newFakeOllama(t, ollamaKnobs{})
+	busy := newFakeOllama(t, ollamaKnobs{status: http.StatusTooManyRequests})
+	flaky := newFakeOllama(t, ollamaKnobs{status: http.StatusInternalServerError})
+	t.Setenv("TEST_MOCK_KEY", "mock")
+	g := newBudgetGateway(t, loadConfig(t, fmt.Sprintf(metricsConfig, mock.URL, aliasUpstream(t), ollama.server.URL, busy.server.URL, flaky.server.URL)))
+	g.warns["falling back"] = 1
+
+	// checkGauges fails the test unless the gauges' samples, scraped after
+	// what, are spent and budget.
+	checkGauges := func(t *testing.T, what string, spent, budget map[string]float64) {
+		t.Helper()
+		got := scrapeMetrics(t, g)
+		checkSamples(t, "gateway_budget_spent_micros after "+what, samples(t, got, "gateway_budget_spent_micros", "tenant"), spent)
+		checkSamples(t, "gateway_budget_micros after "+what, samples(t, got, "gateway_budget_micros", "tenant"), budget)
+	}
+	tenantAt := func(micros float64) map[string]float64 { return map[string]float64{g.tenantID: micros} }
+
+	checkAdmitted(t, g.post("/ollama/v1/chat/completions", chatBody("qwen3.5:9b")), "the request to ollama")
+	if rec := g.post("/busy/v1/chat/completions", chatBody("qwen3.5:9b")); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the request to busy: status %d, want its 429; body %s", rec.Code, rec.Body)
+	}
+	checkGauges(t, "requests to free providers", nil, nil)
+
+	checkAdmitted(t, g.post("/openai/v1/chat/completions", chatBody("gpt-4o")), "the request to openai")
+	paid := g.spent(t)
+	checkGauges(t, "a paid request", tenantAt(float64(paid)), tenantAt(fiftyDollars))
+
+	checkAdmitted(t, g.post("/flaky/v1/chat/completions", chatBody("qwen3.5:9b")), "the fallback to groq")
+	fellBack := g.spent(t)
+	if fellBack == paid {
+		t.Fatalf("spent_micros = %d after groq's answer, as before it: the test needs an answer that costs something", fellBack)
+	}
+	checkGauges(t, "a fallback to groq", tenantAt(float64(fellBack)), tenantAt(fiftyDollars))
+
+	// 1 µ$ is less than any reservation, so the next request is refused.
+	g.setBudget(t, 1)
+	refusal := overBudget(t, g.post("/openai/v1/chat/completions", chatBody("gpt-4o")))
+	checkGauges(t, "a 402", tenantAt(refusal["spent_micros"].(float64)), tenantAt(1))
+}
+
 // TestMetricsRandomModels: 100 requests for models of random names, on each
 // format's route, add no model label but other, so clients can't grow the
 // number of series.

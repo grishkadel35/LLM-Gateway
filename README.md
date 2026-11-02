@@ -36,6 +36,16 @@ the usage rows.
 
 ### What changed
 
+- **Budget gauges per tenant.** `gateway_budget_spent_micros{tenant}` and
+  `gateway_budget_micros{tenant}` show each tenant's spend for the month,
+  reservations in flight included, and its budget, as the ledger reported
+  them to the tenant's latest request to a paid provider: after its
+  reservation, admitted or refused, and after its settlement. A tenant
+  appears once it sends such a request after the gateway starts, and one
+  idle since the month began shows last month's figure until its next
+  request. `GET /admin/tenants/{id}/budget` stays the exact figure. To feed
+  the gauges, settling now returns the new spend; what it adds, and when,
+  doesn't change.
 - **Metrics by tenant and model, and four new counters.**
   `gateway_requests_total` and `gateway_tokens_total` gain `tenant` and
   `model` labels, and these are new:

@@ -28,14 +28,16 @@ import (
 // fakeLedger stands in for the Redis ledger. Each Reserve fails with err when
 // it is set, is refused at spent when refuse is, and is admitted otherwise:
 // the first admission warns when warn is set, as the ledger warns once a
-// month. Each Settle fails with settleErr when it is set. It records each
-// call, under a lock, so concurrent requests can share it.
+// month. Each Settle fails with settleErr when it is set, finds the month
+// missing when missing is, and otherwise reports spent plus its charge. It
+// records each call, under a lock, so concurrent requests can share it.
 type fakeLedger struct {
 	err       error
 	refuse    bool
 	spent     int64
 	warn      bool
 	settleErr error
+	missing   bool
 	// started, when set, makes each Reserve send on it as it starts, and then
 	// wait for its request's context to be done before it answers: a client
 	// that leaves while the ledger works. It fails with err when that is set,
@@ -84,11 +86,14 @@ type settleCall struct {
 	ctxErr error
 }
 
-func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) error {
+func (f *fakeLedger) Settle(ctx context.Context, r budget.Reservation, charge int64) (int64, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.settles = append(f.settles, settleCall{r, charge, ctx.Err()})
-	return f.settleErr
+	if f.settleErr != nil || f.missing {
+		return 0, false, f.settleErr
+	}
+	return f.spent + charge, true, nil
 }
 
 // recorded returns the Reserve calls so far.
@@ -713,6 +718,53 @@ func TestBudgetRecordsRefusals(t *testing.T) {
 
 			if rec.Code != tc.status || !reflect.DeepEqual(record.BudgetRefusal, tc.want) {
 				t.Errorf("status %d, Record's refusal %+v; want %d, %+v", rec.Code, record.BudgetRefusal, tc.status, tc.want)
+			}
+		})
+	}
+}
+
+// TestBudgetRecordsTheSpend: Budget records on the request's Record the
+// month's spend each time the ledger reports it, with the tenant's budget:
+// the reservation's, admitted or refused, and then the settlement's. A
+// settlement that fails or finds the month missing reports none, and leaves
+// the reservation's. A request the ledger never reported on records none.
+func TestBudgetRecordsTheSpend(t *testing.T) {
+	const gpt4o = `{"model":"gpt-4o","max_tokens":100,"messages":[]}`
+	// gpt-4o has one price, so this is what it is whenever the request
+	// arrives.
+	reserved, _ := pricing.Reserve("openai", "gpt-4o", reserveTokens(gpt4o), 100, 1, time.Now())
+	// 1,000 input and 100 output tokens of gpt-4o: 3,500 µ$.
+	used := usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}, Status: http.StatusOK, Complete: true}
+	const budgetMicros = 50_000_000
+	spend := func(spent int64) *BudgetSpend { return &BudgetSpend{SpentMicros: spent, BudgetMicros: budgetMicros} }
+	cases := []struct {
+		name     string
+		ledger   *fakeLedger
+		provider string
+		free     bool
+		body     string
+		want     *BudgetSpend
+	}{
+		{"settled", &fakeLedger{spent: 1_000}, "openai", false, gpt4o, spend(1_000 + 3_500)},
+		{"settled, finding the month missing", &fakeLedger{spent: 1_000, missing: true}, "openai", false, gpt4o, spend(1_000 + reserved)},
+		{"settlement fails", &fakeLedger{spent: 1_000, settleErr: errors.New("redis: i/o timeout")}, "openai", false, gpt4o,
+			spend(1_000 + reserved)},
+		{"refused", &fakeLedger{refuse: true, spent: 49_999_000}, "openai", false, gpt4o, spend(49_999_000)},
+		{"unknown model", &fakeLedger{}, "openai", false, `{"model":"gpt-9000","messages":[]}`, nil},
+		{"ledger fails", &fakeLedger{err: errors.New("redis: connection refused")}, "openai", false, gpt4o, nil},
+		{"free provider", &fakeLedger{}, "ollama", true, `{"model":"qwen3.5:9b","messages":[]}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ReportUsage(r.Context(), tc.provider, used)
+			})
+			h := asTenant(acmeWithBudget(budgetMicros), usage.ReadBody(provider.FormatOpenAI, 1<<20)(Budget(tc.ledger, tc.provider, tc.free, discard)(next)))
+			req, record := withRecord(httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body)))
+			RequestID(h).ServeHTTP(httptest.NewRecorder(), req)
+
+			if !reflect.DeepEqual(record.BudgetSpend, tc.want) {
+				t.Errorf("Record's spend %+v, want %+v", record.BudgetSpend, tc.want)
 			}
 		})
 	}
