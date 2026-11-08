@@ -47,6 +47,18 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **`scripts/seed.sh`.** It creates three test tenants through the admin API
+  and prints `name<TAB>tenant_id<TAB>key` for each on stdout:
+  - `seed-default`, with the column defaults
+  - `seed-limited`, at 100 tokens a minute, so the fourth small request to the
+    mock gets a `429`
+  - `seed-budget`, at $0.001 a month, so a request without `max_tokens` gets a
+    `402`, and one with a small `max_tokens` gets a `200`
+
+  It waits up to 60 s for `/ready`, and reads `GATEWAY_URL` and
+  `GATEWAY_ADMIN_KEY` (by default the mock setup's). A rejected admin key or
+  any other error ends it with exit 1 and the reason. It isn't idempotent:
+  each run makes three new tenants.
 - **A Redis of its own for budgets, and Redis passwords and caps.** Compose
   now runs two Redis, both behind a password (`REDIS_PASSWORD`, dev default
   `gateway`) and a memory cap.
