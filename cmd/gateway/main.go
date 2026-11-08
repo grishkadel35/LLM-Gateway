@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -288,11 +289,21 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	// goes before the first connection, so a dial that fails at startup is
 	// logged as JSON too.
 	redis.SetLogger(redisLogger{logger})
-	rdb, err := openRedis(os.Getenv("REDIS_URL"))
+	rdb, err := openRedis("REDIS_URL", os.Getenv("REDIS_URL"))
 	if err != nil {
 		return err
 	}
 	defer rdb.Close()
+
+	// The ledger shares rdb unless BUDGET_REDIS_URL gives it a Redis of its
+	// own, and either way that Redis must not be one that can evict.
+	ledgerRdb, err := openLedgerRedis(rdb, os.Getenv("BUDGET_REDIS_URL"), logger)
+	if err != nil {
+		return err
+	}
+	if ledgerRdb != rdb {
+		defer ledgerRdb.Close()
+	}
 
 	writer := usage.NewWriter(conn, logger)
 	// Deferred after conn.Close, so it runs first: by the time run returns,
@@ -316,12 +327,9 @@ func run(cfg *config.Config, logger *slog.Logger) error {
 	}
 	checker := health.NewChecker(providers, m.ProviderUp, logger)
 
-	ready := health.ReadyHandler(map[string]func(context.Context) error{
-		"postgres": conn.PingContext,
-		"redis":    func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
-	}, logger)
+	ready := health.ReadyHandler(readyChecks(conn, rdb, ledgerRdb), logger)
 
-	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), budget.New(rdb, conn, writer.Pending), m, checker, ready, logger)
+	handler, err := router(cfg, stores{tenant.NewStore(conn), usage.NewReports(conn)}, adminKey, recordUsage(writer, cfg.Providers, logger), ratelimit.New(rdb), cache.New(rdb, cfg.Cache.TTL()), budget.New(ledgerRdb, conn, writer.Pending), m, checker, ready, logger)
 	if err != nil {
 		return err
 	}
@@ -470,11 +478,12 @@ func openDB(dsn string) (*sql.DB, error) {
 	return conn, nil
 }
 
-// openRedis connects to Redis and pings it, so a missing or unreachable
-// Redis stops startup instead of leaving every request unlimited, and every
-// paid one refused.
-func openRedis(redisURL string) (*redis.Client, error) {
-	opts, err := redisOptions(redisURL)
+// openRedis connects to the Redis that redisURL, the value of the environment
+// variable name, points at, and pings it, so a missing or unreachable Redis
+// stops startup instead of leaving every request unlimited, and every paid
+// one refused. Its errors name the variable, and never quote the URL.
+func openRedis(name, redisURL string) (*redis.Client, error) {
+	opts, err := redisOptions(name, redisURL)
 	if err != nil {
 		return nil, err
 	}
@@ -484,13 +493,14 @@ func openRedis(redisURL string) (*redis.Client, error) {
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		rdb.Close()
-		return nil, fmt.Errorf("connecting to Redis: %w", err)
+		return nil, fmt.Errorf("connecting to Redis with %s: %w", name, err)
 	}
 	return rdb, nil
 }
 
-// redisOptions parses REDIS_URL into the client options the rate limiter and
-// the budget ledger need, whatever the URL asks for:
+// redisOptions parses redisURL, the value of the environment variable name
+// (REDIS_URL or BUDGET_REDIS_URL), into the client options the rate limiter,
+// the cache and the budget ledger need, whatever the URL asks for:
 //   - ContextTimeoutEnabled, without which go-redis ignores context deadlines
 //     on the socket and waits out its own read timeout, so a hung Redis
 //     would hang every request.
@@ -498,10 +508,11 @@ func openRedis(redisURL string) (*redis.Client, error) {
 //     idempotent, and a retry after a lost reply would charge, refund,
 //     reserve or settle twice.
 //
-// Its errors never quote the URL, which can carry a password.
-func redisOptions(redisURL string) (*redis.Options, error) {
+// Its errors name the variable, and never quote the URL, which can carry a
+// password.
+func redisOptions(name, redisURL string) (*redis.Options, error) {
 	if redisURL == "" {
-		return nil, errors.New("REDIS_URL is not set, e.g. redis://127.0.0.1:6379/0")
+		return nil, fmt.Errorf("%s is not set, e.g. redis://127.0.0.1:6379/0", name)
 	}
 	opts, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -509,13 +520,91 @@ func redisOptions(redisURL string) (*redis.Options, error) {
 		// name only the part that's wrong.
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) {
-			return nil, errors.New("REDIS_URL is not a valid URL, e.g. redis://127.0.0.1:6379/0")
+			return nil, fmt.Errorf("%s is not a valid URL, e.g. redis://127.0.0.1:6379/0", name)
 		}
-		return nil, fmt.Errorf("REDIS_URL is not a valid Redis URL (%w), e.g. redis://127.0.0.1:6379/0", err)
+		return nil, fmt.Errorf("%s is not a valid Redis URL (%w), e.g. redis://127.0.0.1:6379/0", name, err)
 	}
 	opts.ContextTimeoutEnabled = true
 	opts.MaxRetries = -1
 	return opts, nil
+}
+
+// openLedgerRedis returns the Redis client for the budget ledger: rdb itself
+// when budgetURL, the value of BUDGET_REDIS_URL, is empty, and otherwise a
+// client of its own for that URL. The rate limiter and the cache always use
+// rdb. It stops startup when the ledger's Redis can evict keys, as
+// checkEviction decides.
+func openLedgerRedis(rdb *redis.Client, budgetURL string, logger *slog.Logger) (*redis.Client, error) {
+	ledger := rdb
+	if budgetURL != "" {
+		var err error
+		if ledger, err = openRedis("BUDGET_REDIS_URL", budgetURL); err != nil {
+			return nil, err
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	info, infoErr := ledger.Info(ctx, "memory").Result()
+	if err := checkEviction(info, infoErr, logger); err != nil {
+		if ledger != rdb {
+			ledger.Close()
+		}
+		return nil, err
+	}
+	return ledger, nil
+}
+
+// checkEviction is the guard on the budget ledger's Redis. info is the text of
+// its INFO memory reply, and infoErr the error from asking for it. Every
+// budget key has a TTL, so any eviction policy, the volatile-* ones included,
+// can drop a ledger, and the rebuild from Postgres can't see the reservations
+// in flight at that moment. So when the Redis has a memory cap (maxmemory
+// above 0) and a policy other than noeviction, checkEviction returns an error
+// that names the policy and says what to do.
+//
+// Some managed Redis services restrict INFO. When it fails, or the reply
+// lacks the fields, checkEviction logs a Warn and lets startup go on.
+func checkEviction(info string, infoErr error, logger *slog.Logger) error {
+	limit, limitErr := strconv.ParseInt(infoField(info, "maxmemory"), 10, 64)
+	policy := infoField(info, "maxmemory_policy")
+	if infoErr != nil || limitErr != nil || policy == "" {
+		if infoErr == nil {
+			infoErr = errors.New("the reply has no usable maxmemory or maxmemory_policy")
+		}
+		logger.Warn("can't tell whether the budget ledger's Redis can evict keys; it must run under maxmemory-policy noeviction", "error", infoErr)
+		return nil
+	}
+	if limit > 0 && policy != "noeviction" {
+		return fmt.Errorf("the budget ledger's Redis (BUDGET_REDIS_URL, or REDIS_URL when that is unset) has a memory cap and maxmemory-policy %s, so it can evict budget keys; point BUDGET_REDIS_URL at a Redis under maxmemory-policy noeviction", policy)
+	}
+	return nil
+}
+
+// infoField returns the value of the field name in the text of an INFO reply,
+// or "" when there is none. A line is the name, a colon and the value, and
+// ends in "\r\n". Matching the colon too keeps maxmemory apart from
+// maxmemory_human and the other fields that begin with it.
+func infoField(info, name string) string {
+	for line := range strings.Lines(info) {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), name+":"); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// readyChecks returns the checks for GET /ready: Postgres and Redis, and the
+// budget ledger's Redis when it is a client of its own, not rdb.
+func readyChecks(conn *sql.DB, rdb, ledgerRdb *redis.Client) map[string]func(context.Context) error {
+	checks := map[string]func(context.Context) error{
+		"postgres": conn.PingContext,
+		"redis":    func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
+	}
+	if ledgerRdb != rdb {
+		checks["redis_budget"] = func(ctx context.Context) error { return ledgerRdb.Ping(ctx).Err() }
+	}
+	return checks
 }
 
 // recordUsage returns a usageFunc that turns each provider response, and each

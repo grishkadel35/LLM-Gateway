@@ -47,6 +47,23 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **A Redis of its own for budgets, and Redis passwords and caps.** Compose
+  now runs two Redis, both behind a password (`REDIS_PASSWORD`, dev default
+  `gateway`) and a memory cap.
+  - `redis` (`REDIS_URL`, port 6379) holds the rate-limit buckets and the
+    cache, capped at 256 MB under `allkeys-lru`. An evicted entry is a miss,
+    and an evicted bucket starts full.
+  - `redis-budget` (`BUDGET_REDIS_URL`, port 6380) holds the budget ledgers,
+    capped at 64 MB under `noeviction`. At the cap Redis refuses writes, and a
+    paid request gets `503 budget_unavailable`, never an unchecked budget.
+  - With `BUDGET_REDIS_URL` unset, the ledger shares `REDIS_URL`'s Redis, as
+    before. Either way, at startup the gateway reads `INFO memory` from the
+    ledger's Redis and refuses to start if it has a cap and any policy but
+    `noeviction`. When INFO can't be read, it logs a warning and starts.
+  - `/ready` adds a `redis_budget` check when the ledger has its own Redis.
+    Startup errors name the variable, never the URL.
+  - `make db-up` starts both. The Makefile and `.env.example` carry both URLs
+    with the password, so a `.env` from before needs them too.
 - **A container image.** `deployments/Dockerfile` builds the gateway, with
   `/migrate` beside it, and with `--target mockprovider` the mock provider.
   Both run on distroless static, Debian 13, as uid 65532, with the CA

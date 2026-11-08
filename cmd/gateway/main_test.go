@@ -549,29 +549,35 @@ func TestOpenDBFailsFast(t *testing.T) {
 }
 
 // TestOpenRedisFailsFast: a missing, malformed or unreachable Redis stops
-// startup with an error that says what to fix, and never quotes the URL,
-// whose password would then land in the log.
+// startup with an error that names the variable the URL came from, says what
+// to fix, and never quotes the URL, whose password would then land in the
+// log. The same for REDIS_URL and BUDGET_REDIS_URL.
 func TestOpenRedisFailsFast(t *testing.T) {
 	cases := []struct{ name, url, want string }{
-		{"unset", "", "REDIS_URL is not set"},
+		{"unset", "", "%s is not set"},
 		// url.Parse fails on this one, and its error quotes the whole URL.
-		{"not a URL", "redis://:hunter2@127.0.0.1:port/0", "REDIS_URL is not a valid URL"},
-		{"wrong scheme", "postgres://:hunter2@127.0.0.1:6379/0", "REDIS_URL is not a valid Redis URL"},
-		{"unknown option", "redis://:hunter2@127.0.0.1:6379/0?retries=3", "REDIS_URL is not a valid Redis URL"},
+		{"not a URL", "redis://:hunter2@127.0.0.1:port/0", "%s is not a valid URL"},
+		{"wrong scheme", "postgres://:hunter2@127.0.0.1:6379/0", "%s is not a valid Redis URL"},
+		{"unknown option", "redis://:hunter2@127.0.0.1:6379/0?retries=3", "%s is not a valid Redis URL"},
 		// Port 1 on loopback: nothing listens there, so the ping fails at once.
-		{"unreachable", "redis://:hunter2@127.0.0.1:1/0", "connecting to Redis"},
+		{"unreachable", "redis://:hunter2@127.0.0.1:1/0", "connecting to Redis with %s: "},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rdb, err := openRedis(tc.url)
-			if err == nil {
-				rdb.Close()
-				t.Fatal("openRedis() returned no error")
-			}
-			if !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "hunter2") {
-				t.Errorf("openRedis() = %q, want an error containing %q, without the password", err, tc.want)
-			}
-		})
+	for _, variable := range []string{"REDIS_URL", "BUDGET_REDIS_URL"} {
+		for _, tc := range cases {
+			t.Run(variable+"/"+tc.name, func(t *testing.T) {
+				rdb, err := openRedis(variable, tc.url)
+				if err == nil {
+					rdb.Close()
+					t.Fatal("openRedis() returned no error")
+				}
+				// A prefix, since "REDIS_URL is not set" is also found inside
+				// "BUDGET_REDIS_URL is not set".
+				want := fmt.Sprintf(tc.want, variable)
+				if !strings.HasPrefix(err.Error(), want) || strings.Contains(err.Error(), "hunter2") {
+					t.Errorf("openRedis() = %q, want an error starting %q, without the password", err, want)
+				}
+			})
+		}
 	}
 }
 
@@ -582,7 +588,7 @@ func TestOpenRedis(t *testing.T) {
 	if u == "" {
 		t.Skip("REDIS_URL not set; skipping Redis tests")
 	}
-	rdb, err := openRedis(u)
+	rdb, err := openRedis("REDIS_URL", u)
 	if err != nil {
 		t.Fatalf("openRedis() returned error: %v", err)
 	}
@@ -598,7 +604,7 @@ func TestRedisOptions(t *testing.T) {
 		// go-redis reads max_retries from the URL; it must not win.
 		"redis://127.0.0.1:6379/0?max_retries=3",
 	} {
-		opts, err := redisOptions(u)
+		opts, err := redisOptions("REDIS_URL", u)
 		if err != nil {
 			t.Fatalf("redisOptions(%q) returned error: %v", u, err)
 		}
@@ -846,7 +852,7 @@ func TestRateLimitFailsOpenWhenRedisIsDown(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			opts, err := redisOptions("redis://" + tc.addr + "/0")
+			opts, err := redisOptions("REDIS_URL", "redis://"+tc.addr+"/0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1268,7 +1274,7 @@ func gatewayRedis(t *testing.T) *redis.Client {
 	if u == "" {
 		t.Skip("REDIS_URL not set; skipping Redis tests")
 	}
-	rdb, err := openRedis(u)
+	rdb, err := openRedis("REDIS_URL", u)
 	if err != nil {
 		t.Fatalf("openRedis() returned error: %v", err)
 	}

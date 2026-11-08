@@ -33,18 +33,78 @@ services:
       retries: 15
 
   redis:
+    # The rate limiter's buckets and the response cache: the gateway's
+    # REDIS_URL. The budget ledgers are in redis-budget, below. Eviction is
+    # safe for what is held here: past the 256 MB cap, allkeys-lru drops the
+    # least recently used key, and an evicted cache entry is only a miss,
+    # while an evicted rate-limit bucket starts full again.
+    image: redis:8-alpine
+    # No snapshots: a restart starts empty, and nothing here is worth keeping.
+    # The password is a dev-only default, like Postgres'. The port below is
+    # bound to loopback, so nothing off this machine can reach it anyway.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --requirepass
+      - "${REDIS_PASSWORD:-gateway}"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    environment:
+      # redis-cli reads its password from here, so the healthcheck below needs
+      # no -a, which would put the password on the command line.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-gateway}
+    # Bound to loopback like Postgres, so nothing off this machine can reach it.
+    ports:
+      - "127.0.0.1:6379:6379"
+    # No volume: everything here can be lost. Rate-limit buckets refill, and
+    # cached answers are fetched again.
+    healthcheck:
+      # redis-cli exits 0 even when Redis answers NOAUTH or WRONGPASS, so the
+      # check looks for PONG in what it prints: a missing or wrong password
+      # fails it.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+  redis-budget:
+    # The budget ledgers and their missed counters, and nothing else: the
+    # gateway's BUDGET_REDIS_URL. Every one of those keys has a TTL, so any
+    # eviction policy, the volatile-* ones too, could drop a ledger, and the
+    # rebuild from Postgres can't see the reservations in flight at that
+    # moment. So noeviction: Redis never drops a key. At the 64 MB cap it
+    # refuses writes instead. A reservation then fails, and a paid request
+    # gets the gateway's 503 budget_unavailable: a budget that can't be
+    # checked is never waved through. The gateway itself refuses to start with
+    # a ledger Redis that has a cap and can evict.
     image: redis:8-alpine
     # No snapshots. A snapshot restored after a crash would bring back an
     # older, lower spent in every budget ledger. With none, a restart starts
     # empty, and each ledger is rebuilt from usage_logs in Postgres.
-    command: ["redis-server", "--save", ""]
-    # Bound to loopback like Postgres, so nothing off this machine can reach it.
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --requirepass
+      - "${REDIS_PASSWORD:-gateway}"
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - noeviction
+    environment:
+      # As for redis: the healthcheck authenticates through this.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-gateway}
+    # Bound to loopback like Postgres. On the host it is 6380, since redis
+    # holds 6379.
     ports:
-      - "127.0.0.1:6379:6379"
-    # No volume: everything here can be lost. Rate-limit buckets refill, cached
-    # answers are fetched again, and budget ledgers are rebuilt from Postgres.
+      - "127.0.0.1:6380:6379"
+    # No volume: a restart rebuilds the ledgers from Postgres.
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # As for redis: a missing or wrong password fails it.
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 2s
       timeout: 5s
       retries: 15
