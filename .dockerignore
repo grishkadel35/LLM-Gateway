@@ -1,0 +1,9 @@
+# An allowlist: everything is excluded, then only what the build reads is let
+# back in. That keeps .env, config.local.yaml and .git out of every build, so a
+# provider key can't end up in an image layer. A file added later is out too,
+# until it is listed here.
+*
+!go.mod
+!go.sum
+!cmd/
+!internal/

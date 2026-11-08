@@ -21,9 +21,9 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-11-01
-**Stage:** Weeks 1 to 6 of 8 complete; Week 6's checkpoint passed and awaits
-its review. Every provider
+**Last updated:** 2026-11-08
+**Stage:** Weeks 1 to 6 of 8 complete, checkpoints closed; Week 7
+(Docker, testing, CI/CD) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -47,7 +47,18 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
-- **Week 6 checkpoint.** `TestObservabilityCheckpoint` in
+- **A container image.** `deployments/Dockerfile` builds the gateway, with
+  `/migrate` beside it, and with `--target mockprovider` the mock provider.
+  Both run on distroless static, Debian 13, as uid 65532, with the CA
+  certificates every HTTPS call to a provider needs. The builder is Go
+  1.26.10, go.mod's line, so the image's `encoding/json` is the one CI tests.
+  No config is baked in: mount one at `/etc/llm-gateway/config.yaml`, where
+  the image's `GATEWAY_CONFIG` points. Without one, the gateway exits naming
+  that path. `.dockerignore` lets in only `go.mod`, `go.sum`, `cmd/` and
+  `internal/`, so `.env`, `config.local.yaml` and `.git` never reach a build.
+  Unpacked, the images are about 31 MB and 12 MB. Compose builds them later
+  this week.
+- **Week 6 checkpoint closed.** `TestObservabilityCheckpoint` in
   `cmd/gateway/observability_test.go`, through the real router against a real
   Postgres and Redis, sends a fixed mix of requests for two tenants to a mock
   provider whose answers are known. It then checks that the metrics, the usage
