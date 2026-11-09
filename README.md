@@ -47,6 +47,21 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **Tests for SSE framing and malformed JSON.** They pin how the gateway
+  reads what it doesn't control:
+  - **Framing:** `internal/usage/framing_test.go` meters an OpenAI, an
+    Anthropic and a Gemini stream framed eight ways: CRLF, `data:` without its
+    space, comment lines between events, one event's data over two lines, a
+    last event without its blank line or line break, and all of them at once.
+    Each is read whole and one byte at a time. The client gets the upstream's
+    exact bytes, and the usage is the plainly written stream's.
+  - **Malformed provider data:** a data line that isn't JSON, between valid
+    events, is skipped in every format, and an Anthropic body that isn't JSON
+    or has no usage yields none.
+  - **Malformed client JSON,** in `cmd/gateway/edge_test.go`: a paid route
+    answers `400 unknown_model` before the provider and refunds the rate-limit
+    charge in full, and free Ollama gets the body byte for byte, with its
+    answer passed back and a row costing 0.
 - **The whole stack in compose.** From the repo root,
   `docker compose up -d --build --wait` builds both images and starts
   Postgres, the two Redis, the migration, the mock provider, the gateway,
