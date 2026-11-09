@@ -47,6 +47,43 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **The whole stack in compose.** From the repo root,
+  `docker compose up -d --build --wait` builds both images and starts
+  Postgres, the two Redis, the migration, the mock provider, the gateway,
+  Prometheus and Grafana, with nothing exported and no keys. The root
+  `compose.yaml` includes `deployments/docker-compose.yml`, so both entry
+  points are the one project, `llm-gateway`, with the same containers and the
+  same `pgdata` volume, and the Makefile targets work as before.
+  - **The gateway** runs `deployments/config.compose.yaml`. The four paid
+    providers point at the `mockprovider` service, and `ollama` at the Mac's
+    Ollama through `host.docker.internal:11434`. It starts once `migrate` has
+    exited 0 and both Redis are healthy.
+  - **Ports:** only the gateway's 8080 is published, on `127.0.0.1`. Inside
+    its container the gateway binds `0.0.0.0`. The metrics port, 9091, and the
+    mock's 9090 stay on the compose network. A gateway on the host wants 8080
+    too, so `docker compose stop gateway` before `make run-mock`.
+  - **The admin key** is `GATEWAY_ADMIN_KEY`, or the mock's key when that is
+    unset, for the gateway and Prometheus alike. Prometheus now reads it from
+    an inline compose config, not a secret, since Compose refuses to start
+    when a secret's variable is unset. `make obs-up` no longer sets the
+    default itself.
+  - **Prometheus** scrapes two targets: `gateway:9091`, the compose gateway,
+    and `host.docker.internal:9091`, a gateway on the host. Normally one of
+    them is down.
+  - **`.env`:** from the root, Compose interpolates from the root `.env`, and
+    with `-f deployments/docker-compose.yml`, as the Makefile runs it, from
+    `deployments/.env` only. The file interpolates only the passwords and the
+    admin key, and writes every in-network URL out, so a `.env` with
+    `127.0.0.1` URLs changes nothing inside the stack.
+  - **Checked live:** `/ready` was 200 with `postgres`, `redis` and
+    `redis_budget`. Streamed and non-streamed requests in all four formats got
+    200, each with its usage row. One `/ollama` request from the container got
+    200 from `qwen3.5:9b` on the Mac's `127.0.0.1`, with no `OLLAMA_HOST`
+    change. Prometheus scraped the compose gateway, and after
+    `docker compose stop gateway`, one started with `make run-mock`.
+  - **Memory:** the in-image `go build` peaks at about 1.2 GB. A rebuild with
+    the whole stack up has been OOM-killed on Colima's default 2 GiB VM, so
+    stop Prometheus and Grafana first, or give the VM more memory.
 - **`scripts/seed.sh`.** It creates three test tenants through the admin API
   and prints `name<TAB>tenant_id<TAB>key` for each on stdout:
   - `seed-default`, with the column defaults
@@ -85,8 +122,8 @@ API, cost included, in all 53 comparisons.
   the image's `GATEWAY_CONFIG` points. Without one, the gateway exits naming
   that path. `.dockerignore` lets in only `go.mod`, `go.sum`, `cmd/` and
   `internal/`, so `.env`, `config.local.yaml` and `.git` never reach a build.
-  Unpacked, the images are about 31 MB and 12 MB. Compose builds them later
-  this week.
+  Unpacked, the images are about 31 MB and 12 MB. The compose stack builds
+  both.
 - **Week 6 checkpoint closed.** `TestObservabilityCheckpoint` in
   `cmd/gateway/observability_test.go`, through the real router against a real
   Postgres and Redis, sends a fixed mix of requests for two tenants to a mock

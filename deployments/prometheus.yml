@@ -9,13 +9,15 @@ global:
 scrape_configs:
   - job_name: gateway
     # /metrics needs the admin key, as a Bearer token. The file is a compose
-    # secret that docker-compose.yml fills from GATEWAY_ADMIN_KEY, so the key
-    # never lands in git. Prometheus reads it again on every scrape.
+    # config that docker-compose.yml fills from GATEWAY_ADMIN_KEY, or from the
+    # mock's key when that is unset, so the key never lands in git. Prometheus
+    # reads it again on every scrape.
     authorization:
       type: Bearer
       credentials_file: /run/secrets/gateway_admin_key
     static_configs:
-      # The gateway on your Mac, where `make run` starts it; host.docker.internal
-      # is the Mac as a container sees it. Week 7 runs the gateway in compose,
-      # and this becomes gateway:9091.
-      - targets: ["host.docker.internal:9091"]
+      # The gateway in compose, by its service name over the compose network,
+      # and the gateway on your Mac, where `make run` starts it;
+      # host.docker.internal is the Mac as a container sees it. Normally only
+      # one of the two runs, so the other target is down.
+      - targets: ["gateway:9091", "host.docker.internal:9091"]

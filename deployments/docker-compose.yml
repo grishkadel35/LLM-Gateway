@@ -1,11 +1,23 @@
-# Local dev stack. Week 3: Postgres and Redis. Week 6 adds Prometheus and
-# Grafana; later weeks add the gateway itself.
+# Local dev stack: Postgres, two Redis, the gateway with its migration and a
+# mock provider, and Prometheus and Grafana. There are two ways to run it.
 #
-#   make db-up      # start Postgres and Redis and wait until both are healthy
+# All in compose, from the repo root (compose.yaml there includes this file):
+#
+#   docker compose up -d --build --wait   # build the images and start everything
+#   docker compose stop                   # stop everything, removing nothing
+#
+# Or the gateway on your Mac, with only its dependencies in compose:
+#
+#   make db-up      # start Postgres and the two Redis and wait until they are healthy
 #   make migrate    # apply schema migrations
 #   make obs-up     # start Prometheus and Grafana and wait until both are healthy
-#   make obs-down   # stop those two
+#   make mock       # the mock provider, in its own terminal
+#   make run-mock   # the gateway, in another
+#   make obs-down   # stop Prometheus and Grafana
 #   make db-down    # stop everything (Postgres data survives in the pgdata volume)
+#
+# The gateway in compose and a gateway on your Mac both want port 8080, so run
+# one at a time: `docker compose stop gateway` before `make run-mock`.
 
 # Without a name, Compose would call the project "deployments", after this
 # file's directory.
@@ -109,6 +121,82 @@ services:
       timeout: 5s
       retries: 15
 
+  migrate:
+    # Applies the schema and exits; the gateway starts once it has succeeded.
+    # The gateway's image holds /migrate too, so this service reuses the image
+    # the gateway builds, by name, and builds nothing itself.
+    image: llm-gateway:dev
+    # The name exists only as a local build. Without this, a first `up --build`
+    # tries Docker Hub for it before building, and prints a pull error.
+    pull_policy: never
+    entrypoint: ["/migrate"]
+    environment:
+      # Written out, with only the password interpolated: a .env copied from
+      # .env.example sets DATABASE_URL to 127.0.0.1, which inside a container is
+      # the container itself.
+      DATABASE_URL: postgres://gateway:${POSTGRES_PASSWORD:-gateway}@postgres:5432/gateway?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  mockprovider:
+    # Fake OpenAI, Groq, Anthropic and Gemini APIs, so the gateway below runs
+    # with no real keys. No published port: only the gateway talks to it, over
+    # the compose network. `make mock` starts the same server on the host.
+    image: llm-gateway-mock:dev
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+      target: mockprovider
+
+  gateway:
+    # Like migrate and mockprovider it has no healthcheck: the images are
+    # distroless, with no shell or wget to run one. `--wait` only waits for it to
+    # be running; GET /ready is the real check.
+    image: llm-gateway:dev
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+      target: gateway
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      redis-budget:
+        condition: service_healthy
+      mockprovider:
+        condition: service_started
+    environment:
+      # Dev-only default, like Postgres'. The port below is bound to loopback,
+      # so nothing off this machine can reach the admin API. Prometheus is given
+      # the same key (see the configs block below).
+      GATEWAY_ADMIN_KEY: ${GATEWAY_ADMIN_KEY:-mock-admin-key-for-local-testing-only}
+      # These URLs are written out, with only the passwords interpolated. A .env
+      # copied from .env.example sets DATABASE_URL, REDIS_URL, BUDGET_REDIS_URL
+      # and OLLAMA_BASE_URL to 127.0.0.1, which inside a container is the
+      # container itself.
+      DATABASE_URL: postgres://gateway:${POSTGRES_PASSWORD:-gateway}@postgres:5432/gateway?sslmode=disable
+      REDIS_URL: redis://:${REDIS_PASSWORD:-gateway}@redis:6379/0
+      BUDGET_REDIS_URL: redis://:${REDIS_PASSWORD:-gateway}@redis-budget:6379/0
+      # config.compose.yaml names it as every mock provider's key. The mock only
+      # checks that a key is present, so any value works.
+      MOCK_API_KEY: mock
+      # Ollama runs on your Mac, not in compose.
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    # Colima already resolves host.docker.internal, for the Ollama URL above;
+    # Linux Docker needs this line.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # The image has no config of its own; this one points the providers at the
+      # mock.
+      - ./config.compose.yaml:/etc/llm-gateway/config.yaml:ro
+    # Bound to loopback like Postgres. The metrics port, 9091, is not published:
+    # Prometheus reaches it over the compose network.
+    ports:
+      - "127.0.0.1:8080:8080"
+
   prometheus:
     # The newest stable release on github.com/prometheus/prometheus/releases,
     # checked 2026-10-31.
@@ -116,11 +204,13 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     # The gateway's admin key, which /metrics requires, as a file at
-    # /run/secrets/gateway_admin_key. See the secrets block below.
-    secrets:
-      - gateway_admin_key
-    # prometheus.yml scrapes the gateway on the host. Colima already resolves
-    # host.docker.internal; Linux Docker needs this line.
+    # /run/secrets/gateway_admin_key. See the configs block below.
+    configs:
+      - source: gateway_admin_key
+        target: /run/secrets/gateway_admin_key
+    # prometheus.yml scrapes the gateway on the host as well as the one in
+    # compose. Colima already resolves host.docker.internal; Linux Docker needs
+    # this line.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # The mock provider holds 9090 on the host, so Prometheus is on 9092. Bound
@@ -167,8 +257,11 @@ services:
 volumes:
   pgdata:
 
-secrets:
-  # Read from your environment when the container is created, so the key is
-  # never in git or in a file in the repo. `make obs-up` supplies it.
+configs:
+  # Built from your environment when the container is created, so the key is
+  # never in git or in a file in the repo. With GATEWAY_ADMIN_KEY unset it is
+  # the mock's key, which is also the gateway's default. A config, not a secret:
+  # Compose stops `up` when a secret's variable is unset, and this has to start
+  # without one.
   gateway_admin_key:
-    environment: GATEWAY_ADMIN_KEY
+    content: "${GATEWAY_ADMIN_KEY:-mock-admin-key-for-local-testing-only}"

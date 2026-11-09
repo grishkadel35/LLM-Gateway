@@ -1,0 +1,19 @@
+# Lets `docker compose up` work from the repo root: the stack is
+# deployments/docker-compose.yml, and its header says how to run it. This file
+# and that one with -f, as the Makefile runs it, are both the project
+# llm-gateway, with the same containers and the same pgdata volume.
+#
+# The two read different .env files for the ${...} defaults in that file:
+#   docker compose                                        the root .env, then
+#                                                         deployments/.env for
+#                                                         what it leaves unset
+#   docker compose -f deployments/docker-compose.yml      deployments/.env only
+# The file interpolates only POSTGRES_PASSWORD, REDIS_PASSWORD,
+# GRAFANA_ADMIN_PASSWORD and GATEWAY_ADMIN_KEY, and writes every in-network URL
+# out, so the 127.0.0.1 URLs in a .env copied from .env.example change none of
+# them. To have both entry points agree on a password or the key, set it in your
+# shell's environment, which both read ahead of any .env.
+name: llm-gateway
+
+include:
+  - deployments/docker-compose.yml

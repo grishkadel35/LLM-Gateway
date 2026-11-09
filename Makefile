@@ -54,13 +54,11 @@ db-down:
 
 # Prometheus and Grafana, with the dashboard from deployments/grafana.
 # Prometheus scrapes the gateway's /metrics with the admin key: your
-# GATEWAY_ADMIN_KEY, or the mock's when that is unset. The default applies in
-# this recipe only, so `make run` never gets one. Compose doesn't notice a
-# changed key, so both containers are recreated each time; Prometheus keeps
-# its data through that.
+# GATEWAY_ADMIN_KEY, or the mock's when that is unset, a default the compose
+# file supplies. Compose doesn't notice a changed key, so both containers are
+# recreated each time; Prometheus keeps its data through that.
 obs-up:
-	GATEWAY_ADMIN_KEY=$${GATEWAY_ADMIN_KEY:-$(MOCK_ADMIN_KEY)} \
-		docker compose -f deployments/docker-compose.yml up -d --wait \
+	docker compose -f deployments/docker-compose.yml up -d --wait \
 		--force-recreate prometheus grafana
 
 # Stops Prometheus and Grafana; Postgres and Redis keep running.

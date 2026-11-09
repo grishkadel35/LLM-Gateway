@@ -1,0 +1,61 @@
+# The gateway's config inside the compose stack: docker-compose.yml mounts this
+# file at /etc/llm-gateway/config.yaml, where the image looks for it. Like
+# config.mock.yaml it points the four paid providers at the mock, which is the
+# mockprovider service, so the stack runs with no real keys and no spend.
+# Ollama is the exception: it is free, and it is the one on your Mac.
+
+port: 8080
+
+# Inside the container. Loopback here would be the container's own, which
+# nothing outside it can reach, so the gateway listens on every interface. Only
+# 8080 is published, and on the host's loopback, so nothing off this machine can
+# reach the gateway. metrics_port is not published; Prometheus gets to it over
+# the compose network.
+host: 0.0.0.0
+metrics_port: 9091
+
+providers:
+  openai:
+    url: http://mockprovider:9090
+    key: ${MOCK_API_KEY}
+    auth: bearer
+    format: openai
+
+  # The /openai base path mirrors Groq's real URL; the mock serves Groq's
+  # usage quirk there.
+  groq:
+    url: http://mockprovider:9090/openai
+    key: ${MOCK_API_KEY}
+    auth: bearer
+    format: openai
+
+  anthropic:
+    url: http://mockprovider:9090
+    key: ${MOCK_API_KEY}
+    auth: x-api-key
+    format: anthropic
+    headers:
+      anthropic-version: "2023-06-01"
+
+  gemini:
+    url: http://mockprovider:9090
+    key: ${MOCK_API_KEY}
+    auth: x-goog-api-key
+    format: gemini
+
+  # Ollama on your Mac, not in compose: keyless and free, though clients still
+  # need a gateway key. host.docker.internal is the Mac as a container sees it.
+  # The settings are config.yaml's defaults, written out because the container
+  # sets none of the OLLAMA_* variables except OLLAMA_BASE_URL.
+  ollama:
+    url: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    timeout: 120
+    auth: none
+    format: openai
+    free: true
+    max_concurrency: 1
+    queue_timeout: 30
+    health_path: /api/tags
+    # Off: groq here is the mock, so there is nothing real to fall back to.
+    fallback:
+      enabled: false
