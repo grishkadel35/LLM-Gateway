@@ -16,6 +16,9 @@ config.local.yaml
 # The example holds placeholders only, so it is committed.
 !.env.example
 
+# The Python virtual environment the README's Quick start makes
+/.venv/
+
 # Editor and OS noise
 .DS_Store
 .idea/

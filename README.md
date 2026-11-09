@@ -13,17 +13,19 @@ provider is a block of YAML, not code.
 > **⚠️ Keep it on loopback for now.** Every provider route requires a tenant
 > key and is held to the tenant's budget, but there is no TLS yet, and
 > `/metrics`, on a port of its own, has only the admin key to guard it.
-> Prometheus holds that key in a compose secret, and the same key creates
+> Prometheus holds that key in a compose config, and the same key creates
 > tenants and mints keys. So the gateway binds to `127.0.0.1` by default, and
-> `metrics_port` binds to the same `host`. Binding wider is your call to make
-> deliberately. Whether a Prometheus container can reach a gateway on loopback
-> depends on the container runtime; see [The dashboard](#the-dashboard).
+> `metrics_port` binds to the same `host`. (In compose it binds `0.0.0.0`
+> inside its container, and only 8080 is published, on the host's `127.0.0.1`.)
+> Binding wider is your call to make deliberately. Whether a Prometheus
+> container can reach a gateway on loopback depends on the container runtime;
+> see [The dashboard](#the-dashboard).
 
 ## Project status
 
 **Last updated:** 2026-11-09
-**Stage:** Weeks 1 to 6 of 8 complete, checkpoints closed; Week 7
-(Docker, testing, CI/CD) is under way. Every provider
+**Stage:** Weeks 1 to 7 of 8 complete; Week 7's checkpoint awaits a green CI
+run on GitHub and its review. Every provider
 request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
@@ -39,14 +41,38 @@ budget can't cover that gets `402`. Of 50 requests sent at once against room for
 the usage rows. Each request on a provider route now also leaves one JSON line
 that names its tenant, provider and model and carries its tokens and cost.
 Prometheus metrics by tenant and model are served on a port of their own,
-behind the admin key, `GET /ready` checks Postgres and Redis, and `make obs-up`
-starts Prometheus and Grafana with a provisioned dashboard. In a 15-minute
-live run against Groq, Gemini and Ollama, every panel of the dashboard showed
-data, and the metrics agreed with the responses, the usage rows and the admin
-API, cost included, in all 53 comparisons.
+behind the admin key, and `GET /ready` checks Postgres and both Redis. In a
+15-minute live run against Groq, Gemini and Ollama, every panel of the
+dashboard showed data, and the metrics agreed with the responses, the usage
+rows and the admin API, cost included, in all 53 comparisons. Since then one
+command, `docker compose up -d --build --wait` from the repo root, starts
+everything: Postgres, a Redis for the rate limiter and the cache, another that
+never evicts for the budgets, the gateway on a mock provider (so with no keys
+and no spend), Prometheus and Grafana with a provisioned dashboard. A paid
+response whose final usage the gateway never saw, because the client left or
+the provider went quiet, costs what its budget held for it, and its usage row
+says `usage_complete` is false. CI runs golangci-lint, the tests against the
+compose Postgres and Redis, and the whole stack, seeded and checked by
+`scripts/smoke.sh`.
 
 ### What changed
 
+- **Week 7 checkpoint: a fresh clone, and the docs.** A `git clone` of the
+  repo, with no `.env` and nothing exported, ran as a compose project of its
+  own. `docker compose up -d --build --wait` started all eight services, and
+  `scripts/seed.sh` and `scripts/smoke.sh` passed. An `/ollama` request
+  reached Ollama on the Mac. The dashboard showed data in every panel but
+  Fallbacks, since compose has no fallback route. act ran CI's `lint` and `test`
+  jobs green.
+  - **Docs:** the [Quick start](#quick-start) now starts the whole stack on
+    the mock, with a curl and an OpenAI SDK script, and every command in it
+    was run as written. It also lists the stack's services and ports, and the
+    two ways to run it.
+    - [Database](#database) has the two Redis, AUTH, TLS and the guard.
+    - The reference sections have incomplete usage.
+    - [Tests](#tests) says where each item of the roadmap's test list lives.
+    - [CI](#ci) has the three jobs, and how to run two of them locally with
+      act.
 - **CI runs the whole stack, with a smoke test.** CI's jobs are now `lint`,
   `test` and `compose`.
   - **`test`:** in place of GitHub's service containers, it starts Postgres
@@ -1175,9 +1201,191 @@ reading the dashboard:
 - A counter's series appears with its first event, so a rate doesn't count
   that first event, such as the first fallback.
 
+### Week 7 deliverables — Docker, testing, CI/CD ✅
+
+Goal: one command starts the whole stack, on a mock provider and with no keys;
+every item of the roadmap's test list has a test, and the README says where;
+and CI runs lint, the tests on the compose services and the whole stack with a
+smoke test.
+
+- [x] `deployments/Dockerfile` — one builder on go.mod's Go line and two
+  targets on distroless static, as uid 65532: `gateway`, which holds
+  `/gateway` and `/migrate`, and `mockprovider`. No config is baked in, and
+  `.dockerignore` is an allowlist
+- [x] The whole stack in compose — from the repo root, `docker compose up -d
+  --build --wait` starts Postgres, both Redis, a one-shot migration, the mock
+  provider, the gateway, Prometheus and Grafana, with nothing exported. The
+  gateway runs `deployments/config.compose.yaml`: it binds `0.0.0.0` inside
+  its container, and only 8080 is published, on `127.0.0.1`
+- [x] Ollama from the compose gateway — `OLLAMA_BASE_URL` is
+  `http://host.docker.internal:11434`, with `extra_hosts` for Linux Docker.
+  Under Colima, Ollama on the Mac's `127.0.0.1` answers, so no `OLLAMA_HOST`
+  change is needed
+- [x] Redis AUTH and TLS — both Redis take `REDIS_PASSWORD`, and the URLs carry
+  it. `rediss://` keeps go-redis's TLS config, which a live run with a scratch
+  CA proved. Compose itself stays plaintext
+- [x] Redis caps, and a Redis of its own for budgets — `redis` at 256 MB under
+  `allkeys-lru`, `redis-budget` at 64 MB under `noeviction`, and a startup
+  guard that refuses a ledger Redis that has a cap and can evict. `/ready`
+  checks both
+- [x] `scripts/seed.sh` — three test tenants, with their keys on stdout
+- [x] Incomplete usage keeps its hold, recorded — a paid response whose final
+  usage the gateway never saw costs what its budget held, with
+  `usage_complete` false on its row, the request line and the usage report's
+  `incomplete_requests`. This settled the roadmap's open question about a
+  client that leaves mid-stream
+- [x] The test suite — [Tests](#tests) maps each item of the roadmap's list to
+  its test files and functions. Week 7 added the SSE framing tests, the
+  malformed-JSON tests, and the cut-short and no-usage tests
+- [x] CI expanded — three jobs, `lint` (golangci-lint v2.15.0 and
+  `.golangci.yml`), `test` (on the compose Postgres and both Redis) and
+  `compose` (the whole stack, seeded and checked by `scripts/smoke.sh`). See
+  [CI](#ci)
+
+[Quick start](#quick-start) starts the stack, [Database](#database) has the two
+Redis, and [The budget contract](#the-budget-contract) has incomplete usage.
+
 ## Quick start
 
-Start Postgres and Redis and create the schema (see [Database](#database)):
+There are two paths. The first runs the whole stack in Docker on a mock
+provider, with no keys and no spend. The second runs the gateway on your
+machine against the real providers.
+
+### The whole stack, on the mock provider
+
+You need Docker with Compose 2.23.1 or newer, curl and jq, and Python 3 for
+the SDK snippet. On Colima, give the VM 4 GiB (see **Memory** below). From the
+repo root, with nothing exported and no `.env`:
+
+```sh
+docker compose up -d --build --wait
+SEED=$(scripts/seed.sh)
+export KEY=$(awk -F'\t' '$1 == "seed-default" { print $3 }' <<<"$SEED")
+```
+
+The first command builds both images and starts everything. The gateway's image
+has no shell to run a healthcheck in, so `--wait` only waits for it to be
+running; the second command waits up to 60 s for `GET /ready`, then makes three
+test tenants through the admin API and keeps what it prints on stdout: one line
+for each, with its name, its ID and its gateway key, separated by tabs. The
+third takes `seed-default`'s key, the third column of its line, into `KEY`.
+`seed-limited` and `seed-budget` have a rate limit and a budget small enough to
+show a `429` and a `402`; the header of `scripts/seed.sh` has the numbers. Each
+run of the script makes three new tenants.
+
+The script uses the mock setup's admin key, which is also the compose gateway's
+default, so nothing needs setting. If you have set `GATEWAY_ADMIN_KEY`, in a
+`.env` say, export it in the shell that runs the script too: Compose reads the
+`.env`, and the script reads only its environment.
+
+Send a request with the key. The gateway checks it, strips it, and forwards the
+request to the mock with the provider key it holds:
+
+```sh
+curl -sS http://127.0.0.1:8080/openai/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o-mini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+The mock gives every request the same reply, with the same usage: 20 prompt
+tokens, 5 of them cached, and 10 output.
+
+```json
+{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"This is a deterministic reply from the llm-gateway mock provider.","role":"assistant"}}],"created":0,"id":"chatcmpl-mock","model":"gpt-4o-mini","object":"chat.completion","usage":{"completion_tokens":10,"prompt_tokens":20,"prompt_tokens_details":{"cached_tokens":5},"total_tokens":30}}
+```
+
+`gpt-4o-mini` is in the gateway's price table (`internal/pricing`): a paid route
+answers a model it has no price for with `400 unknown_model`. `max_tokens` is
+small because the gateway reserves the most a request could cost against the
+tenant's budget before it goes on, and with no `max_tokens` that is the model's
+whole maximum output (see [The budget contract](#the-budget-contract)).
+
+With the OpenAI Python SDK, set `base_url` to the gateway's `/openai/v1` and
+pass the gateway key as the API key. Save this as `hello.py`:
+
+```python
+import os
+
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key=os.environ["KEY"])
+
+reply = client.chat.completions.create(
+    model="gpt-4o-mini",
+    max_tokens=16,
+    messages=[{"role": "user", "content": "hi"}],
+)
+print(reply.choices[0].message.content)
+```
+
+Run it from a virtual environment, since Homebrew's Python and most Linux
+distributions' refuse a global `pip install`:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install openai
+.venv/bin/python hello.py
+```
+
+It prints the mock's text, `This is a deterministic reply from the llm-gateway
+mock provider.` Each request leaves one JSON line in `docker compose logs
+gateway`, a row in `usage_logs`, and a point on the Grafana dashboard at
+`http://127.0.0.1:3000/d/llm-gateway`.
+
+**Memory.** The `go build` inside the gateway's image peaks at about 1.2 GB.
+With the whole stack up, a rebuild on Colima's default 2 GiB VM has been
+OOM-killed, so give the VM 4 GiB (`colima stop`, then `colima start --memory
+4`), or stop Prometheus and Grafana while you build (`docker compose stop
+prometheus grafana`). Colima also shares only your home folder with its VM, so
+clone the repo under it: from a clone outside it, the compose file's
+bind-mounted config files arrive as empty directories.
+
+### The stack's services, and two ways to run it
+
+Every port is bound to `127.0.0.1`, so nothing off your machine can reach the
+stack, and its dev-only default passwords are safe for that reason. These ports
+must be free:
+
+| Service        | What it is                                                                                                                        | On the host                                    |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `postgres`     | Postgres 18; its data is in the `pgdata` volume                                                                                   | 5432                                           |
+| `redis`        | Redis 8 for the rate limiter and the cache (`REDIS_URL`): 256 MB, `allkeys-lru`                                                   | 6379                                           |
+| `redis-budget` | Redis 8 for the budget ledgers (`BUDGET_REDIS_URL`): 64 MB, `noeviction`                                                          | 6380                                           |
+| `migrate`      | applies the schema, then exits                                                                                                    | none                                           |
+| `mockprovider` | fake OpenAI, Groq, Anthropic and Gemini APIs                                                                                      | none; port 9090 on the compose network         |
+| `gateway`      | the gateway, on `deployments/config.compose.yaml`: the four paid providers go to the mock, and `ollama` to the Ollama on your Mac | 8080; the metrics port, 9091, is not published |
+| `prometheus`   | scrapes `gateway:9091`, and `host.docker.internal:9091` for a gateway on your machine                                             | 9092                                           |
+| `grafana`      | the dashboard, with anonymous viewing                                                                                             | 3000                                           |
+
+There are two ways to run it. Both are the one Compose project, `llm-gateway`,
+with the same containers and the same `pgdata` volume:
+
+- **Everything in compose,** as above. `docker compose stop` stops everything
+  and removes nothing, `docker compose down` removes the containers and keeps
+  the database, and `docker compose down -v` deletes the database too.
+- **The gateway on your machine, with only its dependencies in compose.**
+  `make db-up` starts Postgres and both Redis and waits until they are healthy,
+  `make migrate` applies the schema, and then either `make mock` and
+  `make run-mock` (see [Without API keys](#without-api-keys)) or `make run` with
+  real keys (below). `make obs-up` adds Prometheus and Grafana.
+
+The gateway in compose and one on your machine both want port 8080, so run one
+at a time: `docker compose stop gateway` before `make run-mock` or `make run`,
+and `docker compose start gateway` to bring it back.
+
+Compose interpolates only `POSTGRES_PASSWORD`, `REDIS_PASSWORD`,
+`GRAFANA_ADMIN_PASSWORD` and `GATEWAY_ADMIN_KEY`, each with a dev-only default,
+from your shell or from a `.env`: the repo root's for `docker compose`, and
+`deployments/.env` for the Makefile's `docker compose -f
+deployments/docker-compose.yml`. The shell wins over both. Every URL inside the
+stack is written out in the file, so the `127.0.0.1` URLs in a `.env` copied
+from [`.env.example`](.env.example) change none of them.
+
+### With real provider keys
+
+To run the gateway on your machine against the real providers, start Postgres
+and the two Redis and create the schema (see [Database](#database)):
 
 ```sh
 make db-up migrate
@@ -1199,6 +1407,8 @@ make run
 A provider key that isn't set, a missing or weak admin key, or an unreachable
 database or Redis is a startup error, not a surprise on the first request. To
 run with fewer providers, delete the ones you don't need from `config.yaml`.
+`make run` can't start while the compose gateway holds port 8080:
+`docker compose stop gateway` first.
 
 Create a tenant with the admin key. The response holds the tenant's first
 gateway key (`key.plaintext`); it is shown once, so keep it:
@@ -1222,7 +1432,7 @@ curl http://127.0.0.1:8080/openai/v1/chat/completions \
 curl http://127.0.0.1:8080/anthropic/v1/messages \
   -H "X-Api-Key: gw_..." \
   -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-4","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"claude-haiku-4-5","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
 With an SDK, override the base URL and pass the gateway key as the API key:
@@ -1235,6 +1445,10 @@ client = OpenAI(base_url="http://127.0.0.1:8080/openai/v1", api_key="gw_...")
 
 ### Without API keys
 
+This is the stack above with the gateway and the mock on your machine, and only
+Postgres and Redis in compose. Stop the compose gateway first if it is up
+(`docker compose stop gateway`): both want port 8080.
+
 `cmd/mockprovider` serves fake OpenAI, Groq, Anthropic and Gemini APIs on one port,
 and `config.mock.yaml` points the gateway's providers at it. Nothing leaves the
 machine and nothing costs money:
@@ -1246,7 +1460,8 @@ make run-mock        # terminal 2: gateway on 127.0.0.1:8080
 ```
 
 `run-mock` sets a fixed admin key, `mock-admin-key-for-local-testing-only`, so
-creating a tenant needs no setup:
+creating a tenant needs no setup (`scripts/seed.sh` uses the same key, and makes
+three at once):
 
 ```sh
 curl -X POST http://127.0.0.1:8080/admin/tenants \
@@ -1282,13 +1497,13 @@ in-process with `httptest.NewServer(mockprovider.Handler())`.
 
 ### Database
 
-Postgres and Redis run in Docker (any runtime works; on macOS, `brew install
-colima docker docker-compose` then `colima start` is enough):
+Postgres and the two Redis run in Docker (any runtime works; on macOS, `brew
+install colima docker docker-compose` then `colima start` is enough for these):
 
 ```sh
-make db-up      # Postgres 18 on 127.0.0.1:5432 and Redis 8 on 127.0.0.1:6379, waits until healthy
+make db-up      # Postgres 18 on 127.0.0.1:5432, Redis 8 on 6379 and a second Redis 8 on 6380, waits until healthy
 make migrate    # apply pending migrations
-make db-down    # stop everything, Prometheus and Grafana too; Postgres data survives in the llm-gateway_pgdata volume
+make db-down    # take down everything in the compose file, the gateway, Prometheus and Grafana too; Postgres data survives in the llm-gateway_pgdata volume
 ```
 
 Migrations live in `internal/db/migrations` and are embedded into the binary,
@@ -1296,28 +1511,66 @@ so a build always carries the schema its code expects. `make migrate` targets
 the compose database; pass `DATABASE_URL=postgres://...` to use another.
 
 Redis holds the rate-limit buckets (Week 3), the cached responses (Week 4) and
-the budget ledgers (Week 5). It has no volume and takes no snapshots
-(`--save ''`), because all three can be lost: losing the buckets only refills
-every tenant, losing a cached response only makes the next identical request a
-miss, and a lost ledger is rebuilt from `usage_logs` (see
-[The budget contract](#the-budget-contract)). A snapshot would be worse than
-none: restored after a crash, it would bring back an older, lower spend. It has
-no password either, so binding to loopback is what keeps it private, which
-matters more now that cached answers sit in it unencrypted until their TTL ends.
+the budget ledgers (Week 5), in two instances:
 
-The gateway finds it through `REDIS_URL`: `make run` and `make run-mock` point
-it at this one (pass `REDIS_URL=redis://...` to use another). The gateway pings
-it at startup, so a missing or unreachable Redis stops it there instead of
-leaving every tenant unlimited.
+- `redis` (`REDIS_URL`, host port 6379) holds the buckets and the cache, capped
+  at 256 MB under `allkeys-lru`. An evicted entry is only a miss, and an evicted
+  bucket starts full again.
+- `redis-budget` (`BUDGET_REDIS_URL`, host port 6380) holds the budget ledgers
+  and their missed counters, capped at 64 MB under `noeviction`. Redis never
+  drops one of their keys: at the cap it refuses writes, so a reservation
+  fails, and a paid request gets `503 budget_unavailable`, never an unchecked
+  budget.
+
+Neither has a volume or takes snapshots (`--save ''`), because everything in
+them can be lost: losing the buckets only refills every tenant, losing a cached
+response only makes the next identical request a miss, and a lost ledger is
+rebuilt from `usage_logs` (see [The budget contract](#the-budget-contract)). A
+snapshot would be worse than none: restored after a crash, it would bring back
+an older, lower spend.
+
+- **AUTH.** Both take the password in `REDIS_PASSWORD`, `gateway` by default: a
+  dev-only default, like Postgres', safe because both ports are bound to
+  loopback. The URLs carry it, as in `redis://:gateway@127.0.0.1:6379/0`, and
+  so do the Makefile's and [`.env.example`](.env.example)'s. If you set
+  `REDIS_PASSWORD`, put the same password in both URLs. Cached answers sit in
+  `redis` unencrypted until their TTL ends, so the password and the loopback
+  binding are what keep it private.
+- **TLS.** A `rediss://` URL, in either variable, keeps go-redis's TLS config:
+  the server's certificate is verified against the URL's host, with TLS 1.2 as
+  the minimum. The gateway's container trusts the image's CA bundle, so a Redis
+  behind a private CA needs that CA in a directory that `SSL_CERT_DIR` names.
+  Without it the gateway exits 1 at startup with `connecting to Redis with
+  REDIS_URL: tls: failed to verify certificate: x509: certificate signed by
+  unknown authority`, naming `BUDGET_REDIS_URL` instead when that is the one on
+  TLS. A live run against a TLS-only Redis behind a scratch CA showed both: with
+  the CA in `SSL_CERT_DIR`, the container started and `/ready` was 200. Compose
+  itself stays plaintext, since its traffic never leaves the Docker host.
+- **The ledger's Redis.** With `BUDGET_REDIS_URL` unset, the ledger shares
+  `REDIS_URL`'s Redis, so that one must be uncapped or under `noeviction`.
+  Either way, at startup the gateway reads `INFO memory` from the ledger's
+  Redis and refuses to start if it has a memory cap and any policy but
+  `noeviction`, with an error that says to point `BUDGET_REDIS_URL` at a Redis
+  that doesn't evict. When it can't read INFO, as on some managed Redis
+  services, it logs a warning and starts. `/ready` has a `redis_budget` check
+  when the ledger has a Redis of its own.
+
+The gateway pings each Redis at startup, so a missing or unreachable one stops
+it there instead of leaving every tenant unlimited. Its errors name the
+variable, never the URL, which carries the password. `make run` and
+`make run-mock` point both variables at these two (pass `REDIS_URL=redis://...`
+or `BUDGET_REDIS_URL=redis://...` to use others).
 
 The Postgres tests only run when `DATABASE_URL` is set, and each creates and
 drops its own throwaway database, so they never touch dev data. The Redis
-tests likewise need `REDIS_URL`; they share one Redis, each under its own
-random tenant ID:
+tests likewise need `REDIS_URL`, and the budget ledger's own Redis tests also
+`BUDGET_REDIS_URL`; they share the Redis, each under its own random tenant ID.
+`make test` sets all three for the compose stack, and spelled out it is:
 
 ```sh
 DATABASE_URL='postgres://gateway:gateway@127.0.0.1:5432/gateway?sslmode=disable' \
-REDIS_URL='redis://127.0.0.1:6379/0' go test -race ./...
+REDIS_URL='redis://:gateway@127.0.0.1:6379/0' \
+BUDGET_REDIS_URL='redis://:gateway@127.0.0.1:6380/0' go test -race ./...
 ```
 
 Without them, `go test ./...` skips those tests and needs nothing running.
@@ -1538,30 +1791,33 @@ gets `402` with `X-Gateway-Provider: groq` and `X-Gateway-Fallback: true`
 instead of Groq's answer, and a mapped model with no price gets
 `400 unknown_model` (see [The budget contract](#the-budget-contract)).
 
-**Docker.** The gateway has no compose service yet (Week 7). Once it runs in a
-container, set `OLLAMA_BASE_URL=http://host.docker.internal:11434` and add
-`extra_hosts: ["host.docker.internal:host-gateway"]` to its service. Under
-Colima, a container reached a service bound to the Mac's `127.0.0.1` when
-tested (see [The dashboard](#the-dashboard)), so Ollama may not need to listen
-beyond loopback. An earlier test with Ollama found that a container couldn't
-reach it; the cause is unknown, and Ollama's own host checks are one
-possibility. Check Ollama's case in Week 7 before setting `OLLAMA_HOST`
-(Ollama's own setting) to `0.0.0.0`. That exposes Ollama's unauthenticated API
-to the network: bind it to the Colima bridge address or firewall it.
+**Docker.** The gateway in the compose stack reaches your Mac's Ollama through
+`host.docker.internal`: the compose file sets `OLLAMA_BASE_URL` to
+`http://host.docker.internal:11434` and gives the gateway `extra_hosts:
+["host.docker.internal:host-gateway"]`, which Colima doesn't need and Linux
+Docker does. Under Colima, Ollama on the Mac's default `127.0.0.1` answers from
+the container, so no `OLLAMA_HOST` change is needed (checked live on
+2026-11-08: one `/ollama` request from the container got a 200 from
+`qwen3.5:9b`). On Linux Docker, a service bound to `127.0.0.1` isn't reachable
+from a container, since `host-gateway` is the bridge IP, so Ollama there would
+have to listen beyond loopback. Setting Ollama's own `OLLAMA_HOST` to `0.0.0.0`
+exposes its unauthenticated API to the network: bind it to the bridge address
+or firewall it. The compose config leaves `ollama`'s fallback off, since its
+`groq` is the mock.
 
 ## Endpoints
 
 | Path                              | Behavior                                                                                  |
 | --------------------------------- | ----------------------------------------------------------------------------------------- |
 | `GET /health`                     | Always `200`: `{"status":"ok"}`, plus provider checks. Handled locally, no key needed.    |
-| `GET /ready`                      | `200` with `{"status":"ready","checks":{"postgres":"ok","redis":"ok"}}` while Postgres and Redis both answer within a second; otherwise `503` with `"status":"not_ready"` and the failing check `down`. Handled locally, no key needed, and never calls a provider. See [GET /ready](#get-ready). |
+| `GET /ready`                      | `200` with `{"status":"ready","checks":{"postgres":"ok","redis":"ok","redis_budget":"ok"}}` while Postgres and every Redis answer within a second (`redis_budget` is there when `BUDGET_REDIS_URL` is set); otherwise `503` with `"status":"not_ready"` and the failing check `down`. Handled locally, no key needed, and never calls a provider. See [GET /ready](#get-ready). |
 | `GET /metrics`                    | Not on this port: it gets the `404` of the last row. It is served on `metrics_port` (9091 by default), where it needs the admin key. See [Metrics](#metrics). |
 | `/<provider>/...`                 | Needs a gateway key (`401` otherwise) and a metered endpoint (`403` otherwise, see below), within the tenant's tokens-per-minute limit (`429` with `Retry-After` otherwise, see [The 429 contract](#the-429-contract)) and, on a paid provider, with room in its monthly budget for what the request could cost (`402` otherwise, see [The budget contract](#the-budget-contract)). Prefix stripped, forwarded with the provider's key. An eligible repeat may be answered from the cache instead, without reaching the limit, the budget or the provider (see [The cache contract](#the-cache-contract)). |
 | `POST /admin/tenants`             | Admin key. `{"name": "..."}` → `201` with the tenant and its first key.                   |
 | `POST /admin/tenants/{id}/keys`   | Admin key. Issues another key for the tenant → `201`.                                     |
 | `PATCH /admin/tenants/{id}`       | Admin key. Any of `budget_micros` (0 to 1e15 µ$; $50.00 by default), `rate_limit_tokens_per_min` (1 to 2^40) and `default_max_tokens` (1 to 2^31 − 1) → `200` with the tenant; the next request uses them. `400` for an unknown field, a `null`, a non-integer or a value out of range; `404` for an unknown tenant. |
 | `DELETE /admin/keys/{id}`         | Admin key. Revokes the key → `204`; the row stays so past usage still attributes to it.   |
-| `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage.  |
+| `GET /admin/tenants/{id}/usage`   | Admin key. `?from=&to=` (RFC 3339, default this UTC month) → totals and per-model usage, each with `unpriced_requests` (rows with no cost) and `incomplete_requests` (rows whose usage the gateway never saw in full, costed at what the budget held; see [The budget contract](#the-budget-contract)). |
 | `GET /admin/tenants/{id}/budget`  | Admin key. This UTC month's `budget_micros`, `spent_micros` (in-flight reservations included) and `remaining_micros` (never below 0), with `period` and `resets_at`; `404` for an unknown tenant, `503 budget_unavailable` if the ledger can't answer. See [The budget contract](#the-budget-contract). |
 | anything else                     | `404` with a JSON body listing the configured providers.                                  |
 
@@ -1835,11 +2091,16 @@ refuses any other.
     full. Without this, a network outage would use up budgets at the reservation
     rate.
   - **An incomplete response: the reservation,** or the cost of the usage seen
-    so far if that is more. That is a timeout, a stream the client abandoned, or
-    a connection dropped after the request was sent. The provider may have
-    billed it, so it keeps what it reserved, as the rate limiter keeps its
-    charge, and its row's cost is NULL. For an uncapped request, the reservation
-    is the model's maximum output.
+    so far if that is more. That is a stream the client abandoned, a request
+    the provider never answered after it went out (the gateway's `499`, `502`
+    or `504`), or a 2xx that ended without the provider's final usage report.
+    The provider may have billed it, so it keeps what it reserved, as the rate
+    limiter keeps its charge. Its usage row has the tokens seen, `usage_complete`
+    false and that same figure as its cost, and so do the request line and
+    `gateway_cost_micros_total`, so the month's rows add up to the ledger's
+    spend. For an uncapped request, the reservation is the model's maximum
+    output (about $3.84 for `gpt-5.5`), so one cut short holds that much: set
+    `max_tokens` to bound it.
 
   Settlement runs once for each attempt, in a `defer`, so it also runs when the
   proxy aborts a stream and when the client has gone. It holds the response's
@@ -1854,9 +2115,10 @@ refuses any other.
   `resets_at`, with the `tenant_id`. `spent_micros` is the ledger's, rebuilt
   first if it is missing, and asking reserves nothing. It can differ from the
   usage report (`GET /admin/tenants/{id}/usage`), which sums the rows' costs: the
-  ledger also holds reservations in flight, and those kept by requests cut short,
-  whose rows have no cost. An unknown tenant gets 404, and Redis is never asked
-  about it. A ledger that can't answer gets `503 budget_unavailable`.
+  ledger also holds reservations in flight. A request cut short is in both, at
+  the hold its row records as its cost, and the report's `incomplete_requests`
+  counts such rows. An unknown tenant gets 404, and Redis is never asked about
+  it. A ledger that can't answer gets `503 budget_unavailable`.
 - **Rebuilding after a Redis loss.** Postgres is the record of what a tenant
   spent, and Redis holds a running total of it: one hash for each tenant and
   month, `budget:{<tenant_id>}:<YYYY-MM>`, with `spent` (settled costs plus
@@ -1868,7 +2130,8 @@ refuses any other.
     of the tenant's rows still queued in the usage writer, and `SUM(cost_micros)`
     over the month's rows in `usage_logs`. The queue comes before the sum so that
     a batch that commits between the two reads is counted twice, an over-count,
-    and never missed. A row with no cost counts as 0.
+    and never missed. A row with no cost counts as 0, and a request cut short
+    has its hold as its row's cost, so it is counted.
   - It writes the total only while the hash is still missing, inside the Lua
     script that reserves, with a new random `gen`. A settle that finds no hash
     writes none: it adds one to the missed counter, which expires with the hash.
@@ -1910,28 +2173,31 @@ refuses any other.
     reads them. It misses rows queued on other gateway replicas, rows the usage
     writer dropped (a full queue, or Postgres rejecting the row), and the rows a
     gateway crash loses: those queued and not yet flushed, normally the last
-    second's. It forgets the reservations that requests cut short keep, since
-    their rows have no cost. And it doesn't hold the reservations of requests in
-    flight when the hash went missing until those requests settle.
+    second's. And it doesn't hold the reservations of requests in flight when
+    the hash went missing until those requests settle.
 
   The other mistakes are over-counts, which refuse a tenant early: a
   reservation whose reply was lost, and a row a rebuild counts twice. They end
   when the month does, or at the next rebuild.
-- **Redis without persistence.** The dev stack starts Redis with `--save ''`: no
-  snapshots, no append-only file (Redis's default) and no volume. Postgres, not
-  Redis, is the record of spend, and a restart is safe only if Redis comes back
-  empty. A snapshot restored after a crash would bring back an older, lower
-  `spent`, and the gateway would trust it, since a hash that exists is never
-  checked against Postgres. Empty, every ledger is rebuilt from `usage_logs` by
-  its next request. Production should run the Redis that holds budgets the same
-  way, with no snapshots and no append-only file. It should also keep budget
-  keys out of eviction: an evicted ledger is rebuilt like a lost one, with the
-  bounds above, and a missed counter evicted during a rebuild can hide a settle,
-  so that request's cost is counted nowhere. The dev Redis sets no `maxmemory`,
-  so nothing is evicted there. Week 7 plans one for the cache's sake, and budget
-  keys need a Redis of their own under `noeviction`, or no expiry under a
-  `volatile-*` policy, which evicts only keys that have one, with past months
-  deleted another way.
+- **Redis without persistence.** The dev stack starts both Redis with `--save
+  ''`: no snapshots, no append-only file (Redis's default) and no volume.
+  Postgres, not Redis, is the record of spend, and a restart is safe only if
+  Redis comes back empty. A snapshot restored after a crash would bring back an
+  older, lower `spent`, and the gateway would trust it, since a hash that
+  exists is never checked against Postgres. Empty, every ledger is rebuilt from
+  `usage_logs` by its next request. Production should run the Redis that holds
+  budgets the same way, with no snapshots and no append-only file.
+- **Redis without eviction.** Budget keys must stay out of eviction: an evicted
+  ledger is rebuilt like a lost one, with the bounds above, and a missed
+  counter evicted during a rebuild can hide a settle, so that request's cost is
+  counted nowhere. Every budget key has a TTL, so a `volatile-*` policy can
+  evict them too. So the ledgers have a Redis of their own, `redis-budget`
+  (`BUDGET_REDIS_URL`), capped at 64 MB under `noeviction`: at the cap it
+  refuses writes, and a reservation fails closed, as above. The rate limiter's
+  buckets and the cache are in `redis`, at 256 MB under `allkeys-lru`, where an
+  evicted entry is a miss and an evicted bucket starts full. The gateway
+  refuses to start when the ledger's Redis has a cap and any other policy (see
+  [Database](#database)).
 
 ## Make targets
 
@@ -1941,18 +2207,151 @@ refuses any other.
 | `make run`      | Build, then run                                                   |
 | `make mock`     | Run the mock provider on :9090                                    |
 | `make run-mock` | Run the gateway against the mock                                  |
-| `make db-up`    | Start local Postgres and Redis                                    |
-| `make db-down`  | Stop the whole stack: Postgres, Redis, Prometheus, Grafana        |
+| `make db-up`    | Start local Postgres and the two Redis                            |
+| `make db-down`  | Take down everything in the compose file; Postgres data survives  |
 | `make obs-up`   | Start Prometheus and Grafana; see [The dashboard](#the-dashboard) |
 | `make obs-down` | Stop Prometheus and Grafana; Postgres and Redis keep running      |
 | `make migrate`  | Apply pending database migrations                                 |
-| `make test`     | Run all tests (needs `make db-up`)                                |
+| `make test`     | Run all tests with `-race` (needs `make db-up`)                   |
 | `make vet`      | Run `go vet` (catches suspicious code)                            |
 | `make lint`     | Run golangci-lint (v2.15.0, as CI pins it; needs it installed)    |
 | `make fmt`      | Format all source files                                           |
 | `make tidy`     | Sync `go.mod` / `go.sum`                                          |
 | `make clean`    | Remove `./bin`                                                    |
 | `make all`      | fmt, vet, test, build                                             |
+
+## Tests
+
+`make test` runs everything with `-race`, against the compose Postgres and
+Redis (`make db-up` first). A test that needs one of them skips, and still
+prints `ok`, when its URL is unset, so a plain `go test ./...` needs nothing
+running; `make test` sets `DATABASE_URL`, `REDIS_URL` and `BUDGET_REDIS_URL`,
+and CI runs it. Here is where each item of the roadmap's Week 7 test list lives.
+Every one has a test. The integration tests build the router from the parts
+`main` uses, with the mock provider (`internal/mockprovider`) as the upstream,
+and need Postgres and Redis.
+
+Unit:
+
+- **Token bucket math:** `internal/ratelimit/ratelimit_test.go`, against Redis,
+  since the bucket is two Lua scripts: `TestThreshold`,
+  `TestDrainedBucketRefills`, `TestRefillStopsAtTheLimit`,
+  `TestOversizeRequestRunsIntoDebt`,
+  `TestAdjustRefundsUpToTheLimitAndChargesIntoDebt`,
+  `TestFractionalBalanceSurvivesExactly`
+- **Cost calculation:** `internal/pricing/pricing_test.go`: `TestCost`,
+  `TestCostUsesPriceInForce`, `TestCostUnknown`, `TestResultCost`, and for the
+  budget's reservation `TestReserve` and `TestReserveCoversCost`
+- **Usage parsers:** `internal/usage/parse_test.go`, a body and a stream for each
+  format: `TestOpenAIBody`, `TestOpenAIStream`, `TestGroqStreamCountsUsageOnce`,
+  `TestAnthropicBody`, `TestAnthropicStream`, `TestGeminiBody`,
+  `TestGeminiSSEStream`, `TestGeminiJSONArrayStream`; and Ollama's fixtures in
+  `internal/usage/ollama_test.go`: `TestOllamaFixtures`
+- **SSE parser on split and partial chunks:** `internal/usage/stream_test.go`:
+  `TestMeterPassesBytesThrough` (every event split at every point, by reading a
+  byte at a time) and `TestMeterOnEarlyClose` (a stream cut short);
+  `internal/usage/framing_test.go`: `TestMeterSSEFraming` (CRLF, `data:`
+  without its space, comment lines, one event's data over two lines, and a last
+  event without its blank line or line break, each whole and a byte at a time)
+- **Cache key canonicalization:** `internal/cache/key_test.go`: `TestKeyBody`,
+  `TestKeyQuery`, `TestKeyRequest`
+
+Integration:
+
+- **Full flow, gateway to mockprovider, for each format:**
+  `cmd/gateway/main_test.go`: `TestOpenAIFormatUsageThroughMock`,
+  `TestAnthropicUsageThroughMock`, `TestGeminiUsageThroughMock` and
+  `TestEveryFormatLandsAPricedRow` (every format, streamed or not, to a priced
+  usage row in Postgres); the mock's own handlers are tested in
+  `internal/mockprovider/mockprovider_test.go`
+- **Rate limit triggers:** `cmd/gateway/main_test.go`:
+  `TestRateLimitThroughGateway`, `TestRateLimitThresholdAndRefill`,
+  `TestRateLimitNoOverAdmission`
+- **Cache hits:** `cmd/gateway/cache_test.go`: `TestCacheHitAndMiss`,
+  `TestCacheHitUsageRow`, `TestCacheCheckpoint` (on each mock route)
+- **Budget enforcement:** `cmd/gateway/budget_checkpoint_test.go`:
+  `TestBudgetOneDollar`, `TestBudgetFreeOnASpentBudget`;
+  `cmd/gateway/budget_test.go`: `TestBudgetRefusalThroughGateway`,
+  `TestBudgetUnpricedModelThroughGateway`, `TestBudgetFailsClosedThroughGateway`
+- **Redis-restart rehydration:** `cmd/gateway/budget_checkpoint_test.go`:
+  `TestBudgetRedisLossAtTheBoundary`, `TestBudgetRedisLossInFlight`;
+  `internal/budget/budget_test.go`: `TestRebuildCountsTheMonthsRowsAndTheQueue`.
+  They lose the month as a restart does, by deleting the tenant's budget keys.
+  No test restarts a Redis container; Week 7's Checkpoint B restarted
+  `redis-budget` live, and the next request rebuilt the ledger to the sum of
+  the rows.
+
+Edge cases:
+
+- **Concurrent budget requests:** `cmd/gateway/budget_checkpoint_test.go`:
+  `TestBudgetNoOverspendUnderLoad` (50 requests at once against room for 10:
+  exactly 10 reach the provider, and 40 get `402`);
+  `internal/budget/budget_test.go`: `TestConcurrentReservationsCannotOverAdmit`
+- **Client disconnect mid-stream, usage still logged:**
+  `cmd/gateway/incomplete_test.go`: `TestIncompleteUsageKeepsItsHold` (each
+  format, cut after the headers: the usage row, the request line, the cost
+  counter and the ledger all carry the hold);
+  `cmd/gateway/requestline_test.go`: `TestRequestLineClientLeavesMidStream`;
+  `internal/usage/stream_test.go`: `TestMeterOnEarlyClose`
+- **Provider timeout:** `cmd/gateway/incomplete_test.go`:
+  `TestUnansweredUsageKeepsItsHold` (a `504`, a `499`, a `502`, and a failed
+  dial, which costs 0); `internal/proxy/proxy_test.go`:
+  `TestProxyTimeoutReturns504`
+- **Malformed JSON:** `cmd/gateway/edge_test.go`:
+  `TestMalformedJSONOnAPaidRoute` and `TestMalformedJSONOnAFreeRoute` (the
+  client's body); `internal/usage/framing_test.go`:
+  `TestMeterSkipsInvalidJSONEvents` and `TestMeterAnthropicBodyWithoutUsage`
+  (the provider's)
+- **Stream that ends without a usage event:** `cmd/gateway/incomplete_test.go`:
+  `TestIncompleteUsageKeepsItsHold` (each format's stream without its final
+  usage report, and bodies without usage); `internal/usage/stream_test.go`:
+  `TestMeterUsageComplete`; `internal/usage/parse_test.go`:
+  `TestOpenAINoUsage` and `TestGeminiNoUsage`
+
+## CI
+
+`.github/workflows/ci.yml` runs three jobs on every push and pull request:
+
+- **`lint`:** golangci-lint, pinned to v2.15.0 so that a new release can't turn
+  CI red by itself, with Go from `go.mod` and the settings in `.golangci.yml`:
+  the default linters plus gofmt. Locally it is `make lint`, with golangci-lint
+  v2.15.0 installed.
+- **`test`:** `go vet ./...`, then `make db-up` starts Postgres and both Redis
+  from the compose file, and `make test` runs `go test -race ./...` against
+  them. So the Postgres and Redis tests run in CI instead of skipping, with the
+  compose passwords and caps, and so do the budget ledger's own Redis tests.
+  Locally it is `make db-up`, then `make vet test`.
+- **`compose`:** the whole stack, started as in the
+  [Quick start](#the-whole-stack-on-the-mock-provider): `docker compose up -d
+  --build --wait` from the repo root, then `scripts/seed.sh`, whose output goes
+  to a file so that the keys stay out of the log, then `scripts/smoke.sh` with
+  `seed-default`'s key. The smoke test sends one request each to `/openai`
+  (streamed), `/groq`, `/anthropic` and `/gemini`, wants a 200 and a usage
+  object from each, and then wants Prometheus' `gateway:9091` target up and
+  `gateway_requests_total` with samples. A failed step prints every container's
+  log, and the job always ends with `docker compose down -v`. On your own
+  stack, the same check is `SMOKE_KEY=$KEY scripts/smoke.sh`, with `KEY` as in
+  the Quick start.
+
+act can run `lint` and `test` locally, on your own Docker:
+
+```sh
+act push -j lint --env-file /dev/null -P ubuntu-latest=catthehacker/ubuntu:act-latest
+act push -j test --env-file /dev/null -P ubuntu-latest=catthehacker/ubuntu:act-latest
+```
+
+`--env-file /dev/null` matters: act loads `./.env` into every job container by
+default, and yours holds real keys. `-P` maps `ubuntu-latest` to an image with
+what the jobs need: Node for the actions, gcc for `-race`, and Docker with
+Compose, make and jq. On Colima, add `--container-daemon-socket
+unix:///var/run/docker.sock`: by default act mounts the Mac's socket path into
+the job container, which the VM can't. The `test` job runs `make db-up` on your
+Docker, so it uses the dev stack's Postgres and Redis.
+
+> **Never run the `compose` job with act, or a bare `act`,** which runs every
+> job. act uses your own Docker, and the job's last step, `docker compose down
+> -v`, would take down the dev stack, which is the same project, `llm-gateway`,
+> and delete its database volume.
 
 ## Layout
 
@@ -1980,9 +2379,12 @@ internal/redistest/       Redis client for tests
 internal/admin/           admin API: create tenants, change their limits, issue and revoke keys, report usage and budgets
 internal/apierror/        the one JSON error shape every response uses
 cmd/migrate/main.go       applies migrations to DATABASE_URL
-deployments/              docker compose dev stack (Postgres, Redis, Prometheus, Grafana), and prometheus.yml
+compose.yaml              the repo root's way in: includes deployments/docker-compose.yml
+deployments/              the compose stack (Postgres, two Redis, a migration, the mock provider, the gateway, Prometheus, Grafana), its Dockerfile, config.compose.yaml (the gateway's config in it) and prometheus.yml
 deployments/grafana/      the dashboard and its screenshot, and what provisions them
-.github/workflows/ci.yml  vet + race-enabled tests against Postgres and Redis
+scripts/                  seed.sh (three test tenants) and smoke.sh (the compose stack's smoke test)
+.golangci.yml             golangci-lint's settings: the default linters plus gofmt
+.github/workflows/ci.yml  CI: lint, vet + race-enabled tests on the compose services, and the whole stack with a smoke test
 ```
 
 Routing costs no custom code: each provider is registered on `ServeMux` as
@@ -2045,9 +2447,8 @@ headers arrive: `m.UpstreamTTFB` innermost, inside any concurrency limit, and
 `m.Overhead` outermost, before it. The usage writer's two metrics are read at
 each scrape (`m.UsageWriter`), so the writer knows nothing of metrics.
 
-In Week 7, when the gateway runs in the compose stack, Prometheus is to scrape
-`gateway:9091` over the compose network with the same secret, and the metrics
-port needn't be published.
+In the compose stack, Prometheus scrapes `gateway:9091` over the compose
+network with the same key, so the metrics port isn't published.
 
 ## Observability
 
@@ -2058,10 +2459,11 @@ the metrics. [`GET /ready`](#get-ready) says whether it can serve at all.
 ### The request line
 
 Every request produces one JSON line on stdout. This one is a non-streaming
-request to Groq, from the Week 6 live run:
+request to Groq, from the Week 6 live run, with the `usage_complete` field that
+Week 7 added:
 
 ```json
-{"time":"2026-11-01T22:21:27.958418-05:00","level":"INFO","msg":"request","request_id":"req_a3496c2963c0d0ebcbba12fbe60f2514","method":"POST","path":"/groq/v1/chat/completions","status":200,"duration_ms":224.206,"bytes":883,"remote_addr":"127.0.0.1:63195","tenant_id":"tn_3494fc7bb5f6aae1","provider":"groq","model":"openai/gpt-oss-20b","input_tokens":94,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":64,"cost_micros":26,"cached":false,"streamed":false}
+{"time":"2026-11-01T22:21:27.958418-05:00","level":"INFO","msg":"request","request_id":"req_a3496c2963c0d0ebcbba12fbe60f2514","method":"POST","path":"/groq/v1/chat/completions","status":200,"duration_ms":224.206,"bytes":883,"remote_addr":"127.0.0.1:63195","tenant_id":"tn_3494fc7bb5f6aae1","provider":"groq","model":"openai/gpt-oss-20b","input_tokens":94,"cached_input_tokens":0,"cache_write_tokens":0,"output_tokens":64,"cost_micros":26,"usage_complete":true,"cached":false,"streamed":false}
 ```
 
 `request_id` is the `X-Request-ID` returned to the client. When the client
@@ -2079,10 +2481,15 @@ once it is known:
   body was read has it too, as whether the client asked for a stream.
 - Once an attempt has ended, its usage: `input_tokens`, `cached_input_tokens`,
   `cache_write_tokens` (the 5-minute and 1-hour writes together, as the usage
-  row stores them), `output_tokens`, `cost_micros` and `cached`. These repeat
-  the request's last usage row, which `request_id` joins. `cost_micros` is 0
-  for a cache hit and for a free provider, and `null` when the cost isn't
-  known, such as for a response cut short.
+  row stores them), `output_tokens`, `cost_micros`, `usage_complete` and
+  `cached`. These repeat the request's last usage row, which `request_id`
+  joins. `usage_complete` is false when the gateway never saw the provider's
+  final usage report: the client left mid-stream, the provider never answered
+  a request that went out, or a 2xx ended without the report. The tokens are
+  then what it saw, and `cost_micros` is what the budget held for the request
+  (see [The budget contract](#the-budget-contract)). `cost_micros` is 0 for a
+  cache hit and for a free provider, even one cut short, and `null` when the
+  cost isn't known.
 - `fallback_provider`, when a provider other than the route answered.
 
 The usage fields appear for any attempt that ended: a provider's answer, a
@@ -2119,7 +2526,7 @@ Without the key, or with a tenant's key, any path gets `401 invalid_admin_key`,
 as any `/admin/` request does. The listener writes no request lines, since
 Prometheus scrapes every few seconds. The admin key also creates tenants and
 mints keys, so whatever holds it to scrape holds that power too: Prometheus
-from `make obs-up` does (see [The dashboard](#the-dashboard)).
+in the compose stack does (see [The dashboard](#the-dashboard)).
 
 | Metric                                                    | Type      | What it counts                                                                                                                              |
 | --------------------------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -2225,16 +2632,18 @@ limits:
 
 `GET /ready` on the main port says whether the gateway can serve. It pings
 Postgres and Redis at the same time, and gives them a second together. It needs
-no key, like `/health`. When both answer, it is `200`:
+no key, like `/health`. When every one answers, it is `200`:
 
 ```json
-{"status":"ready","checks":{"postgres":"ok","redis":"ok"}}
+{"status":"ready","checks":{"postgres":"ok","redis":"ok","redis_budget":"ok"}}
 ```
 
-When one doesn't answer in time or fails, it is `503`, and names that check:
+`redis_budget` is the budget ledger's own Redis, `BUDGET_REDIS_URL`. With that
+unset, the ledger shares `redis`, and there are two checks. When one doesn't
+answer in time or fails, it is `503`, and names that check:
 
 ```json
-{"status":"not_ready","checks":{"postgres":"ok","redis":"down"}}
+{"status":"not_ready","checks":{"postgres":"ok","redis":"down","redis_budget":"ok"}}
 ```
 
 The body never carries an error's text, since the endpoint needs no key: each
@@ -2245,15 +2654,20 @@ than `GET` gets `405` with `Allow: GET`.
 
 ### The dashboard
 
-`make obs-up` starts Prometheus and Grafana from the compose stack, with
-Grafana's datasource and dashboard provisioned, and waits until both are
-healthy. Run it in the shell the gateway runs in, so that both hold the same
-admin key:
+`docker compose up` starts Prometheus and Grafana with the rest of the stack,
+with Grafana's datasource and dashboard provisioned. `make obs-up` starts just
+those two, for a gateway on your machine, and waits until both are healthy.
+With a gateway that has an admin key of its own (`make run`), run it in the
+shell the gateway runs in, so that both hold the same key:
 
 ```sh
 export GATEWAY_ADMIN_KEY=...   # the key the gateway runs with
 make obs-up
 ```
+
+With `make run-mock`, or the gateway in compose, there is nothing to export:
+they use the mock's key, which is what Prometheus gets when `GATEWAY_ADMIN_KEY`
+is unset.
 
 - **Grafana** is on `127.0.0.1:3000`. Anyone who can reach the port may view it
   without a login, so the "LLM Gateway" dashboard opens at
@@ -2261,15 +2675,20 @@ make obs-up
   provisioned from `deployments/grafana/`, so the UI can't save over them. Its
   admin password comes from `GRAFANA_ADMIN_PASSWORD`, `admin` by default.
 - **Prometheus** is on `127.0.0.1:9092`, because the mock provider holds 9090.
-  It scrapes `host.docker.internal:9091` every 5 seconds, sending the admin key
-  as a Bearer token from a compose secret that is filled from
+  It scrapes two targets every 5 seconds: `gateway:9091`, the gateway in
+  compose, and `host.docker.internal:9091`, a gateway on your machine. Normally
+  only one runs, so the other target shows as down. It sends the admin key as a
+  Bearer token, read from a file that an inline compose config fills from
   `GATEWAY_ADMIN_KEY`. The key is never in git or in a file in the repo.
-- **The key.** `make obs-up` passes your `GATEWAY_ADMIN_KEY` through. When it is
-  unset, it passes the mock's key, the one `make run-mock` uses, in that
-  recipe only, so `make run` never gets a default key. With another key than
-  the gateway's, the scrape gets a `401` and the target shows as down. Running
-  `make obs-up` again with a different key makes Prometheus use it.
-- `make obs-down` stops both; Postgres and Redis keep running.
+- **The key.** The config is built from your `GATEWAY_ADMIN_KEY` when the
+  container is created, or from the mock's key, the one `make run-mock` and the
+  compose gateway use, when that is unset. It is a config, not a secret, since
+  Compose refuses to start when a secret's variable is unset, so a plain
+  `docker compose up` works with nothing set. With another key than the
+  gateway's, the scrape gets a `401` and the target shows as down. Compose
+  doesn't notice a changed key, so `make obs-up` recreates both containers each
+  time: running it again with a different key makes Prometheus use it.
+- `make obs-down` stops both; Postgres and the Redis keep running.
 
 The dashboard (`deployments/grafana/dashboard.json`) refreshes every 10 seconds
 and shows the last 30 minutes. Its panels are:
@@ -2294,10 +2713,11 @@ from 40 seconds in until 15 seconds after it ended: 2026-11-01, 22:19 to 22:33
 (UTC−5). Headless Chrome took it from the anonymous dashboard. The late
 start keeps the one-minute rates from reaching back before the run.*
 
-**Reaching a gateway on loopback.** Prometheus runs in a container and scrapes
-`host.docker.internal`. The compose file maps that name to `host-gateway` for
-it, which Colima doesn't need and Linux Docker does. Whether the container then
-reaches a gateway bound to `127.0.0.1` depends on the runtime:
+**Reaching a gateway on loopback.** Prometheus runs in a container and, for a
+gateway on your machine, scrapes `host.docker.internal`. The compose file maps
+that name to `host-gateway` for it, which Colima doesn't need and Linux Docker
+does. Whether the container then reaches a gateway bound to `127.0.0.1` depends
+on the runtime:
 
 - **Colima:** it does. On 2026-10-31, on Colima's default profile (the macOS
   Virtualization.Framework VM, with no vmnet address), a container fetched from
@@ -2309,8 +2729,9 @@ reaches a gateway bound to `127.0.0.1` depends on the runtime:
   The gateway would have to listen on an address the bridge can reach, which
   means a `host` beyond loopback for both ports, since `metrics_port` listens
   on `host` too. Read the warning at the top first.
-- In Week 7, when the gateway runs in the compose stack, Prometheus is to
-  scrape `gateway:9091` over the compose network.
+- **The gateway in compose** has no such problem: Prometheus scrapes
+  `gateway:9091` over the compose network. Inside its container the gateway
+  binds `0.0.0.0`, and only its 8080 is published, on the host's `127.0.0.1`.
 
 Some things to know about the stack:
 
@@ -2318,9 +2739,6 @@ Some things to know about the stack:
 - Grafana doesn't re-read `dashboard.json` while it runs. Edit the file, then
   run `make obs-up`, which recreates both containers in about 10 seconds.
   Prometheus keeps its data: its anonymous volume is reattached.
-- Plain `docker compose up` with `GATEWAY_ADMIN_KEY` unset fails, since
-  Prometheus's secret needs it. `make db-up`, `docker compose config`, `ps` and
-  `stop` don't.
 - `docker compose down`, which `make db-down` runs, leaves Prometheus's
   anonymous `/prometheus` volume behind, one for each `down`.
 - Grafana preinstalls plugins at every start, which needs the network. One

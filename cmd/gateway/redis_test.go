@@ -189,8 +189,8 @@ func TestOpenLedgerRedisUsesBudgetRedisURL(t *testing.T) {
 func TestOpenLedgerRedisSharesTheClientWhenUnset(t *testing.T) {
 	// The guard runs on this client, so it must be one for a Redis that passes
 	// it. REDIS_URL's, under the compose stack, is capped and evicts, and is
-	// refused above; BUDGET_REDIS_URL's passes. CI has only REDIS_URL, with no
-	// cap.
+	// refused above; BUDGET_REDIS_URL's passes. With only REDIS_URL set, that
+	// Redis must pass the guard itself: no cap, or noeviction.
 	var rdb *redis.Client
 	if u := os.Getenv("BUDGET_REDIS_URL"); u != "" {
 		var err error
