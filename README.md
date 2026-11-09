@@ -47,6 +47,29 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **CI runs the whole stack, with a smoke test.** CI's jobs are now `lint`,
+  `test` and `compose`.
+  - **`test`:** in place of GitHub's service containers, it starts Postgres
+    and both Redis with `make db-up` and runs `make test`, as a developer
+    does. So CI's Redis has its password and caps, and the tests of the
+    budget ledger's own Redis, which skipped in CI, now run there.
+  - **`compose`:** from the repo root, `docker compose up -d --build --wait`
+    builds both images and starts the whole stack. Then `scripts/seed.sh`
+    makes its tenants and `scripts/smoke.sh` checks the stack with
+    `seed-default`'s key. When a step fails, the job prints every container's
+    log, and it always ends with `docker compose down -v`. Don't run this job
+    with act: on your own Docker, that last step would delete the dev stack's
+    database volume.
+  - **`scripts/smoke.sh`:** given a tenant key in `SMOKE_KEY`, it sends one
+    request each to `/openai` (streamed), `/groq`, `/anthropic` and `/gemini`,
+    and wants 200 and the format's usage object. Then it wants Prometheus'
+    `gateway:9091` target up and `gateway_requests_total` with samples,
+    polling for up to 30 s. The first failure ends it, named. It sends nothing
+    to Ollama, which CI doesn't have.
+  - **Compose on GitHub's runners:** `ubuntu-latest` moves from Ubuntu 24.04
+    (Compose 2.38.2) to 26.04 (Compose 5.1.3) during November 2026. Both
+    support everything the stack uses: `include`, inline `configs` content,
+    and `--wait` with the one-shot `migrate`. So no Compose is pinned.
 - **golangci-lint, locally and in CI.** `.golangci.yml` keeps golangci-lint
   v2's default linters (errcheck, govet, ineffassign, staticcheck, unused) and
   adds the gofmt check.

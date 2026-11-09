@@ -8,40 +8,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # A throwaway Postgres for the migration tests. It matches the compose
-    # image; the database tests create and drop their own databases inside it.
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: gateway
-          POSTGRES_PASSWORD: gateway
-          POSTGRES_DB: gateway
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U gateway -d gateway"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 15
-
-      # A throwaway Redis for the rate-limit tests. It matches the compose
-      # image; each test uses its own tenant ID, so tests never share keys.
-      redis:
-        image: redis:8-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 15
-
-    env:
-      # Set, so the Postgres and Redis tests run here instead of skipping.
-      DATABASE_URL: postgres://gateway:gateway@localhost:5432/gateway?sslmode=disable
-      REDIS_URL: redis://localhost:6379/0
-
     steps:
       - uses: actions/checkout@v7
 
@@ -51,9 +17,15 @@ jobs:
 
       - run: go vet ./...
 
+      # The Postgres and the two Redis a developer runs, from the compose file.
+      # --wait returns once their healthchecks pass.
+      - run: make db-up
+
       # -race from the start: the usage writer brings goroutines and channels
       # this week, and data races rarely show up as plain test failures.
-      - run: go test -race ./...
+      # make test is go test -race ./... with the URLs of the three services
+      # above set, so the Postgres and Redis tests run here instead of skipping.
+      - run: make test
 
   lint:
     runs-on: ubuntu-latest
@@ -69,3 +41,38 @@ jobs:
       - uses: golangci/golangci-lint-action@v9
         with:
           version: v2.15.0
+
+  # The whole stack, started the way a developer starts it: from the repo root,
+  # where compose.yaml includes deployments/docker-compose.yml. There is no Go
+  # setup here, because the images build in Docker.
+  #
+  # Don't run this job with act. It would run on your own Docker daemon, where
+  # the last step removes your dev stack and its database volume.
+  compose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Builds the gateway and the mock provider, then waits: migrate has to
+      # exit 0 and every other service has to be running, or healthy where it
+      # has a healthcheck. The gateway has none, so seed.sh below waits for its
+      # /ready.
+      - run: docker compose up -d --build --wait
+
+      # seed.sh prints one line per tenant, name<TAB>tenant_id<TAB>key. They go
+      # to a file, which keeps the keys out of the log.
+      - run: scripts/seed.sh > "$RUNNER_TEMP/seed.tsv"
+
+      # seed-default's key, the third column of its line, is smoke.sh's key.
+      - run: |
+          SMOKE_KEY=$(awk -F'\t' '$1 == "seed-default" { print $3 }' "$RUNNER_TEMP/seed.tsv") scripts/smoke.sh
+
+      # What every container printed, to find out why a step above failed.
+      - if: failure()
+        run: docker compose logs
+
+      # The runner is its own machine and is thrown away after the job, so this
+      # only tidies up; -v removes the database volume too.
+      - if: always()
+        run: docker compose down -v
