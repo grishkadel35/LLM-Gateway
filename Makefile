@@ -18,7 +18,7 @@ MOCK_ADMIN_KEY := mock-admin-key-for-local-testing-only
 
 # .PHONY tells make these targets are commands, not files to be produced.
 # Without it, a file named "test" in the repo would stop `make test` working.
-.PHONY: build run mock run-mock db-up db-down obs-up obs-down migrate test vet fmt tidy clean all
+.PHONY: build run mock run-mock db-up db-down obs-up obs-down migrate test vet lint fmt tidy clean all
 
 all: fmt vet test build
 
@@ -77,6 +77,11 @@ test:
 
 vet:
 	go vet ./...
+
+# Needs golangci-lint v2.15.0 installed, the version CI pins. Its config is
+# .golangci.yml. Not part of `make all`, so that still works without it.
+lint:
+	golangci-lint run ./...
 
 fmt:
 	go fmt ./...

@@ -1,0 +1,17 @@
+version: "2"
+linters:
+  exclusions:
+    presets:
+      # Unchecked errors that almost every program ignores: Close, Flush,
+      # os.Remove, the print functions, os.Setenv, the std streams. Without it
+      # errcheck reports 79 more here today: 73 Close calls, 5 fmt.Fprintf and
+      # 1 os.Unsetenv.
+      - std-error-handling
+      # Hides three gosec rules that often misfire: G103 (unsafe), G204 (a
+      # subprocess with a variable) and G304 (a file read from a variable).
+      # gosec is not in the default linters, so today this hides nothing; it
+      # only matters if gosec is turned on.
+      - common-false-positives
+formatters:
+  enable:
+    - gofmt

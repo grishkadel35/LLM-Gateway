@@ -54,3 +54,18 @@ jobs:
       # -race from the start: the usage writer brings goroutines and channels
       # this week, and data races rarely show up as plain test failures.
       - run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Pinned: a new release can add findings and turn CI red by itself.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0

@@ -184,7 +184,7 @@ func TestFallbackDecisions(t *testing.T) {
 				t.Error("ollama's 5xx was not read to the end, so its usage is incomplete")
 			}
 			// A refused connection never reached ollama: that attempt cost nothing.
-			if first := rig.calls[0].result; tc.wantReason == reasonUnreachable && (!first.Complete || first.Usage.Tokens() != 0) {
+			if first := rig.calls[0].result; tc.wantReason == reasonUnreachable && (!first.Complete || first.Tokens() != 0) {
 				t.Errorf("ollama's result = %+v, want complete with no tokens", first)
 			}
 			if !fellBack {

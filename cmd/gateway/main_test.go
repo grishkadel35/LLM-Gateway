@@ -2006,9 +2006,9 @@ func TestRecordUsageCost(t *testing.T) {
 				ids[i]).Scan(&cost, &input, &cached, &complete); err != nil {
 				t.Fatal(err)
 			}
-			if input != tc.result.Usage.Input || cached != tc.result.Cached || complete != tc.result.UsageComplete {
+			if input != tc.result.Input || cached != tc.result.Cached || complete != tc.result.UsageComplete {
 				t.Errorf("input_tokens = %d, cached = %v, usage_complete = %v; want %d, %v, %v",
-					input, cached, complete, tc.result.Usage.Input, tc.result.Cached, tc.result.UsageComplete)
+					input, cached, complete, tc.result.Input, tc.result.Cached, tc.result.UsageComplete)
 			}
 			if tc.wantNull && cost.Valid {
 				t.Errorf("cost = %d, want NULL", cost.Int64)

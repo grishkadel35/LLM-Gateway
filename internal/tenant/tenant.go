@@ -99,8 +99,10 @@ func (s *Store) Create(ctx context.Context, name string) (Tenant, NewKey, error)
 	}
 	// Go note: deferring Rollback is the standard pattern. After a successful
 	// Commit it does nothing (it returns sql.ErrTxDone, ignored here); on any
-	// early return it undoes the transaction.
-	defer tx.Rollback()
+	// early return it undoes the transaction. Rollback's error is discarded on
+	// purpose, and errcheck wants that said with `_ =`; `defer` takes only a
+	// call, so the assignment goes in a closure.
+	defer func() { _ = tx.Rollback() }()
 
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO tenants (id, name) VALUES ($1, $2)

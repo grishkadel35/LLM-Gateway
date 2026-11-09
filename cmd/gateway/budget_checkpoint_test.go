@@ -292,11 +292,11 @@ func (g *budgetGateway) lockRows(t *testing.T) (unlock func()) {
 	}
 	// Registered after newBudgetGateway's cleanups, so it runs before them:
 	// closing the writer waits on the lock.
-	t.Cleanup(func() { tx.Rollback() })
+	t.Cleanup(func() { _ = tx.Rollback() })
 	if _, err := tx.Exec(`LOCK TABLE usage_logs IN EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
-	return func() { tx.Rollback() }
+	return func() { _ = tx.Rollback() }
 }
 
 // waitCommitted waits until none of the tenant's rows are left in the

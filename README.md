@@ -47,6 +47,25 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **golangci-lint, locally and in CI.** `.golangci.yml` keeps golangci-lint
+  v2's default linters (errcheck, govet, ineffassign, staticcheck, unused) and
+  adds the gofmt check.
+  - **Presets:** two exclusion presets. `std-error-handling` leaves alone the
+    unchecked `Close`, `Flush` and print calls that nearly every Go program
+    ignores (79 findings here without it). `common-false-positives` covers
+    gosec only, so it hides nothing until gosec is turned on.
+  - **CI:** a `lint` job runs `golangci/golangci-lint-action@v9` with
+    golangci-lint pinned to v2.15.0 and Go from go.mod. `make lint` runs the
+    same check locally, with golangci-lint v2.15.0 installed.
+  - **Fixes:** the tree had 12 findings and now has none:
+    - five `Rollback` calls whose errors went unchecked, one in
+      `tenant.Store.Create` and four in tests, now discarded with `_ =`
+    - a test that discarded an `error` it received from a channel, and now
+      puts it in its failure message
+    - six test selectors through the embedded `Usage` field (staticcheck's
+      QF1008), such as `res.Usage.Tokens()`, now `res.Tokens()`
+
+    No behavior or test meaning changed.
 - **Incomplete usage keeps its hold, recorded.** A paid response whose final
   usage the gateway never saw now costs what its budget kept: the reservation,
   or the cost of the usage seen if that is more.
@@ -1906,6 +1925,7 @@ refuses any other.
 | `make migrate`  | Apply pending database migrations                                 |
 | `make test`     | Run all tests (needs `make db-up`)                                |
 | `make vet`      | Run `go vet` (catches suspicious code)                            |
+| `make lint`     | Run golangci-lint (v2.15.0, as CI pins it; needs it installed)    |
 | `make fmt`      | Format all source files                                           |
 | `make tidy`     | Sync `go.mod` / `go.sum`                                          |
 | `make clean`    | Remove `./bin`                                                    |

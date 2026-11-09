@@ -95,8 +95,8 @@ func TestLimitQueuesUntilTheBodyCloses(t *testing.T) {
 	}()
 
 	select {
-	case <-done:
-		t.Fatal("the second request went through while the first held the only slot")
+	case err := <-done:
+		t.Fatalf("the second request went through while the first held the only slot (err = %v)", err)
 	case <-time.After(50 * time.Millisecond):
 	}
 

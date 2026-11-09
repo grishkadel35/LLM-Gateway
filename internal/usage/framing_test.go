@@ -310,7 +310,7 @@ func TestMeterAnthropicBodyWithoutUsage(t *testing.T) {
 			if got != tc.body {
 				t.Errorf("client received %q, want the upstream's bytes %q", got, tc.body)
 			}
-			if res.Usage.Tokens() != 0 {
+			if res.Tokens() != 0 {
 				t.Errorf("usage = %+v, want no tokens", res.Usage)
 			}
 		})

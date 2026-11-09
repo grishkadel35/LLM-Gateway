@@ -715,7 +715,7 @@ func TestFailedRequestsAreMetered(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("onUsage ran %d times, want once", len(got))
 			}
-			if got[0].Status != tc.wantStatus || got[0].Complete || got[0].UsageComplete || got[0].Usage.Tokens() != 0 {
+			if got[0].Status != tc.wantStatus || got[0].Complete || got[0].UsageComplete || got[0].Tokens() != 0 {
 				t.Errorf("result = %+v, want status %d, incomplete, no tokens", got[0], tc.wantStatus)
 			}
 		})
@@ -776,7 +776,7 @@ func TestFailedDialCostsNothing(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("onUsage ran %d times, want once", len(got))
 			}
-			if got[0].Status != tc.wantStatus || !got[0].Complete || !got[0].UsageComplete || got[0].Usage.Tokens() != 0 {
+			if got[0].Status != tc.wantStatus || !got[0].Complete || !got[0].UsageComplete || got[0].Tokens() != 0 {
 				t.Errorf("result = %+v, want status %d, complete, its usage too, no tokens", got[0], tc.wantStatus)
 			}
 		})

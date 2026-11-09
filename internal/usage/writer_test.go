@@ -214,7 +214,7 @@ func TestWriterQueued(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Rollback()
+	defer func() { _ = lock.Rollback() }()
 	if _, err := lock.Exec(`LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +455,7 @@ func TestWriterPendingCountsUntilCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lock.Rollback()
+	defer func() { _ = lock.Rollback() }()
 	if _, err := lock.Exec(`LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
 		t.Fatal(err)
 	}
