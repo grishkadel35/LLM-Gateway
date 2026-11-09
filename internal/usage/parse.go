@@ -45,6 +45,9 @@ type parser interface {
 	// body handles a complete, non-SSE response body.
 	body(b []byte)
 	usage() Usage
+	// reported reports whether what the parser was fed carried the
+	// provider's final usage report, as the format sends it.
+	reported() bool
 	// requestID is the provider's ID for the request when the body carries it,
 	// "" otherwise. Providers that send it in a response header report none
 	// here: Meter reads the header.
@@ -68,8 +71,12 @@ func newParser(format provider.Format) parser {
 // Streams carry usage on one chunk near the end (the include_usage chunk;
 // Groq also on the finish chunk). The last usage seen wins, never a sum:
 // Groq reports the same numbers twice.
+//
+// Any usage object is the final report: a body's, or a chunk's, Groq's finish
+// chunk included. The other chunks carry "usage": null, or none.
 type openAIParser struct {
-	u Usage
+	u     Usage
+	final bool
 }
 
 type openAIChunk struct {
@@ -101,6 +108,7 @@ func (p *openAIParser) event(data []byte) {
 		p.u.CachedInput = d.CachedTokens
 		p.u.CacheWrite = d.CacheWriteTokens
 		p.u.Output = c.Usage.CompletionTokens
+		p.final = true
 	}
 }
 
@@ -108,6 +116,8 @@ func (p *openAIParser) event(data []byte) {
 func (p *openAIParser) body(b []byte) { p.event(b) }
 
 func (p *openAIParser) usage() Usage { return p.u }
+
+func (p *openAIParser) reported() bool { return p.final }
 
 // OpenAI and Groq send the request ID as the x-request-id header.
 func (p *openAIParser) requestID() string { return "" }
@@ -118,8 +128,12 @@ func (p *openAIParser) requestID() string { return "" }
 // Streams carry input usage in message_start, whose output_tokens is only a
 // placeholder, and the final, cumulative usage in message_delta. The delta's
 // fields win when present; a stream cut before it reports no output.
+//
+// The final report is a body's usage, or a stream's message_delta usage.
+// message_start's is not, for its placeholder.
 type anthropicParser struct {
-	u Usage
+	u     Usage
+	final bool
 }
 
 // anthropicUsage uses pointers to tell a field that is absent from one that
@@ -155,6 +169,7 @@ func (p *anthropicParser) event(data []byte) {
 		p.apply(e.Message.Usage, false)
 	case "message_delta":
 		p.apply(e.Usage, true)
+		p.final = p.final || e.Usage != nil
 	}
 }
 
@@ -168,6 +183,7 @@ func (p *anthropicParser) body(b []byte) {
 	}
 	p.u.Model = m.Model
 	p.apply(m.Usage, true)
+	p.final = m.Usage != nil
 }
 
 // apply copies the fields u states. withOutput is false for message_start,
@@ -200,6 +216,8 @@ func (p *anthropicParser) apply(u *anthropicUsage, withOutput bool) {
 
 func (p *anthropicParser) usage() Usage { return p.u }
 
+func (p *anthropicParser) reported() bool { return p.final }
+
 // Anthropic sends the request ID as the request-id header.
 func (p *anthropicParser) requestID() string { return "" }
 
@@ -217,12 +235,22 @@ func (p *anthropicParser) requestID() string { return "" }
 // Gemini sends no request ID header. Its body carries one instead, responseId,
 // the same on every chunk (verified live 2026-10-17); an error body has none.
 // The last one seen is the request ID.
+//
+// The final report is usageMetadata: a body's, or the last element's of a
+// JSON array. On SSE it is the one in the chunk that carries a finishReason,
+// or in a chunk after it: the totals before it are still running.
 type geminiParser struct {
 	u  Usage
 	id string
+	// finished is set once an SSE chunk has carried a finishReason.
+	finished bool
+	final    bool
 }
 
 type geminiChunk struct {
+	Candidates []struct {
+		FinishReason string `json:"finishReason"`
+	} `json:"candidates"`
 	ModelVersion  string `json:"modelVersion"`
 	ResponseID    string `json:"responseId"`
 	UsageMetadata *struct {
@@ -238,6 +266,8 @@ func (p *geminiParser) event(data []byte) {
 	var c geminiChunk
 	if json.Unmarshal(data, &c) == nil {
 		p.chunk(c)
+		p.finished = p.finished || c.finishes()
+		p.final = p.final || p.finished && c.UsageMetadata != nil
 	}
 }
 
@@ -250,9 +280,24 @@ func (p *geminiParser) body(b []byte) {
 		for _, c := range chunks {
 			p.chunk(c)
 		}
+		p.final = len(chunks) > 0 && chunks[len(chunks)-1].UsageMetadata != nil
 		return
 	}
-	p.event(b)
+	var c geminiChunk
+	if json.Unmarshal(b, &c) == nil {
+		p.chunk(c)
+		p.final = c.UsageMetadata != nil
+	}
+}
+
+// finishes reports whether one of c's candidates carries a finishReason.
+func (c geminiChunk) finishes() bool {
+	for _, candidate := range c.Candidates {
+		if candidate.FinishReason != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *geminiParser) chunk(c geminiChunk) {
@@ -270,5 +315,7 @@ func (p *geminiParser) chunk(c geminiChunk) {
 }
 
 func (p *geminiParser) usage() Usage { return p.u }
+
+func (p *geminiParser) reported() bool { return p.final }
 
 func (p *geminiParser) requestID() string { return p.id }

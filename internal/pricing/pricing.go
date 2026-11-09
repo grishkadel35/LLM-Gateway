@@ -294,17 +294,19 @@ func Cost(provider string, u usage.Usage, requested string, at time.Time) (cost 
 //
 // A cache hit always costs 0, whatever its usage says, since no provider saw
 // it. So does a free provider's response, even one cut short. Otherwise a
-// response cut short (or too large to parse) may be missing its usage, so its
-// cost is unknown, never a guess and never 0. A complete response with no
-// tokens, such as an upstream error, really did cost nothing. Any other costs
-// what Cost says, which is unknown when the model isn't priced.
+// response whose usage is incomplete (usage.Result.UsageComplete: cut short,
+// too large to parse, or a 2xx without its final usage report) may be billed
+// for more than it shows, so its cost is unknown, never a guess and never 0.
+// A complete response with no tokens, such as an upstream error, really did
+// cost nothing. Any other costs what Cost says, which is unknown when the
+// model isn't priced.
 func ResultCost(provider string, free bool, r usage.Result, requested string, at time.Time) (cost int64, ok bool) {
 	switch {
 	case r.Cached:
 		return 0, true
 	case free:
 		return 0, true
-	case !r.Complete:
+	case !r.UsageComplete:
 		return 0, false
 	case r.Tokens() == 0:
 		return 0, true

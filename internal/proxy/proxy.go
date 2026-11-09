@@ -200,6 +200,7 @@ func errorHandler(p provider.Provider, logger *slog.Logger, onUsage usage.Callba
 			// A failed dial never reached the provider, so it cost nothing. Any
 			// other failure may have been billed, and stays incomplete.
 			res.Complete = failedDial(err)
+			res.UsageComplete = res.Complete
 			onUsage(r.Context(), res)
 		}
 

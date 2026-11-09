@@ -140,7 +140,7 @@ func Cache(store CacheStore, provider string, onUsage usage.Callback, hitHeader 
 				_, _ = w.Write(e.Body)
 				// Once the body is written, so the row's latency covers it.
 				// Complete, since its usage is known: none.
-				onUsage(ctx, usage.Result{Usage: usage.Usage{Model: e.Model}, Status: e.Status, Complete: true, Cached: true})
+				onUsage(ctx, usage.Result{Usage: usage.Usage{Model: e.Model}, Status: e.Status, Complete: true, UsageComplete: true, Cached: true})
 				return
 			}
 

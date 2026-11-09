@@ -151,8 +151,8 @@ func RecordRequest(next http.Handler) http.Handler {
 //   - tenant_id, provider, and model as the client named it
 //   - from the usage last reported, while it describes the response the
 //     client got: fallback_provider when the provider that produced it isn't
-//     the route, its tokens, cost_micros (null when the cost isn't known) and
-//     cached
+//     the route, its tokens, cost_micros (null when the cost isn't known),
+//     usage_complete and cached
 //   - streamed, once the body was read: the report's when there is one, so it
 //     is the usage row's, else whether the client asked for a stream
 func (r *Record) attrs(attrs []any) []any {
@@ -184,6 +184,7 @@ func (r *Record) attrs(attrs []any) []any {
 			"output_tokens", u.Output,
 			// A nil *int64 is JSON null.
 			"cost_micros", u.CostMicros,
+			"usage_complete", u.UsageComplete,
 			"cached", u.Cached,
 		)
 	}

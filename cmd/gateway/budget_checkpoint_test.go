@@ -62,7 +62,8 @@ func pricedCosts(t *testing.T, provider, model, body string, at time.Time) (rese
 	}
 	// The answer names no model, so it is priced as the one the request asked
 	// for.
-	answer := usage.Result{Usage: usage.Usage{Model: model, Input: pricedInput, Output: pricedOutput}, Status: http.StatusOK, Complete: true}
+	answer := usage.Result{Usage: usage.Usage{Model: model, Input: pricedInput, Output: pricedOutput}, Status: http.StatusOK,
+		Complete: true, UsageComplete: true}
 	if cost, ok = pricing.ResultCost(provider, false, answer, model, at); !ok {
 		t.Fatalf("%s/%s should be priced", provider, model)
 	}

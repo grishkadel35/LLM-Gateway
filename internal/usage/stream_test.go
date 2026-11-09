@@ -100,7 +100,9 @@ func TestMeterOnEarlyClose(t *testing.T) {
 	if len(*calls) != 1 {
 		t.Fatalf("callback ran %d times, want once", len(*calls))
 	}
-	if res := (*calls)[0]; res.Complete || res.Usage != wantOpenAI {
+	// The usage chunk came before the cut, but the stream didn't end: its
+	// usage is incomplete too.
+	if res := (*calls)[0]; res.Complete || res.UsageComplete || res.Usage != wantOpenAI {
 		t.Errorf("result = %+v, want usage %+v, incomplete", res, wantOpenAI)
 	}
 }
@@ -117,8 +119,8 @@ func TestMeterUpstreamError(t *testing.T) {
 	if len(*calls) != 1 {
 		t.Fatalf("callback ran %d times, want once", len(*calls))
 	}
-	if res := (*calls)[0]; res.Status != http.StatusTooManyRequests || res.Usage != (Usage{}) {
-		t.Errorf("result = %+v, want status 429 and no usage", res)
+	if res := (*calls)[0]; res.Status != http.StatusTooManyRequests || res.Usage != (Usage{}) || !res.UsageComplete {
+		t.Errorf("result = %+v, want status 429 and no usage, complete", res)
 	}
 }
 
@@ -213,8 +215,108 @@ func TestMeterOverflowIsIncomplete(t *testing.T) {
 		if n != int64(len(tc.body)) {
 			t.Errorf("%s: client got %d bytes, want all %d", tc.name, n, len(tc.body))
 		}
-		if res := (*calls)[0]; res.Complete {
-			t.Errorf("%s: result = Complete, want incomplete after overflow", tc.name)
+		if res := (*calls)[0]; res.Complete || res.UsageComplete {
+			t.Errorf("%s: result = Complete or UsageComplete, want incomplete after overflow", tc.name)
 		}
+	}
+}
+
+// TestMeterUsageComplete: a 2xx's usage is complete only when its body was
+// read to the end and carried the provider's final usage report, as each
+// format sends it:
+//   - openai (Groq and Ollama too): a usage object, in a body or on a chunk,
+//     Groq's finish chunk included
+//   - anthropic: a body's usage, or a stream's message_delta usage, never
+//     message_start's alone
+//   - gemini: a body's usageMetadata, the JSON array's last element's, and on
+//     SSE the one in the chunk that carries finishReason, or after it
+//
+// Any other status reports no usage, so it is complete once read to the end.
+// A body closed short of its end is complete in no case, its report seen or
+// not.
+func TestMeterUsageComplete(t *testing.T) {
+	const sse, jsonType = "text/event-stream", "application/json"
+	events := func(data ...string) string {
+		var b strings.Builder
+		for _, d := range data {
+			b.WriteString("data: " + d + "\n\n")
+		}
+		return b.String()
+	}
+	openAIDelta := `{"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hi"}}],"usage":null}`
+	openAIFinish := `{"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}`
+	groqUsage := `{"prompt_tokens":20,"completion_tokens":10}`
+	groqFinish := `{"model":"openai/gpt-oss-120b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":` + groqUsage +
+		`,"x_groq":{"id":"req_1","usage":` + groqUsage + `}}`
+	messageStart := `{"type":"message_start","message":{"model":"claude-sonnet-4","usage":{"input_tokens":15,"output_tokens":1}}}`
+	messageDelta := `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":10}}`
+	messageStop := `{"type":"message_stop"}`
+	geminiRunning := `{"candidates":[{"content":{"parts":[{"text":"w"}]}}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":1}}`
+	geminiFinish := `{"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"STOP"}],` +
+		`"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":10}}`
+	geminiFinishBare := `{"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"STOP"}]}`
+	geminiUsageOnly := `{"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":10}}`
+
+	cases := []struct {
+		name        string
+		format      provider.Format
+		status      int
+		contentType string
+		body        string
+		want        bool // UsageComplete, read to the end
+	}{
+		{"openai body", provider.FormatOpenAI, http.StatusOK, jsonType, openAIBody, true},
+		{"openai body without usage", provider.FormatOpenAI, http.StatusOK, jsonType, `{"model":"gpt-4o","choices":[]}`, false},
+		{"openai body with usage null", provider.FormatOpenAI, http.StatusOK, jsonType, `{"model":"gpt-4o","choices":[],"usage":null}`, false},
+		{"openai stream", provider.FormatOpenAI, http.StatusOK, sse, openAIStream, true},
+		{"openai stream without the usage chunk", provider.FormatOpenAI, http.StatusOK, sse, events(openAIDelta, openAIFinish, "[DONE]"), false},
+		{"groq stream: the finish chunk's usage", provider.FormatOpenAI, http.StatusOK, sse, events(openAIDelta, groqFinish, "[DONE]"), true},
+		{"anthropic body", provider.FormatAnthropic, http.StatusOK, jsonType,
+			`{"type":"message","model":"claude-sonnet-4","usage":{"input_tokens":15,"output_tokens":10}}`, true},
+		{"anthropic body without usage", provider.FormatAnthropic, http.StatusOK, jsonType, `{"type":"message","model":"claude-sonnet-4","content":[]}`, false},
+		{"anthropic stream", provider.FormatAnthropic, http.StatusOK, sse, events(messageStart, messageDelta, messageStop), true},
+		{"anthropic stream with message_start alone", provider.FormatAnthropic, http.StatusOK, sse, events(messageStart, messageStop), false},
+		{"gemini body", provider.FormatGemini, http.StatusOK, jsonType, geminiFinish, true},
+		// A blocked prompt has no candidates, so no finishReason, and its
+		// usageMetadata is still the report.
+		{"gemini body without a finishReason", provider.FormatGemini, http.StatusOK, jsonType,
+			`{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":20}}`, true},
+		{"gemini body without usageMetadata", provider.FormatGemini, http.StatusOK, jsonType, geminiFinishBare, false},
+		{"gemini sse: usage on the finishing chunk", provider.FormatGemini, http.StatusOK, sse, events(geminiRunning, geminiFinish), true},
+		{"gemini sse: usage after the finishing chunk", provider.FormatGemini, http.StatusOK, sse,
+			events(geminiRunning, geminiFinishBare, geminiUsageOnly), true},
+		{"gemini sse: running totals only", provider.FormatGemini, http.StatusOK, sse, events(geminiRunning, geminiRunning), false},
+		{"gemini sse: a finish without usage", provider.FormatGemini, http.StatusOK, sse, events(geminiRunning, geminiFinishBare), false},
+		{"gemini json array", provider.FormatGemini, http.StatusOK, jsonType, "[" + geminiRunning + ",\n" + geminiFinish + "]", true},
+		{"gemini json array: the last element without usage", provider.FormatGemini, http.StatusOK, jsonType,
+			"[" + geminiRunning + ",\n" + geminiFinishBare + "]", false},
+		{"a provider's 429 without usage", provider.FormatOpenAI, http.StatusTooManyRequests, jsonType, `{"error":{"message":"Rate limit reached"}}`, true},
+		{"a provider's 502 without usage", provider.FormatAnthropic, http.StatusBadGateway, jsonType, `{"type":"error","error":{"type":"api_error"}}`, true},
+		{"a provider's 504 without usage", provider.FormatGemini, http.StatusGatewayTimeout, jsonType, `{"error":{"code":504,"status":"DEADLINE_EXCEEDED"}}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := response(tc.status, tc.contentType, strings.NewReader(tc.body))
+			calls := meter(resp, tc.format)
+			if _, err := io.ReadAll(resp.Body); err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if res := (*calls)[0]; !res.Complete || res.UsageComplete != tc.want {
+				t.Errorf("read to the end: complete %v, usage complete %v; want complete, usage complete %v", res.Complete, res.UsageComplete, tc.want)
+			}
+
+			// One byte short of the end: the report, if there is one, came
+			// before the cut.
+			cut := response(tc.status, tc.contentType, strings.NewReader(tc.body))
+			calls = meter(cut, tc.format)
+			if _, err := io.ReadFull(cut.Body, make([]byte, len(tc.body)-1)); err != nil {
+				t.Fatal(err)
+			}
+			_ = cut.Body.Close()
+			if res := (*calls)[0]; res.Complete || res.UsageComplete {
+				t.Errorf("cut short: complete %v, usage complete %v; want neither", res.Complete, res.UsageComplete)
+			}
+		})
 	}
 }

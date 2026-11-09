@@ -366,7 +366,7 @@ func TestCacheHit(t *testing.T) {
 				}
 			}
 
-			want := usage.Result{Usage: usage.Usage{Model: "m-snapshot"}, Status: tc.entry.Status, Complete: true, Cached: true}
+			want := usage.Result{Usage: usage.Usage{Model: "m-snapshot"}, Status: tc.entry.Status, Complete: true, UsageComplete: true, Cached: true}
 			if len(reported) != 1 || reported[0] != want {
 				t.Fatalf("reported %+v, want one %+v", reported, want)
 			}

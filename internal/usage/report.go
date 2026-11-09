@@ -10,15 +10,18 @@ import (
 
 // Totals sums usage rows. CostMicros covers priced rows only;
 // UnpricedRequests says how many rows had no cost, so a partial total isn't
-// mistaken for a complete one.
+// mistaken for a complete one. IncompleteRequests says how many rows had
+// incomplete usage: their tokens are what the gateway saw, and their cost
+// what the budget held.
 type Totals struct {
-	Requests          int64 `json:"requests"`
-	InputTokens       int64 `json:"input_tokens"`
-	CachedInputTokens int64 `json:"cached_input_tokens"`
-	CacheWriteTokens  int64 `json:"cache_write_tokens"`
-	OutputTokens      int64 `json:"output_tokens"`
-	CostMicros        int64 `json:"cost_micros"`
-	UnpricedRequests  int64 `json:"unpriced_requests"`
+	Requests           int64 `json:"requests"`
+	InputTokens        int64 `json:"input_tokens"`
+	CachedInputTokens  int64 `json:"cached_input_tokens"`
+	CacheWriteTokens   int64 `json:"cache_write_tokens"`
+	OutputTokens       int64 `json:"output_tokens"`
+	CostMicros         int64 `json:"cost_micros"`
+	UnpricedRequests   int64 `json:"unpriced_requests"`
+	IncompleteRequests int64 `json:"incomplete_requests"`
 }
 
 func (t *Totals) add(o Totals) {
@@ -29,6 +32,7 @@ func (t *Totals) add(o Totals) {
 	t.OutputTokens += o.OutputTokens
 	t.CostMicros += o.CostMicros
 	t.UnpricedRequests += o.UnpricedRequests
+	t.IncompleteRequests += o.IncompleteRequests
 }
 
 // ModelTotals is one provider and model's share of a Summary.
@@ -69,7 +73,8 @@ func (r *Reports) TenantUsage(ctx context.Context, tenantID string, from, to tim
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT provider, model, count(*),
 		       sum(input_tokens), sum(cached_input_tokens), sum(cache_write_tokens), sum(output_tokens),
-		       coalesce(sum(cost_micros), 0), count(*) FILTER (WHERE cost_micros IS NULL)
+		       coalesce(sum(cost_micros), 0), count(*) FILTER (WHERE cost_micros IS NULL),
+		       count(*) FILTER (WHERE NOT usage_complete)
 		FROM usage_logs
 		WHERE tenant_id = $1 AND created_at >= $2 AND created_at < $3
 		GROUP BY provider, model
@@ -86,7 +91,7 @@ func (r *Reports) TenantUsage(ctx context.Context, tenantID string, from, to tim
 		var m ModelTotals
 		if err := rows.Scan(&m.Provider, &m.Model, &m.Requests,
 			&m.InputTokens, &m.CachedInputTokens, &m.CacheWriteTokens, &m.OutputTokens,
-			&m.CostMicros, &m.UnpricedRequests); err != nil {
+			&m.CostMicros, &m.UnpricedRequests, &m.IncompleteRequests); err != nil {
 			return Summary{}, err
 		}
 		s.ByModel = append(s.ByModel, m)

@@ -22,14 +22,17 @@ func TestTenantUsage(t *testing.T) {
 	row := func(tn tenant.Tenant, key tenant.NewKey, provider, model string, at time.Time, cost *int64) Row {
 		return Row{RequestID: "r", TenantID: tn.ID, APIKeyID: key.ID, Provider: provider, Model: model,
 			Endpoint: "/e", Status: 200, Usage: Usage{Input: 10, CachedInput: 2, CacheWrite: 1, CacheWrite1h: 1, Output: 5},
-			CostMicros: cost, CreatedAt: at}
+			UsageComplete: true, CostMicros: cost, CreatedAt: at}
 	}
 	c100, c50 := int64(100), int64(50)
 
 	w := newWriter(conn, discard(), 100, 100, time.Hour)
 	w.start()
 	w.Write(row(tn, key, "openai", "gpt-4o", oct.Add(time.Hour), &c100))
-	w.Write(row(tn, key, "openai", "gpt-4o", oct.Add(2*time.Hour), &c50))
+	// Cut short: its cost is what the budget held.
+	held := row(tn, key, "openai", "gpt-4o", oct.Add(2*time.Hour), &c50)
+	held.UsageComplete = false
+	w.Write(held)
 	w.Write(row(tn, key, "groq", "llama-3.3-70b-versatile", oct.Add(3*time.Hour), nil))
 	// Outside the period: the boundary is half-open, so November's first
 	// instant belongs to November.
@@ -47,7 +50,7 @@ func TestTenantUsage(t *testing.T) {
 	}
 
 	wantTotal := Totals{Requests: 3, InputTokens: 30, CachedInputTokens: 6, CacheWriteTokens: 6, OutputTokens: 15,
-		CostMicros: 150, UnpricedRequests: 1}
+		CostMicros: 150, UnpricedRequests: 1, IncompleteRequests: 1}
 	if got.Total != wantTotal {
 		t.Errorf("Total = %+v, want %+v", got.Total, wantTotal)
 	}
@@ -55,11 +58,11 @@ func TestTenantUsage(t *testing.T) {
 		t.Fatalf("ByModel = %+v, want groq and openai", got.ByModel)
 	}
 	// Sorted by provider, then model.
-	if g := got.ByModel[0]; g.Provider != "groq" || g.Requests != 1 || g.CostMicros != 0 || g.UnpricedRequests != 1 {
-		t.Errorf("ByModel[0] = %+v, want groq: 1 request, unpriced", g)
+	if g := got.ByModel[0]; g.Provider != "groq" || g.Requests != 1 || g.CostMicros != 0 || g.UnpricedRequests != 1 || g.IncompleteRequests != 0 {
+		t.Errorf("ByModel[0] = %+v, want groq: 1 request, unpriced, complete", g)
 	}
-	if o := got.ByModel[1]; o.Provider != "openai" || o.Model != "gpt-4o" || o.Requests != 2 || o.CostMicros != 150 {
-		t.Errorf("ByModel[1] = %+v, want openai/gpt-4o: 2 requests, 150", o)
+	if o := got.ByModel[1]; o.Provider != "openai" || o.Model != "gpt-4o" || o.Requests != 2 || o.CostMicros != 150 || o.IncompleteRequests != 1 {
+		t.Errorf("ByModel[1] = %+v, want openai/gpt-4o: 2 requests, 150, 1 incomplete", o)
 	}
 }
 

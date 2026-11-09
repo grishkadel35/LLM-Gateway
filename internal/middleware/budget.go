@@ -35,7 +35,7 @@ type Ledger interface {
 // reservation is what Budget reserved for one attempt. It rides on the
 // attempt's context as a pointer, so the attempt's usage can be reported onto
 // it (ReportUsage), and Budget settles the reservation by that usage once the
-// attempt is over.
+// attempt is over. While the attempt runs, UsageCost finds it there too.
 //
 // It needs no lock, for the reason charge gives: the reports are made, and
 // the settlement reads them, on the goroutine serving the request.
@@ -191,15 +191,57 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 	}
 }
 
+// UsageCost returns what r, provider's response to the attempt on ctx, cost in
+// µ$, or nil when that isn't known. free reports that provider costs nothing.
+// It is the one figure for the response: cmd/gateway records it on the usage
+// row, the request line and the cost counter, and an attempt Budget reserved
+// for is settled at it (see settleReservation).
+//
+// On an attempt Budget reserved for, it is what the reservation is settled at
+// (see costOf). On any other, a free provider's, a cache hit's, or a paid
+// attempt on a router with no budgets, it is what pricing.ResultCost says,
+// which leaves incomplete usage on a paid provider with no known cost: nothing
+// was held for it.
+func UsageCost(ctx context.Context, provider string, free bool, r usage.Result) *int64 {
+	req, ok := usage.RequestFrom(ctx)
+	if !ok {
+		req = &usage.Request{Received: time.Now()}
+	}
+	if res := reservationFrom(ctx); res != nil {
+		cost := res.costOf(provider, r, req)
+		return &cost
+	}
+	cost, known := pricing.ResultCost(provider, free, r, req.Model, req.Received)
+	if !known {
+		return nil
+	}
+	return &cost
+}
+
+// costOf returns what the attempt res is reserved for cost, by r, its usage,
+// priced as req, its Request, asks:
+//   - A cost pricing.ResultCost knows: that cost.
+//   - Unknown, as the usage is incomplete (the client left mid-stream, the
+//     provider never answered, a 2xx ended without its final usage report):
+//     the reservation, or what the usage seen so far costs if that's more.
+//     The attempt keeps what it reserved, as RateLimit keeps its charge.
+func (res *reservation) costOf(provider string, r usage.Result, req *usage.Request) int64 {
+	// Budget never runs for a free provider.
+	cost, known := pricing.ResultCost(provider, false, r, req.Model, req.Received)
+	if !known {
+		cost = res.Amount
+		if seen, priced := pricing.Cost(provider, r.Usage, req.Model, req.Received); priced {
+			cost = max(cost, seen)
+		}
+	}
+	return cost
+}
+
 // settleReservation swaps res's reservation for what its attempt cost, once
 // the attempt is over, by the usage last reported for it:
 //   - None: nothing reached the provider (no concurrency slot came free), so
 //     the attempt is charged 0.
-//   - A cost pricing.ResultCost knows: that cost, the one the attempt's usage
-//     row records.
-//   - Unknown (the client left mid-stream, the provider never answered): the
-//     reservation, or what the usage seen so far costs if that's more. The
-//     attempt keeps what it reserved, as RateLimit keeps its charge.
+//   - Any: its charge, the cost UsageCost gave the attempt's usage row.
 //
 // req is the attempt's own Request, which its row is priced by too: after a
 // fallback, it names the model the fallback asked for.
@@ -217,15 +259,7 @@ func Budget(ledger Ledger, provider string, free bool, logger *slog.Logger) func
 func settleReservation(ctx context.Context, ledger Ledger, logger *slog.Logger, provider string, t tenant.Tenant, req *usage.Request, res *reservation) {
 	var charged int64
 	if r := res.result; r != nil {
-		var known bool
-		// Budget never runs for a free provider.
-		charged, known = pricing.ResultCost(provider, false, *r, req.Model, req.Received)
-		if !known {
-			charged = res.Amount
-			if seen, priced := pricing.Cost(provider, r.Usage, req.Model, req.Received); priced {
-				charged = max(charged, seen)
-			}
-		}
+		charged = res.costOf(provider, *r, req)
 	}
 
 	spent, known, err := ledger.Settle(context.WithoutCancel(ctx), res.Reservation, charged)

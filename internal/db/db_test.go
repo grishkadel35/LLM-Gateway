@@ -69,7 +69,7 @@ func TestMigrateUpDownUp(t *testing.T) {
 		}
 	}
 	cols := columns(t, conn, "usage_logs")
-	for _, c := range []string{"request_id", "tenant_id", "api_key_id", "provider", "model", "endpoint", "status", "cache_write_tokens", "cost_micros"} {
+	for _, c := range []string{"request_id", "tenant_id", "api_key_id", "provider", "model", "endpoint", "status", "cache_write_tokens", "cost_micros", "usage_complete"} {
 		if !cols[c] {
 			t.Errorf("usage_logs has no %s column", c)
 		}
@@ -92,6 +92,14 @@ func TestMigrateUpDownUp(t *testing.T) {
 	p, err := newProvider(conn)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The table outlives 00004's down, so the column's own drop is checked
+	// here: 00001's would hide one that does nothing.
+	if _, err := p.DownTo(ctx, 3); err != nil {
+		t.Fatalf("migrating down to 3: %v", err)
+	}
+	if columns(t, conn, "usage_logs")["usage_complete"] {
+		t.Error("usage_logs still has usage_complete after migrating down to 3")
 	}
 	if _, err := p.DownTo(ctx, 0); err != nil {
 		t.Fatalf("migrating down: %v", err)

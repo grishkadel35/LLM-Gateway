@@ -30,15 +30,18 @@ func TestOllamaFixtures(t *testing.T) {
 		status      int
 		contentType string
 		want        Usage
+		// usageComplete: the reply carried its final usage report, or is an
+		// error, which reports none.
+		usageComplete bool
 	}{
-		{"chat.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 19, Output: 1}},
-		{"chat_cached.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 5, CachedInput: 14, Output: 1}},
-		{"chat_thinking.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 3, CachedInput: 14, Output: 362}},
-		{"chat_stream.sse", http.StatusOK, "text/event-stream", Usage{Model: "qwen3.5:9b", Input: 4, CachedInput: 15, Output: 1}},
+		{"chat.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 19, Output: 1}, true},
+		{"chat_cached.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 5, CachedInput: 14, Output: 1}, true},
+		{"chat_thinking.json", http.StatusOK, "application/json", Usage{Model: "qwen3.5:9b", Input: 3, CachedInput: 14, Output: 362}, true},
+		{"chat_stream.sse", http.StatusOK, "text/event-stream", Usage{Model: "qwen3.5:9b", Input: 4, CachedInput: 15, Output: 1}, true},
 		// Without include_usage there is no usage at all: the reason ReadBody
 		// forces it on.
-		{"chat_stream_no_usage.sse", http.StatusOK, "text/event-stream", Usage{Model: "qwen3.5:9b"}},
-		{"error_unknown_model.json", http.StatusNotFound, "application/json", Usage{}},
+		{"chat_stream_no_usage.sse", http.StatusOK, "text/event-stream", Usage{Model: "qwen3.5:9b"}, false},
+		{"error_unknown_model.json", http.StatusNotFound, "application/json", Usage{}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -70,6 +73,9 @@ func TestOllamaFixtures(t *testing.T) {
 				if c.Usage != tc.want || c.Status != tc.status || !c.Complete || c.Streamed != (tc.contentType == "text/event-stream") {
 					t.Errorf("oneByte=%v: got usage %+v, status %d, complete %v, streamed %v; want %+v, %d, complete, streamed %v",
 						oneByte, c.Usage, c.Status, c.Complete, c.Streamed, tc.want, tc.status, tc.contentType == "text/event-stream")
+				}
+				if c.UsageComplete != tc.usageComplete {
+					t.Errorf("oneByte=%v: usage complete %v, want %v", oneByte, c.UsageComplete, tc.usageComplete)
 				}
 			}
 		})

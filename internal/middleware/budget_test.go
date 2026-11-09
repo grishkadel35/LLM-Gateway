@@ -497,8 +497,8 @@ func TestBudgetWarnsOnce(t *testing.T) {
 // the attempt:
 //   - no report: 0
 //   - a cost pricing.ResultCost knows: that cost
-//   - an incomplete result: the reservation, or what the usage seen costs if
-//     that's more
+//   - incomplete usage, cut short or read to the end without its final
+//     report: the reservation, or what the usage seen costs if that's more
 //
 // Settle is called even when the charge is the reservation.
 func TestBudgetSettles(t *testing.T) {
@@ -519,8 +519,12 @@ func TestBudgetSettles(t *testing.T) {
 	if c := cost(used); c == 0 || c == reserved || cost(under) >= reserved || cost(over) <= reserved {
 		t.Fatalf("the usages don't fit the reservation, %d µ$: used %d, under %d, over %d", reserved, c, cost(under), cost(over))
 	}
-	complete := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK, Complete: true} }
+	complete := func(u usage.Usage) usage.Result {
+		return usage.Result{Usage: u, Status: http.StatusOK, Complete: true, UsageComplete: true}
+	}
 	cutShort := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK} }
+	// Read to the end, but without the provider's final usage report.
+	unreported := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK, Complete: true} }
 
 	cases := []struct {
 		name    string
@@ -536,6 +540,7 @@ func TestBudgetSettles(t *testing.T) {
 		{"incomplete with no usage: the reservation", []usage.Result{cutShort(usage.Usage{Model: "gpt-4o"})}, reserved},
 		{"incomplete, seen under the reservation: the reservation", []usage.Result{cutShort(under)}, reserved},
 		{"incomplete, seen over the reservation: what was seen", []usage.Result{cutShort(over)}, cost(over)},
+		{"read to the end without the report: the reservation", []usage.Result{unreported(under)}, reserved},
 		{"the last report wins", []usage.Result{cutShort(over), complete(used)}, cost(used)},
 	}
 	for _, tc := range cases {
@@ -549,6 +554,97 @@ func TestBudgetSettles(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestUsageCost: UsageCost gives a response the one figure for it. On an
+// attempt Budget reserved for, it is the charge Budget then settles the
+// attempt at: what pricing.ResultCost knows, and for incomplete usage the
+// reservation, or what the usage seen costs if that's more. Anywhere else it
+// is pricing.ResultCost's: a free provider's response and a cache hit cost 0,
+// and a paid response's incomplete usage has no known cost, as nothing was
+// held for it.
+func TestUsageCost(t *testing.T) {
+	const body = `{"model":"gpt-4o","max_tokens":100,"messages":[]}`
+	now := time.Now()
+	reserved, _ := pricing.Reserve("openai", "gpt-4o", reserveTokens(body), 100, 1, now)
+	cost := func(u usage.Usage) int64 {
+		c, _ := pricing.Cost("openai", u, "gpt-4o", now)
+		return c
+	}
+	used := usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}
+	under := usage.Usage{Model: "gpt-4o", Input: 10}
+	over := usage.Usage{Model: "gpt-4o", Input: 1_000_000}
+	if cost(under) >= reserved || cost(over) <= reserved {
+		t.Fatalf("the usages don't fit the reservation, %d µ$: under %d, over %d", reserved, cost(under), cost(over))
+	}
+	complete := usage.Result{Usage: used, Status: http.StatusOK, Complete: true, UsageComplete: true}
+	// Read to the end, but without the provider's final usage report.
+	unreported := usage.Result{Usage: under, Status: http.StatusOK, Complete: true}
+	cutShort := func(u usage.Usage) usage.Result { return usage.Result{Usage: u, Status: http.StatusOK} }
+	show := func(c *int64) any {
+		if c == nil {
+			return nil
+		}
+		return *c
+	}
+
+	t.Run("reserved", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			r    usage.Result
+			want int64
+		}{
+			{"complete: its cost", complete, cost(used)},
+			{"without its final report: the reservation", unreported, reserved},
+			{"cut short, seen under the reservation: the reservation", cutShort(under), reserved},
+			{"cut short, seen over the reservation: what was seen", cutShort(over), cost(over)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ledger := &fakeLedger{}
+				var got *int64
+				next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					ReportUsage(r.Context(), "openai", tc.r)
+					got = UsageCost(r.Context(), "openai", false, tc.r)
+				})
+				h := asTenant(acmeWithBudget(50_000_000), usage.ReadBody(provider.FormatOpenAI, 1<<20)(Budget(ledger, "openai", false, discard)(next)))
+				h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
+				if settles := ledger.settled(); show(got) != tc.want || len(settles) != 1 || settles[0].charge != tc.want {
+					t.Errorf("UsageCost() = %v, Settle calls %+v; want %d, and one Settle charging that", show(got), settles, tc.want)
+				}
+			})
+		}
+	})
+
+	t.Run("nothing reserved", func(t *testing.T) {
+		hit := complete
+		hit.Cached = true
+		for _, tc := range []struct {
+			name     string
+			provider string
+			free     bool
+			r        usage.Result
+			want     any // nil for no known cost
+		}{
+			{"paid, complete: its cost", "openai", false, complete, cost(used)},
+			{"paid, cut short: unknown", "openai", false, cutShort(over), nil},
+			{"paid, without its final report: unknown", "openai", false, unreported, nil},
+			{"free, cut short: 0", "ollama", true, cutShort(under), int64(0)},
+			{"a cache hit: 0", "openai", false, hit, int64(0)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var got *int64
+				next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					got = UsageCost(r.Context(), tc.provider, tc.free, tc.r)
+				})
+				usage.ReadBody(provider.FormatOpenAI, 1<<20)(next).ServeHTTP(httptest.NewRecorder(),
+					httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+				if show(got) != tc.want {
+					t.Errorf("UsageCost() = %v, want %v", show(got), tc.want)
+				}
+			})
+		}
+	})
 }
 
 // TestBudgetSettlesWhenAborted: a client that leaves mid-stream cancels the
@@ -592,7 +688,8 @@ func TestBudgetSettlementFailure(t *testing.T) {
 	ledger := &fakeLedger{settleErr: errors.New("redis: i/o timeout")}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 1,000 input and 100 output tokens of gpt-4o: 3,500 µ$.
-		ReportUsage(r.Context(), "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}, Status: http.StatusOK, Complete: true})
+		ReportUsage(r.Context(), "openai", usage.Result{Usage: usage.Usage{Model: "gpt-4o", Input: 1_000, Output: 100}, Status: http.StatusOK,
+			Complete: true, UsageComplete: true})
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, reply)
 	})

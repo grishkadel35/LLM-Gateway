@@ -21,11 +21,17 @@ type Result struct {
 	// event stream, or a stream the client asked for in another shape (such
 	// as Gemini's default JSON array).
 	Streamed bool
-	// Complete is false when usage may be missing: the body was closed
-	// before EOF (typically a client disconnecting mid-stream), or was too
-	// large to parse. Usage then holds only what had been seen, and the
-	// response's real cost is unknown.
+	// Complete is false when the body was closed before EOF (typically a
+	// client disconnecting mid-stream), or was too large to parse. Usage then
+	// holds only what had been seen.
 	Complete bool
+	// UsageComplete reports that Usage is the provider's final count. It
+	// takes Complete and, for a 2xx, the provider's final usage report among
+	// what was read (each parser says what that is in its format): a 2xx that
+	// ends without it, at EOF or not, may be billed for more than it shows.
+	// Any other status reports no usage, so it takes Complete alone. When it
+	// is false, the response's real cost is unknown.
+	UsageComplete bool
 	// ProviderRequestID is the provider's own ID for the request, which its
 	// support asks for. OpenAI and Groq send it as the x-request-id header,
 	// Anthropic as request-id, and Gemini in the body as responseId. "" if it
@@ -89,8 +95,9 @@ func Meter(resp *http.Response, format provider.Format, done Callback) {
 // Unanswered is the Result for a request that got no response from the
 // provider: a timeout, a dropped connection, or a client that gave up first.
 // The provider may still have received and billed it, so it is reported as
-// incomplete, with unknown usage. The proxy marks it complete when its dial
-// failed: such a request never left the gateway, so it cost nothing.
+// incomplete, with unknown usage. The proxy marks it complete, its usage
+// too, when its dial failed: such a request never left the gateway, so it
+// cost nothing.
 func Unanswered(ctx context.Context, status int) Result {
 	r := Result{Status: status}
 	if req, ok := RequestFrom(ctx); ok {
@@ -217,6 +224,10 @@ func (m *meteredBody) finish(complete bool) {
 		}
 		m.buf, m.data = nil, nil
 		m.result.Complete = complete && !m.overflow
+		// A 2xx reports its usage, so its usage is final only with the
+		// report. Any other status reports none.
+		reported := m.parser != nil && m.parser.reported()
+		m.result.UsageComplete = m.result.Complete && (reported || m.result.Status < 200 || m.result.Status > 299)
 		m.done(m.ctx, m.result)
 	})
 }

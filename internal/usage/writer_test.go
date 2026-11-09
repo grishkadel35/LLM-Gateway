@@ -259,6 +259,7 @@ func TestWriterStoresEveryField(t *testing.T) {
 	w.start()
 
 	priced := testRow(tn, key, "req_priced")
+	priced.UsageComplete = true
 	unpriced := testRow(tn, key, "req_unpriced")
 	unpriced.CostMicros = nil
 	unpriced.ProviderRequestID = ""
@@ -274,7 +275,7 @@ func TestWriterStoresEveryField(t *testing.T) {
 		keyID                                     int64
 		status, input, cached, cacheWrite, output int
 		cost                                      sql.NullInt64
-		isCached, streamed                        bool
+		usageComplete, isCached, streamed         bool
 		latency                                   int
 		createdAt                                 time.Time
 	}
@@ -283,10 +284,10 @@ func TestWriterStoresEveryField(t *testing.T) {
 		err := conn.QueryRow(`
 			SELECT provider_request_id, tenant_id, api_key_id, provider, model, endpoint, status,
 			       input_tokens, cached_input_tokens, cache_write_tokens, output_tokens,
-			       cost_micros, cached, streamed, latency_ms, created_at
+			       cost_micros, usage_complete, cached, streamed, latency_ms, created_at
 			FROM usage_logs WHERE request_id = $1`, requestID,
 		).Scan(&s.providerRequestID, &s.tenantID, &s.keyID, &s.provider, &s.model, &s.endpoint, &s.status,
-			&s.input, &s.cached, &s.cacheWrite, &s.output, &s.cost, &s.isCached, &s.streamed, &s.latency, &s.createdAt)
+			&s.input, &s.cached, &s.cacheWrite, &s.output, &s.cost, &s.usageComplete, &s.isCached, &s.streamed, &s.latency, &s.createdAt)
 		if err != nil {
 			t.Fatalf("reading %s: %v", requestID, err)
 		}
@@ -300,16 +301,16 @@ func TestWriterStoresEveryField(t *testing.T) {
 	}
 	// Both cache-write TTLs go in the one column; pricing already used the
 	// split.
-	if p.input != 15 || p.cached != 5 || p.cacheWrite != 3 || p.output != 17 || !p.cost.Valid || p.cost.Int64 != 75 {
-		t.Errorf("tokens and cost = %+v", p)
+	if p.input != 15 || p.cached != 5 || p.cacheWrite != 3 || p.output != 17 || !p.cost.Valid || p.cost.Int64 != 75 || !p.usageComplete {
+		t.Errorf("tokens, cost and usage_complete = %+v", p)
 	}
 	if !p.createdAt.Equal(time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)) {
 		t.Errorf("created_at = %v, want the request's time, not the flush time", p.createdAt)
 	}
 
 	u := read("req_unpriced")
-	if u.cost.Valid || u.providerRequestID.Valid {
-		t.Errorf("cost = %v, provider_request_id = %v; want both NULL", u.cost, u.providerRequestID)
+	if u.cost.Valid || u.providerRequestID.Valid || u.usageComplete {
+		t.Errorf("cost = %v, provider_request_id = %v, usage_complete = %v; want both NULL, and false", u.cost, u.providerRequestID, u.usageComplete)
 	}
 }
 

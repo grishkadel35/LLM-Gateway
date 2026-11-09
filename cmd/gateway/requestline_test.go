@@ -26,6 +26,7 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/db/dbtest"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/mockprovider"
+	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
 	"github.com/grishkadel/llm-gateway/internal/usage"
@@ -159,7 +160,7 @@ func (g *lineGateway) line(t *testing.T, id string) map[string]any {
 type lineRow struct {
 	Input, CachedInput, CacheWrite, Output int64
 	Cost                                   sql.NullInt64
-	Cached, Streamed                       bool
+	UsageComplete, Cached, Streamed        bool
 }
 
 // row returns the usage row of provider's attempt at the request with ID id.
@@ -168,9 +169,9 @@ func (g *lineGateway) row(t *testing.T, id, provider string) lineRow {
 	t.Helper()
 	var r lineRow
 	err := g.conn.QueryRow(`
-		SELECT input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, cached, streamed
+		SELECT input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost_micros, usage_complete, cached, streamed
 		FROM usage_logs WHERE request_id = $1 AND provider = $2`, id, provider,
-	).Scan(&r.Input, &r.CachedInput, &r.CacheWrite, &r.Output, &r.Cost, &r.Cached, &r.Streamed)
+	).Scan(&r.Input, &r.CachedInput, &r.CacheWrite, &r.Output, &r.Cost, &r.UsageComplete, &r.Cached, &r.Streamed)
 	if err != nil {
 		t.Fatalf("no usage row for %s's attempt at request %s: %v", provider, id, err)
 	}
@@ -178,7 +179,7 @@ func (g *lineGateway) row(t *testing.T, id, provider string) lineRow {
 }
 
 // fields returns the request line's usage fields that repeat r: its tokens,
-// its cost (null when it has none), cached and streamed.
+// its cost (null when it has none), usage_complete, cached and streamed.
 func (r lineRow) fields() map[string]any {
 	var cost any
 	if r.Cost.Valid {
@@ -190,6 +191,7 @@ func (r lineRow) fields() map[string]any {
 		"cache_write_tokens":  float64(r.CacheWrite),
 		"output_tokens":       float64(r.Output),
 		"cost_micros":         cost,
+		"usage_complete":      r.UsageComplete,
 		"cached":              r.Cached,
 		"streamed":            r.Streamed,
 	}
@@ -198,7 +200,7 @@ func (r lineRow) fields() map[string]any {
 // recordedFields are the request line's fields that come from the request's
 // Record.
 var recordedFields = []string{"tenant_id", "provider", "model", "fallback_provider", "input_tokens", "cached_input_tokens",
-	"cache_write_tokens", "output_tokens", "cost_micros", "cached", "streamed"}
+	"cache_write_tokens", "output_tokens", "cost_micros", "usage_complete", "cached", "streamed"}
 
 // fromRecord returns the fields of line, a request line, that come from the
 // request's Record. A field logged as null is there, with a nil value.
@@ -432,12 +434,13 @@ func TestRequestLine(t *testing.T) {
 }
 
 // TestRequestLineClientLeavesMidStream: a client that leaves mid-stream
-// still gets its line, with the usage seen so far and cost_micros null: its
-// row's, as the usage is incomplete. The gateway runs behind a real server,
-// so ReverseProxy aborts the stream with panic(http.ErrAbortHandler), as it
-// would in production, and the line is written as that unwinds.
+// still gets its line, with the usage seen so far, usage_complete false, and
+// as cost_micros its row's: what the budget held, here the 1,000 input tokens
+// seen, which cost more than the reservation. The gateway runs behind a real
+// server, so ReverseProxy aborts the stream with panic(http.ErrAbortHandler),
+// as it would in production, and the line is written as that unwinds.
 func TestRequestLineClientLeavesMidStream(t *testing.T) {
-	g := newLineGateway(t, openaiAt(t, sseUpstream(t, 1000), ""), map[string]int{"usage incomplete; logged without cost": 1})
+	g := newLineGateway(t, openaiAt(t, sseUpstream(t, 1000), ""), map[string]int{"usage incomplete; charged the budget's hold": 1})
 	acme, key := g.newTenant(t, "acme", tenant.Update{})
 
 	// done closes when the gateway is through with the request, abort
@@ -451,12 +454,13 @@ func TestRequestLineClientLeavesMidStream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+"/openai/v1/chat/completions",
-		strings.NewReader(`{"model":"gpt-4o","stream":true,"max_tokens":5,"messages":[]}`))
+	const body = `{"model":"gpt-4o","stream":true,"max_tokens":5,"messages":[]}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+"/openai/v1/chat/completions", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
+	at := time.Now()
 	resp, err := gw.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -472,10 +476,16 @@ func TestRequestLineClientLeavesMidStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The upstream names model m, so gpt-4o prices what it saw.
+	reserve, _ := pricing.Reserve("openai", "gpt-4o", reserveTokens(body), 5, 1, at)
+	seen, _ := pricing.Cost("openai", usage.Usage{Model: "m", Input: 1000}, "gpt-4o", at)
+	if seen <= reserve {
+		t.Fatalf("the usage seen costs %d µ$, the reservation %d; want it to cost more", seen, reserve)
+	}
 	id := resp.Header.Get("X-Request-ID")
 	row := g.row(t, id, "openai")
-	if row.Input != 1000 || row.Cost.Valid || !row.Streamed {
-		t.Errorf("the row = %+v, want the 1,000 input tokens seen, no cost, streamed", row)
+	if row.Input != 1000 || row.UsageComplete || !row.Cost.Valid || row.Cost.Int64 != seen || !row.Streamed {
+		t.Errorf("the row = %+v, want the 1,000 input tokens seen, incomplete, at their cost, %d, streamed", row, seen)
 	}
 	want := with(row.fields(), map[string]any{"tenant_id": acme, "provider": "openai", "model": "gpt-4o"})
 	if got := fromRecord(g.line(t, id)); !reflect.DeepEqual(got, want) {

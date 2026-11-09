@@ -24,7 +24,7 @@ func withRecord(req *http.Request) (*http.Request, *Record) {
 
 // lineFields are the request line's fields that come from the Record.
 var lineFields = []string{"tenant_id", "provider", "model", "fallback_provider", "input_tokens", "cached_input_tokens",
-	"cache_write_tokens", "output_tokens", "cost_micros", "cached", "streamed"}
+	"cache_write_tokens", "output_tokens", "cost_micros", "usage_complete", "cached", "streamed"}
 
 // recordedFields returns the fields of entry, a request line, that come from
 // the Record. A field logged as null is there, with a nil value.
@@ -47,7 +47,7 @@ func TestLoggingLineFromRecord(t *testing.T) {
 	cost, zero := int64(144), int64(0)
 	answered := &UsageReport{Provider: "openai", Result: usage.Result{
 		Usage:  usage.Usage{Model: "gpt-4o-2024-08-06", Input: 15, CachedInput: 5, CacheWrite: 3, CacheWrite1h: 4, Output: 10},
-		Status: http.StatusOK, Complete: true,
+		Status: http.StatusOK, Complete: true, UsageComplete: true,
 	}, CostMicros: &cost}
 	// with returns a copy of answered, changed by change.
 	with := func(change func(*UsageReport)) *UsageReport {
@@ -58,7 +58,7 @@ func TestLoggingLineFromRecord(t *testing.T) {
 	asked := &usage.Request{Model: "gpt-4o"}
 	// The fields every request with an answer gets, from answered.
 	usageFields := map[string]any{"input_tokens": 15.0, "cached_input_tokens": 5.0, "cache_write_tokens": 7.0,
-		"output_tokens": 10.0, "cost_micros": 144.0, "cached": false}
+		"output_tokens": 10.0, "cost_micros": 144.0, "usage_complete": true, "cached": false}
 
 	cases := []struct {
 		name   string
@@ -84,14 +84,18 @@ func TestLoggingLineFromRecord(t *testing.T) {
 			Usage: with(func(u *UsageReport) { u.CostMicros = nil })},
 			union(usageFields, map[string]any{"provider": "openai", "tenant_id": "tn_acme", "model": "gpt-4o", "streamed": false,
 				"cost_micros": nil})},
+		{"usage incomplete", Record{Provider: "openai", TenantID: "tn_acme", Request: asked,
+			Usage: with(func(u *UsageReport) { u.UsageComplete = false })},
+			union(usageFields, map[string]any{"provider": "openai", "tenant_id": "tn_acme", "model": "gpt-4o", "streamed": false,
+				"usage_complete": false})},
 		{"answered by the fallback", Record{Provider: "ollama", TenantID: "tn_acme", Request: asked,
 			Usage: with(func(u *UsageReport) { u.Provider = "groq" })},
 			union(usageFields, map[string]any{"provider": "ollama", "tenant_id": "tn_acme", "model": "gpt-4o", "streamed": false,
 				"fallback_provider": "groq"})},
 		{"a cache hit", Record{Provider: "openai", TenantID: "tn_acme", Request: asked, Cache: "hit",
-			Usage: &UsageReport{Provider: "openai", Result: usage.Result{Status: http.StatusOK, Complete: true, Cached: true}, CostMicros: &zero}},
+			Usage: &UsageReport{Provider: "openai", Result: usage.Result{Status: http.StatusOK, Complete: true, UsageComplete: true, Cached: true}, CostMicros: &zero}},
 			map[string]any{"provider": "openai", "tenant_id": "tn_acme", "model": "gpt-4o", "streamed": false, "input_tokens": 0.0,
-				"cached_input_tokens": 0.0, "cache_write_tokens": 0.0, "output_tokens": 0.0, "cost_micros": 0.0, "cached": true}},
+				"cached_input_tokens": 0.0, "cache_write_tokens": 0.0, "output_tokens": 0.0, "cost_micros": 0.0, "usage_complete": true, "cached": true}},
 		// The client got the fallback's 402, not the failed attempt's answer.
 		{"a fallback's attempt refused by Budget", Record{Provider: "ollama", TenantID: "tn_acme", Request: asked,
 			Usage:         &UsageReport{Provider: "ollama", Result: usage.Result{Status: http.StatusInternalServerError, Complete: true, Streamed: true}, CostMicros: &zero},
@@ -174,7 +178,7 @@ func TestLoggingLineAfterAbort(t *testing.T) {
 	}()
 
 	want := map[string]any{"provider": "openai", "input_tokens": 1000.0, "cached_input_tokens": 0.0, "cache_write_tokens": 0.0,
-		"output_tokens": 0.0, "cost_micros": nil, "cached": false}
+		"output_tokens": 0.0, "cost_micros": nil, "usage_complete": false, "cached": false}
 	if got := recordedFields(logLine(t, &logs)); !reflect.DeepEqual(got, want) {
 		t.Errorf("fields from the Record = %v\nwant %v", got, want)
 	}

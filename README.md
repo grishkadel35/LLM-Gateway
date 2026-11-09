@@ -21,7 +21,7 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-11-08
+**Last updated:** 2026-11-09
 **Stage:** Weeks 1 to 6 of 8 complete, checkpoints closed; Week 7
 (Docker, testing, CI/CD) is under way. Every provider
 request is authenticated with a tenant key and held to its tenant's
@@ -47,6 +47,25 @@ API, cost included, in all 53 comparisons.
 
 ### What changed
 
+- **Incomplete usage keeps its hold, recorded.** A paid response whose final
+  usage the gateway never saw now costs what its budget kept: the reservation,
+  or the cost of the usage seen if that is more.
+  - **When:** the client left mid-stream, the provider never answered a
+    request that went out (the gateway's `499`, `502` or `504`), or a 2xx
+    ended without the provider's usage report. A test pins each format's
+    report: OpenAI's `usage` object, Anthropic's body or `message_delta`
+    usage, and Gemini's `usageMetadata`, which on SSE must be in or after the
+    chunk with `finishReason`.
+  - **Recorded:** the usage row keeps the tokens seen, with
+    `usage_complete = false` (migration 00004). The request line,
+    `gateway_cost_micros_total` and the ledger's settlement carry the same
+    figure, so the month's rows add up to the ledger's spend, and a rebuild
+    after a lost month counts these holds too. The admin usage report adds
+    `incomplete_requests`.
+  - **Unchanged:** a failed dial, a provider's error without usage, free
+    providers and cache hits cost 0, and the rate limiter settles as before.
+    An uncapped request's hold is the model's whole maximum output, so set
+    `max_tokens`.
 - **Tests for SSE framing and malformed JSON.** They pin how the gateway
   reads what it doesn't control:
   - **Framing:** `internal/usage/framing_test.go` meters an OpenAI, an

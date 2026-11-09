@@ -24,7 +24,13 @@ type Row struct {
 	Endpoint          string
 	Status            int
 	Usage
-	// CostMicros is nil when the model isn't priced, and stored as NULL.
+	// UsageComplete is false when Usage may not be the provider's final
+	// count (see Result.UsageComplete): it is what the gateway saw, and
+	// CostMicros what the request's budget held for it.
+	UsageComplete bool
+	// CostMicros is nil when the cost isn't known, and stored as NULL: the
+	// model isn't priced, or the usage is incomplete and no budget held
+	// anything for it.
 	CostMicros *int64
 	Cached     bool
 	Streamed   bool
@@ -198,7 +204,7 @@ func (w *Writer) run() {
 	}
 }
 
-const rowColumns = 17
+const rowColumns = 18
 
 // flush writes batch as one multi-row INSERT. If Postgres rejects it, each
 // row is retried on its own, so one bad row costs only itself, not the other
@@ -232,7 +238,7 @@ func (w *Writer) insert(rows []Row) error {
 	var q strings.Builder
 	q.WriteString(`INSERT INTO usage_logs (request_id, provider_request_id, tenant_id, api_key_id,
 		provider, model, endpoint, status, input_tokens, cached_input_tokens, cache_write_tokens,
-		output_tokens, cost_micros, cached, streamed, latency_ms, created_at) VALUES `)
+		output_tokens, cost_micros, usage_complete, cached, streamed, latency_ms, created_at) VALUES `)
 	args := make([]any, 0, len(rows)*rowColumns)
 	for i, r := range rows {
 		if i > 0 {
@@ -255,7 +261,7 @@ func (w *Writer) insert(rows []Row) error {
 			text(r.Provider), text(r.Model), text(r.Endpoint), r.Status, r.Input, r.CachedInput,
 			// One column for both TTLs: the cost already priced them apart.
 			r.CacheWrite+r.CacheWrite1h,
-			r.Output, r.CostMicros, r.Cached, r.Streamed, r.LatencyMS, r.CreatedAt)
+			r.Output, r.CostMicros, r.UsageComplete, r.Cached, r.Streamed, r.LatencyMS, r.CreatedAt)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)

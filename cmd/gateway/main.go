@@ -34,7 +34,6 @@ import (
 	"github.com/grishkadel/llm-gateway/internal/health"
 	"github.com/grishkadel/llm-gateway/internal/metrics"
 	"github.com/grishkadel/llm-gateway/internal/middleware"
-	"github.com/grishkadel/llm-gateway/internal/pricing"
 	"github.com/grishkadel/llm-gateway/internal/proxy"
 	"github.com/grishkadel/llm-gateway/internal/ratelimit"
 	"github.com/grishkadel/llm-gateway/internal/tenant"
@@ -138,10 +137,11 @@ func router(cfg *config.Config, store tenantStore, adminKey string, onUsage usag
 			// whether to store the response.
 			middleware.ReportUsage(ctx, name, r)
 			// Priced once, as recordUsage prices the usage row, for the
-			// metrics and the request line alike. The model label comes from
-			// the names it was priced by: the response's model, then the one
-			// this attempt asked for.
-			cost := usageCost(ctx, name, free, r)
+			// metrics and the request line alike: an incomplete paid response
+			// at what its budget holds. The model label comes from the names
+			// it was priced by: the response's model, then the one this
+			// attempt asked for.
+			cost := middleware.UsageCost(ctx, name, free, r)
 			t, _, _ := middleware.TenantFrom(ctx)
 			requested := ""
 			if req, ok := usage.RequestFrom(ctx); ok {
@@ -610,7 +610,8 @@ func readyChecks(conn *sql.DB, rdb, ledgerRdb *redis.Client) map[string]func(con
 // recordUsage returns a usageFunc that turns each provider response, and each
 // cache hit, into a usage_logs row, priced, and queues it on w. It never
 // blocks: w drops rather than wait. A cache hit costs 0, and so does every row
-// of a provider marked free in providers.
+// of a provider marked free in providers. A paid response whose usage is
+// incomplete costs what its budget holds (middleware.UsageCost).
 func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, logger *slog.Logger) usageFunc {
 	return func(ctx context.Context, provider string, r usage.Result) {
 		t, key, ok := middleware.TenantFrom(ctx)
@@ -634,6 +635,7 @@ func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, lo
 			Endpoint:          req.Path,
 			Status:            r.Status,
 			Usage:             r.Usage,
+			UsageComplete:     r.UsageComplete,
 			Cached:            r.Cached,
 			Streamed:          r.Streamed,
 			LatencyMS:         time.Since(req.Received).Milliseconds(),
@@ -641,36 +643,23 @@ func recordUsage(w *usage.Writer, providers map[string]config.ProviderConfig, lo
 		}
 
 		// Cost is recorded only when it is known, and is NULL otherwise.
-		// Budget settles a paid attempt by the same function, so whenever
-		// its row has a cost, the ledger is charged exactly that.
-		cost, known := pricing.ResultCost(provider, providers[provider].Free, r, req.Model, req.Received)
+		// Budget settles a paid attempt at the same figure, so the ledger is
+		// charged exactly the row's cost. Only a router with no budgets
+		// leaves incomplete usage without one.
+		free := providers[provider].Free
+		row.CostMicros = middleware.UsageCost(ctx, provider, free, r)
 		switch {
-		case known:
-			row.CostMicros = &cost
-		case !r.Complete:
+		case row.CostMicros == nil && !r.UsageComplete:
 			logger.Warn("usage incomplete; logged without cost",
 				"request_id", row.RequestID, "provider", provider, "model", r.Model)
-		default:
+		case row.CostMicros == nil:
 			logger.Warn("model not priced; usage logged without cost",
 				"request_id", row.RequestID, "provider", provider, "model", r.Model)
+		case !r.UsageComplete && !free:
+			logger.Warn("usage incomplete; charged the budget's hold",
+				"request_id", row.RequestID, "provider", provider, "model", r.Model, "cost_micros", *row.CostMicros)
 		}
 
 		w.Write(row)
 	}
-}
-
-// usageCost returns what r, provider's response to the request on ctx, cost
-// in µ$, or nil when that isn't known. free reports that provider costs
-// nothing. It prices r with exactly the inputs recordUsage gives
-// pricing.ResultCost, so the request line's cost is the usage row's.
-func usageCost(ctx context.Context, provider string, free bool, r usage.Result) *int64 {
-	req, ok := usage.RequestFrom(ctx)
-	if !ok {
-		req = &usage.Request{Received: time.Now()}
-	}
-	cost, known := pricing.ResultCost(provider, free, r, req.Model, req.Received)
-	if !known {
-		return nil
-	}
-	return &cost
 }
