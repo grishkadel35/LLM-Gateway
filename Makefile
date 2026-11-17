@@ -18,7 +18,7 @@ MOCK_ADMIN_KEY := mock-admin-key-for-local-testing-only
 
 # .PHONY tells make these targets are commands, not files to be produced.
 # Without it, a file named "test" in the repo would stop `make test` working.
-.PHONY: build run mock run-mock db-up db-down obs-up obs-down migrate test vet lint fmt tidy clean all
+.PHONY: build run mock run-mock bench db-up db-down obs-up obs-down migrate test vet lint fmt tidy clean all
 
 all: fmt vet test build
 
@@ -38,6 +38,16 @@ run-mock: build
 	MOCK_API_KEY=mock GATEWAY_ADMIN_KEY=$(MOCK_ADMIN_KEY) DATABASE_URL='$(DATABASE_URL)' \
 		REDIS_URL='$(REDIS_URL)' BUDGET_REDIS_URL='$(BUDGET_REDIS_URL)' \
 		GATEWAY_CONFIG=config.mock.yaml ./$(BINARY)
+
+# The benchmarks, on the mock provider: scripts/bench.sh builds and starts the
+# mock and the gateway itself, so stop run-mock first (ports 8080 and 9090). Needs
+# hey, and make db-up migrate. ARGS=-quick is the smoke run, about 75 seconds;
+# without it, about 6 minutes.
+#   make bench ARGS=-quick
+bench:
+	GATEWAY_ADMIN_KEY=$(MOCK_ADMIN_KEY) DATABASE_URL='$(DATABASE_URL)' \
+		REDIS_URL='$(REDIS_URL)' BUDGET_REDIS_URL='$(BUDGET_REDIS_URL)' \
+		scripts/bench.sh $(ARGS)
 
 # Local Postgres and the two Redis (redis and redis-budget) from
 # deployments/docker-compose.yml. --wait blocks until the healthchecks pass, so

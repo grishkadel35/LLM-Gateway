@@ -56,6 +56,23 @@ compose Postgres and Redis, and the whole stack, seeded and checked by
 
 ### What changed
 
+- **`make bench` runs every benchmark.** `scripts/bench.sh` builds the
+  gateway, the mock (`-chunk-delay 50ms`) and `cmd/bench` into a temp dir,
+  starts the mock and the gateway on `config.mock.yaml`, and stops both when
+  it exits. Postgres and both Redis must be up (`make db-up migrate`), and it
+  needs `hey` (`go install github.com/rakyll/hey@v0.1.4`), `curl` and `jq`.
+  - **hey**, on a fresh tenant whose limits never bind: the gateway with the
+    cache off and the mock directly, each at 10, 50, 100 and 200 workers for
+    30 s, then the gateway with the cache on at 50.
+  - **The gateway's `/metrics`**, saved for `gateway_overhead_seconds` and
+    the usage writer's dropped-rows counter.
+  - **`cmd/bench`**: `ttfb`, `ratelimit`, `budget` and `cache`.
+
+  Everything lands in `bench/results/<date>/` with an `env.txt` (commit,
+  machine, versions), and one table closes the run: each hey run's req/s,
+  p50, p99 and non-200 count, then each subcommand's PASS or FAIL. `make
+  bench ARGS=-quick` is a smoke run of about 75 seconds, written to
+  `bench/results/quick-<date>/`, which git ignores.
 - **`cmd/bench` measures what a load generator can't.** One stdlib-only Go
   program with four subcommands, each on a fresh tenant of its own, each
   printing a summary, writing a JSON result and exiting 0 on a pass, 1 on a
