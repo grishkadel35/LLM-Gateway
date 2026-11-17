@@ -1,0 +1,192 @@
+# HELP gateway_budget_micros Each tenant's monthly budget in micro-dollars, as the tenant's latest request to a paid provider found it, set with gateway_budget_spent_micros. A new budget shows from the tenant's next such request. tenant is the tenant's ID; the operator creates tenants.
+# TYPE gateway_budget_micros gauge
+gateway_budget_micros{tenant="tn_6defe240f3f2f847"} 1.65e+09
+# HELP gateway_budget_spent_micros Each tenant's spend for the month in micro-dollars, reservations in flight included, as the budget ledger reported it to the tenant's latest request to a paid provider: after its reservation, admitted or refused, or its settlement. A tenant shows up once it sends one after the gateway starts, and one idle since the month began shows last month's spend until its next. tenant is the tenant's ID; the operator creates tenants.
+# TYPE gateway_budget_spent_micros gauge
+gateway_budget_spent_micros{tenant="tn_6defe240f3f2f847"} 1.194264e+06
+# HELP gateway_cache_requests_total Requests the response cache looked at, by its decision: hit, miss, bypass, or error for a lookup that failed. provider is the route the client called. tenant is the tenant's ID; the operator creates tenants.
+# TYPE gateway_cache_requests_total counter
+gateway_cache_requests_total{provider="openai",result="bypass",tenant="tn_6defe240f3f2f847"} 132695
+gateway_cache_requests_total{provider="openai",result="hit",tenant="tn_6defe240f3f2f847"} 56839
+gateway_cache_requests_total{provider="openai",result="miss",tenant="tn_6defe240f3f2f847"} 1
+# HELP gateway_cost_micros_total What the providers' responses cost in micro-dollars, as their usage rows have it; a response whose cost isn't known adds nothing. provider is the one that produced them, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants. model is the price table's name for the model that priced them, so clients can't add series.
+# TYPE gateway_cost_micros_total counter
+gateway_cost_micros_total{model="gpt-4o-mini",provider="openai",tenant="tn_6defe240f3f2f847"} 1.194264e+06
+# HELP gateway_overhead_seconds The gateway's own work on a request before a provider sees it (auth, the body read, the cache lookup, the rate-limit and budget checks): from its arrival on a provider route to its first attempt's handoff to a provider's transport, before any wait for a concurrency slot. Observed once per request handed off, so not for a cache hit or a request refused before then. provider is the route the client called, even when a fallback answered.
+# TYPE gateway_overhead_seconds histogram
+gateway_overhead_seconds_bucket{provider="openai",le="0.0001"} 0
+gateway_overhead_seconds_bucket{provider="openai",le="0.00025"} 0
+gateway_overhead_seconds_bucket{provider="openai",le="0.0005"} 0
+gateway_overhead_seconds_bucket{provider="openai",le="0.001"} 2452
+gateway_overhead_seconds_bucket{provider="openai",le="0.0025"} 33498
+gateway_overhead_seconds_bucket{provider="openai",le="0.005"} 55818
+gateway_overhead_seconds_bucket{provider="openai",le="0.01"} 76294
+gateway_overhead_seconds_bucket{provider="openai",le="0.025"} 100754
+gateway_overhead_seconds_bucket{provider="openai",le="0.05"} 104938
+gateway_overhead_seconds_bucket{provider="openai",le="0.1"} 106765
+gateway_overhead_seconds_bucket{provider="openai",le="0.25"} 115920
+gateway_overhead_seconds_bucket{provider="openai",le="0.5"} 124210
+gateway_overhead_seconds_bucket{provider="openai",le="1"} 132636
+gateway_overhead_seconds_bucket{provider="openai",le="2.5"} 132696
+gateway_overhead_seconds_bucket{provider="openai",le="+Inf"} 132696
+gateway_overhead_seconds_sum{provider="openai"} 10606.657077518046
+gateway_overhead_seconds_count{provider="openai"} 132696
+# HELP gateway_request_duration_seconds Time to serve a request on each provider route, a streamed body included. provider is the route the client called, even when a fallback answered. No tenant or model label, since each value would multiply the buckets.
+# TYPE gateway_request_duration_seconds histogram
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.001"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.005"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.025"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.1"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.25"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="0.5"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="1"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="2.5"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="5"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="10"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="30"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="60"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="120"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="300"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="600"} 0
+gateway_request_duration_seconds_bucket{provider="anthropic",le="+Inf"} 0
+gateway_request_duration_seconds_sum{provider="anthropic"} 0
+gateway_request_duration_seconds_count{provider="anthropic"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.001"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.005"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.025"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.1"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.25"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="0.5"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="1"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="2.5"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="5"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="10"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="30"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="60"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="120"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="300"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="600"} 0
+gateway_request_duration_seconds_bucket{provider="gemini",le="+Inf"} 0
+gateway_request_duration_seconds_sum{provider="gemini"} 0
+gateway_request_duration_seconds_count{provider="gemini"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.001"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.005"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.025"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.1"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.25"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="0.5"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="1"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="2.5"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="5"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="10"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="30"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="60"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="120"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="300"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="600"} 0
+gateway_request_duration_seconds_bucket{provider="groq",le="+Inf"} 0
+gateway_request_duration_seconds_sum{provider="groq"} 0
+gateway_request_duration_seconds_count{provider="groq"} 0
+gateway_request_duration_seconds_bucket{provider="openai",le="0.001"} 6660
+gateway_request_duration_seconds_bucket{provider="openai",le="0.005"} 77710
+gateway_request_duration_seconds_bucket{provider="openai",le="0.025"} 145928
+gateway_request_duration_seconds_bucket{provider="openai",le="0.1"} 156167
+gateway_request_duration_seconds_bucket{provider="openai",le="0.25"} 172649
+gateway_request_duration_seconds_bucket{provider="openai",le="0.5"} 181311
+gateway_request_duration_seconds_bucket{provider="openai",le="1"} 189758
+gateway_request_duration_seconds_bucket{provider="openai",le="2.5"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="5"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="10"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="30"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="60"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="120"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="300"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="600"} 189819
+gateway_request_duration_seconds_bucket{provider="openai",le="+Inf"} 189819
+gateway_request_duration_seconds_sum{provider="openai"} 12358.8378071299
+gateway_request_duration_seconds_count{provider="openai"} 189819
+# HELP gateway_requests_total Requests on each provider route, by the HTTP status the client received. provider is the route the client called, even when a fallback answered. tenant is the tenant's ID, or none before one was known (a 401, or 503 auth_unavailable); the operator creates tenants. model is the price table's name for the model the client asked of the route's provider, or other, so clients can't add series.
+# TYPE gateway_requests_total counter
+gateway_requests_total{model="gpt-4o-mini",provider="openai",status="200",tenant="tn_6defe240f3f2f847"} 189535
+gateway_requests_total{model="other",provider="openai",status="503",tenant="none"} 284
+# HELP gateway_tokens_total Tokens the providers reported, by type. provider is the one that produced them, so after a fallback it is the fallback target. tenant is the tenant's ID; the operator creates tenants. model is the price table's name for the model that priced them, or other, so clients can't add series.
+# TYPE gateway_tokens_total counter
+gateway_tokens_total{model="gpt-4o-mini",provider="openai",tenant="tn_6defe240f3f2f847",type="cached_input"} 663480
+gateway_tokens_total{model="gpt-4o-mini",provider="openai",tenant="tn_6defe240f3f2f847",type="input"} 1.99044e+06
+gateway_tokens_total{model="gpt-4o-mini",provider="openai",tenant="tn_6defe240f3f2f847",type="output"} 1.32696e+06
+# HELP gateway_upstream_ttfb_seconds Time from each attempt's handoff to its provider's transport, after any wait for a concurrency slot, to the provider's response headers: a stream's come as it starts, a non-streaming response's once it is generated. Only attempts that got a response, of any status, are observed, not a failed dial, a timeout or a client gone. provider is the provider the attempt went to, so after a fallback each attempt counts under its own.
+# TYPE gateway_upstream_ttfb_seconds histogram
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="0.025"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="0.05"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="0.1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="0.25"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="0.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="2.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="10"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="30"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="60"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="120"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="300"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="600"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="anthropic",le="+Inf"} 0
+gateway_upstream_ttfb_seconds_sum{provider="anthropic"} 0
+gateway_upstream_ttfb_seconds_count{provider="anthropic"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="0.025"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="0.05"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="0.1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="0.25"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="0.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="2.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="10"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="30"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="60"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="120"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="300"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="600"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="gemini",le="+Inf"} 0
+gateway_upstream_ttfb_seconds_sum{provider="gemini"} 0
+gateway_upstream_ttfb_seconds_count{provider="gemini"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="0.025"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="0.05"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="0.1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="0.25"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="0.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="1"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="2.5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="5"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="10"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="30"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="60"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="120"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="300"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="600"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="groq",le="+Inf"} 0
+gateway_upstream_ttfb_seconds_sum{provider="groq"} 0
+gateway_upstream_ttfb_seconds_count{provider="groq"} 0
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="0.025"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="0.05"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="0.1"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="0.25"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="0.5"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="1"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="2.5"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="5"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="10"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="30"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="60"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="120"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="300"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="600"} 132696
+gateway_upstream_ttfb_seconds_bucket{provider="openai",le="+Inf"} 132696
+gateway_upstream_ttfb_seconds_sum{provider="openai"} 15.55627672200003
+gateway_upstream_ttfb_seconds_count{provider="openai"} 132696
+# HELP gateway_usage_writer_dropped_total Usage rows the usage writer dropped because its queue was full, or because it had closed, read when scraped. A dropped row never reaches usage_logs. A row Postgres rejects is logged, not counted here.
+# TYPE gateway_usage_writer_dropped_total counter
+gateway_usage_writer_dropped_total 9074
+# HELP gateway_usage_writer_queue_depth Usage rows waiting in the usage writer's queue for their batch insert, read when scraped. The queue is bounded, and a row that finds it full is dropped (see gateway_usage_writer_dropped_total). A batch being inserted has left the queue and isn't counted.
+# TYPE gateway_usage_writer_queue_depth gauge
+gateway_usage_writer_queue_depth 9036

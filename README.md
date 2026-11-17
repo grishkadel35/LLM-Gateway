@@ -56,6 +56,10 @@ compose Postgres and Redis, and the whole stack, seeded and checked by
 
 ### What changed
 
+- **The first full benchmark run is committed**, in `bench/results/2026-11-16/`
+  (commit `e0a3180`): hey's summaries, `cmd/bench`'s JSON, the gateway's
+  `/metrics` and `env.txt`. Its `dirty tree: yes` came from the results
+  directory itself; `bench.sh` now leaves `bench/results/` out of that check.
 - **`make bench` runs every benchmark.** `scripts/bench.sh` builds the
   gateway, the mock (`-chunk-delay 50ms`) and `cmd/bench` into a temp dir,
   starts the mock and the gateway on `config.mock.yaml`, and stops both when
