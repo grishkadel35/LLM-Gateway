@@ -456,6 +456,12 @@ func validateAdminKey(key string) error {
 	return nil
 }
 
+// dbPoolSize is how many Postgres connections one gateway holds, open and
+// idle alike: the usage writer's inserts take up to 4, key lookups the rest.
+// Two gateways at 20 each use 40 of Postgres's default 100, which leaves room
+// for migrations, tests and psql.
+const dbPoolSize = 20
+
 // openDB connects to Postgres and pings it, so a missing or unreachable
 // database stops startup instead of turning every request into a 503.
 func openDB(dsn string) (*sql.DB, error) {
@@ -468,6 +474,13 @@ func openDB(dsn string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening the database: %w", err)
 	}
+	// Every request reads its key with one short query, so a small pool kept
+	// open serves thousands a second. Left at database/sql's defaults (two idle
+	// connections, no cap), a burst dials and authenticates a new connection
+	// for nearly every request, then closes it again. Idle connections are kept
+	// for good: nothing here needs them recycled.
+	conn.SetMaxOpenConns(dbPoolSize)
+	conn.SetMaxIdleConns(dbPoolSize)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

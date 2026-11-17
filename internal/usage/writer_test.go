@@ -252,6 +252,63 @@ func TestWriterQueued(t *testing.T) {
 	}
 }
 
+// TestWriterInsertsConcurrently: with two inserters, a second batch is taken
+// off the queue and inserted while the first is held up, and only then do
+// rows wait in the queue.
+func TestWriterInsertsConcurrently(t *testing.T) {
+	conn, tn, key := newWriterDB(t)
+	w := newWriter(conn, discard(), 10, 2, time.Hour)
+	w.inserters = 2
+	w.start()
+	defer w.Close(context.Background())
+
+	lock, err := conn.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Rollback() }()
+	if _, err := lock.Exec(`LOCK TABLE usage_logs IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 4; i++ {
+		w.Write(testRow(tn, key, "req_"+strconv.Itoa(i)))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var waiting int
+		err := conn.QueryRow(`SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d inserts waited on the table lock, want 2", waiting)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := w.Queued(); got != 0 {
+		t.Errorf("with both batches in their inserts, Queued() = %d, want 0", got)
+	}
+	w.Write(testRow(tn, key, "req_5"))
+	if got := w.Queued(); got != 1 {
+		t.Errorf("with both inserters busy, Queued() = %d, want 1", got)
+	}
+
+	if err := lock.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := countRows(t, conn); n != 5 {
+		t.Errorf("usage_logs has %d rows, want 5", n)
+	}
+}
+
 // TestWriterStoresEveryField reads a row back, NULLs included.
 func TestWriterStoresEveryField(t *testing.T) {
 	conn, tn, key := newWriterDB(t)

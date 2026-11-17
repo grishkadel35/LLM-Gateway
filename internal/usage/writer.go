@@ -9,6 +9,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 // Row is one usage_logs row: one request that reached a provider, or one the
@@ -45,14 +48,19 @@ const (
 	DefaultQueue = 10_000
 	batchSize    = 100
 	flushEvery   = time.Second
+	// inserters is how many batches can be inserting at once. With one, a
+	// slow insert stopped the queue draining: under load each took over 100
+	// ms, about 700 rows a second, and the queue filled. Four leave most of
+	// the gateway's Postgres pool to key lookups.
+	inserters = 4
 	// flushTimeout bounds one batch insert, so a hung database can't stall
 	// the writer forever.
 	flushTimeout = 10 * time.Second
 )
 
 // Writer inserts usage rows in batches, off the response path: Write only
-// queues a row, and a goroutine flushes every batchSize rows or flushEvery,
-// whichever comes first.
+// queues a row, and each of its goroutines flushes every batchSize rows or
+// flushEvery, whichever comes first.
 //
 // Rows are lost only when the queue is full, on a write after Close, or when
 // Postgres rejects that row itself (a failed batch is retried row by row);
@@ -64,6 +72,9 @@ type Writer struct {
 	rows       chan Row
 	batchSize  int
 	flushEvery time.Duration
+	// inserters is how many goroutines take rows off the queue, each with a
+	// batch of its own, so that many inserts can run at once.
+	inserters int
 
 	// mu guards closed: Write must never send on the closed channel.
 	mu      sync.RWMutex
@@ -81,6 +92,7 @@ type Writer struct {
 // queued.
 func NewWriter(db *sql.DB, logger *slog.Logger) *Writer {
 	w := newWriter(db, logger, DefaultQueue, batchSize, flushEvery)
+	w.inserters = inserters
 	w.start()
 	return w
 }
@@ -92,12 +104,22 @@ func newWriter(db *sql.DB, logger *slog.Logger, queue, batch int, every time.Dur
 		rows:       make(chan Row, queue),
 		batchSize:  batch,
 		flushEvery: every,
+		inserters:  1,
 		done:       make(chan struct{}),
 		pending:    make(map[string]int64),
 	}
 }
 
-func (w *Writer) start() { go w.run() }
+func (w *Writer) start() {
+	var wg sync.WaitGroup
+	for range w.inserters {
+		wg.Go(w.run)
+	}
+	go func() {
+		wg.Wait()
+		close(w.done)
+	}()
+}
 
 // Write queues r without blocking. If the queue is full, or the writer is
 // closed, r is dropped, logged and counted.
@@ -124,9 +146,9 @@ func (w *Writer) Write(r Row) {
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 
 // Queued reports how many rows are waiting in the queue: queued by Write, and
-// not yet taken off it by the writer's goroutine. The queue holds DefaultQueue
-// rows, and Write drops a row that finds it full. A batch the goroutine has
-// taken and is inserting has left the queue, so it isn't counted.
+// not yet taken off it by one of the writer's goroutines. The queue holds
+// DefaultQueue rows, and Write drops a row that finds it full. A batch a
+// goroutine has taken and is inserting has left the queue, so it isn't counted.
 func (w *Writer) Queued() int { return len(w.rows) }
 
 // Pending returns the cost, in micro-dollars, of the tenant's rows that Write
@@ -179,8 +201,6 @@ func (w *Writer) Close(ctx context.Context) error {
 }
 
 func (w *Writer) run() {
-	defer close(w.done)
-
 	ticker := time.NewTicker(w.flushEvery)
 	defer ticker.Stop()
 
@@ -204,9 +224,7 @@ func (w *Writer) run() {
 	}
 }
 
-const rowColumns = 18
-
-// flush writes batch as one multi-row INSERT. If Postgres rejects it, each
+// flush writes batch in one COPY. If Postgres rejects it, each
 // row is retried on its own, so one bad row costs only itself, not the other
 // rows (other tenants' included) that happened to share its batch. A row stops
 // counting toward Pending once its insert has committed or it is given up, and
@@ -234,40 +252,38 @@ func (w *Writer) flush(batch []Row) {
 	}
 }
 
-func (w *Writer) insert(rows []Row) error {
-	var q strings.Builder
-	q.WriteString(`INSERT INTO usage_logs (request_id, provider_request_id, tenant_id, api_key_id,
-		provider, model, endpoint, status, input_tokens, cached_input_tokens, cache_write_tokens,
-		output_tokens, cost_micros, usage_complete, cached, streamed, latency_ms, created_at) VALUES `)
-	args := make([]any, 0, len(rows)*rowColumns)
-	for i, r := range rows {
-		if i > 0 {
-			q.WriteString(", ")
-		}
-		q.WriteByte('(')
-		for c := range rowColumns {
-			if c > 0 {
-				q.WriteString(", ")
-			}
-			fmt.Fprintf(&q, "$%d", i*rowColumns+c+1)
-		}
-		q.WriteByte(')')
+// columns are usage_logs' columns, in the order insert gives each row's values.
+var columns = []string{"request_id", "provider_request_id", "tenant_id", "api_key_id",
+	"provider", "model", "endpoint", "status", "input_tokens", "cached_input_tokens", "cache_write_tokens",
+	"output_tokens", "cost_micros", "usage_complete", "cached", "streamed", "latency_ms", "created_at"}
 
+// insert writes rows with COPY, which under load took half the time of a
+// multi-row INSERT of the same rows. It needs the pgx driver.
+func (w *Writer) insert(rows []Row) error {
+	values := make([][]any, len(rows))
+	for i, r := range rows {
 		var providerID sql.NullString
 		if r.ProviderRequestID != "" {
 			providerID = sql.NullString{String: text(r.ProviderRequestID), Valid: true}
 		}
-		args = append(args, text(r.RequestID), providerID, text(r.TenantID), r.APIKeyID,
+		values[i] = []any{text(r.RequestID), providerID, text(r.TenantID), r.APIKeyID,
 			text(r.Provider), text(r.Model), text(r.Endpoint), r.Status, r.Input, r.CachedInput,
 			// One column for both TTLs: the cost already priced them apart.
-			r.CacheWrite+r.CacheWrite1h,
-			r.Output, r.CostMicros, r.UsageComplete, r.Cached, r.Streamed, r.LatencyMS, r.CreatedAt)
+			r.CacheWrite + r.CacheWrite1h,
+			r.Output, r.CostMicros, r.UsageComplete, r.Cached, r.Streamed, r.LatencyMS, r.CreatedAt}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 	defer cancel()
-	_, err := w.db.ExecContext(ctx, q.String(), args...)
-	return err
+	conn, err := w.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.Raw(func(driverConn any) error {
+		_, err := driverConn.(*stdlib.Conn).Conn().CopyFrom(ctx, pgx.Identifier{"usage_logs"}, columns, pgx.CopyFromRows(values))
+		return err
+	})
 }
 
 // text makes s storable in a Postgres TEXT column, which rejects NUL bytes

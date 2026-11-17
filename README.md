@@ -56,6 +56,13 @@ compose Postgres and Redis, and the whole stack, seeded and checked by
 
 ### What changed
 
+- **The gateway keeps a pool of 20 Postgres connections**, open and idle,
+  instead of `database/sql`'s default of 2 idle, which under load made nearly
+  every key lookup dial Postgres. **The usage writer runs 4 inserts at once,
+  with COPY**: one insert at a time kept up with about 700 rows a second, so
+  the first full run dropped 9,074 rows. The quick bench went from 487-756
+  req/s, with 503s at 100 and 200 workers, to 1,694-2,450 req/s with none,
+  and no rows dropped.
 - **The first full benchmark run is committed**, in `bench/results/2026-11-16/`
   (commit `e0a3180`): hey's summaries, `cmd/bench`'s JSON, the gateway's
   `/metrics` and `env.txt`. Its `dirty tree: yes` came from the results
