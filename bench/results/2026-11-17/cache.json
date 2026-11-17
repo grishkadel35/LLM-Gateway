@@ -1,0 +1,51 @@
+{
+  "subcommand": "cache",
+  "time": "2026-11-17T15:14:00.902139Z",
+  "inputs": {
+    "c": 20,
+    "gateway": "http://127.0.0.1:8080",
+    "n": 1000,
+    "prompts": 200,
+    "seed": 1,
+    "tenant_off": "tn_2bb2b13732ae0b8b",
+    "tenant_on": "tn_1cfded835a38faaa",
+    "zipf_s": 1.2
+  },
+  "measurements": {
+    "distinct_prompts": 142,
+    "hits": 843,
+    "off": {
+      "statuses": {
+        "200": 1000
+      },
+      "cache": {
+        "bypass": 1000
+      },
+      "seconds": 0.472575167
+    },
+    "on": {
+      "statuses": {
+        "200": 1000
+      },
+      "cache": {
+        "hit": 843,
+        "miss": 157
+      },
+      "seconds": 0.299036625
+    },
+    "saving_percent": 81.29546173308033,
+    "usage_off": {
+      "requests": 1000,
+      "cost_micros": 50592,
+      "unpriced_requests": 0,
+      "incomplete_requests": 0
+    },
+    "usage_on": {
+      "requests": 1000,
+      "cost_micros": 9463,
+      "unpriced_requests": 0,
+      "incomplete_requests": 0
+    }
+  },
+  "pass": true
+}

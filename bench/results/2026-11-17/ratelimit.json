@@ -1,0 +1,25 @@
+{
+  "subcommand": "ratelimit",
+  "time": "2026-11-17T15:13:58.526519Z",
+  "inputs": {
+    "allow": 10,
+    "burst": 30,
+    "charge_tokens": 302,
+    "gateway": "http://127.0.0.1:8080",
+    "model": "gpt-4o-mini",
+    "rate_limit_tokens_per_min": 3020,
+    "tenant_id": "tn_91ceafcb9724df5a"
+  },
+  "measurements": {
+    "ok": 10,
+    "other": 0,
+    "rate_limited": 20,
+    "refill_while_deciding_tokens": 0.7832873333333333,
+    "timing": {
+      "all_decided_ms": 15.562,
+      "first_last_event_ms": 679.952,
+      "decided_before_any_settlement": true
+    }
+  },
+  "pass": true
+}

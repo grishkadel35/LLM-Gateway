@@ -1,0 +1,31 @@
+{
+  "subcommand": "budget",
+  "time": "2026-11-17T15:13:59.8789Z",
+  "inputs": {
+    "budget_micros": 1630,
+    "gateway": "http://127.0.0.1:8080",
+    "model": "gpt-4o-mini",
+    "n": 50,
+    "reservation_micros": 163,
+    "room": 10,
+    "tenant_id": "tn_11f238d8c2d6cab0"
+  },
+  "measurements": {
+    "budget_exceeded": 40,
+    "incomplete_rows": 0,
+    "ledger_budget_micros": 1630,
+    "ok": 10,
+    "other": 0,
+    "settled_cost_micros": 9,
+    "spent_micros": 90,
+    "timing": {
+      "all_decided_ms": 20.522,
+      "first_last_event_ms": 680.835,
+      "decided_before_any_settlement": true
+    },
+    "unpriced_rows": 0,
+    "usage_cost_micros": 90,
+    "usage_rows": 10
+  },
+  "pass": true
+}

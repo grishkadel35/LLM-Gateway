@@ -1,0 +1,40 @@
+{
+  "subcommand": "ttfb",
+  "time": "2026-11-17T15:13:57.815896Z",
+  "inputs": {
+    "chunk_delay_ms": 50,
+    "gateway": "http://127.0.0.1:8080",
+    "mock": "http://127.0.0.1:9090",
+    "model": "gpt-4o-mini",
+    "n": 50,
+    "tenant_id": "tn_0565403dd95cb920"
+  },
+  "measurements": {
+    "direct": {
+      "ttfb": {
+        "p50_ms": 0.427,
+        "p95_ms": 0.523,
+        "p99_ms": 1.137
+      },
+      "total": {
+        "p50_ms": 664.74,
+        "p95_ms": 665.955,
+        "p99_ms": 666.247
+      }
+    },
+    "gateway": {
+      "ttfb": {
+        "p50_ms": 4.948,
+        "p95_ms": 8.349,
+        "p99_ms": 13.05
+      },
+      "total": {
+        "p50_ms": 675.265,
+        "p95_ms": 678.819,
+        "p99_ms": 682.529
+      }
+    },
+    "limit_ms": 332.37
+  },
+  "pass": true
+}
