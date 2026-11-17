@@ -56,6 +56,24 @@ compose Postgres and Redis, and the whole stack, seeded and checked by
 
 ### What changed
 
+- **`cmd/bench` measures what a load generator can't.** One stdlib-only Go
+  program with four subcommands, each on a fresh tenant of its own, each
+  printing a summary, writing a JSON result and exiting 0 on a pass, 1 on a
+  failed check and 2 on a setup error:
+  - `ttfb`: streams through the gateway and straight to the mock, timed to
+    the first `data:` line and to the end. It passes when the gateway's p99
+    time to first event is under half the mock's p50 stream time.
+  - `ratelimit`: a limit that fits exactly 10 requests by the gateway's own
+    estimate, and 30 sent at once. It passes on exactly 10 `200`s.
+  - `budget`: a budget with room for 10 reservations, and 50 sent at once. It
+    passes when the spend stays within the budget.
+  - `cache`: one seeded mix of 1,000 requests, Zipf over 200 prompts, sent
+    with the cache on and then off, and the saving in cost.
+
+  The charge and the reservation come from `internal/usage` and
+  `internal/pricing`, not from numbers in the bench. `ratelimit` needs the
+  mock's `-chunk-delay`: with no delay, finished streams refund their unused
+  tokens while the burst is still being decided, and more than 10 get in.
 - **The mock can stream slowly.** `cmd/mockprovider` has a `-chunk-delay`
   flag: a pause before each event of a stream after the first, on every
   provider's stream and Gemini's JSON array. Week 8's benchmarks use it to
