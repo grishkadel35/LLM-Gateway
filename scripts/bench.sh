@@ -268,7 +268,8 @@ bench cache $CACHE_FLAGS -c 20 -seed 1
 {
   echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "commit: $(git rev-parse HEAD)"
-  if [ -n "$(git status --porcelain)" ]; then echo "dirty tree: yes"; else echo "dirty tree: no"; fi
+  # The run's own results don't make the tree dirty.
+  if [ -n "$(git status --porcelain -- . ':!bench/results')" ]; then echo "dirty tree: yes"; else echo "dirty tree: no"; fi
   echo "go: $(go version)"
   echo "cpu: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
   echo "cores: $(sysctl -n hw.ncpu 2>/dev/null || echo unknown)"
