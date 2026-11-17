@@ -23,10 +23,9 @@ provider is a block of YAML, not code.
 
 ## Project status
 
-**Last updated:** 2026-11-09
-**Stage:** Weeks 1 to 7 of 8 complete; Week 7's checkpoint awaits a green CI
-run on GitHub and its review. Every provider
-request is authenticated with a tenant key and held to its tenant's
+**Last updated:** 2026-11-16
+**Stage:** Weeks 1 to 7 of 8 complete; Week 7's checkpoints are closed. Every
+provider request is authenticated with a tenant key and held to its tenant's
 tokens-per-minute limit, and every request that reaches a provider, streamed or
 not, is recorded in Postgres with its tokens and cost, verified live against
 Groq and Gemini. A tenant over its limit gets `429` with `Retry-After` before
@@ -57,6 +56,12 @@ compose Postgres and Redis, and the whole stack, seeded and checked by
 
 ### What changed
 
+- **The mock can stream slowly.** `cmd/mockprovider` has a `-chunk-delay`
+  flag: a pause before each event of a stream after the first, on every
+  provider's stream and Gemini's JSON array. Week 8's benchmarks use it to
+  tell a gateway that streams from one that buffers. The default is 0, and
+  the bytes of a stream are the same with or without it. Non-streaming
+  answers never wait, and a client that leaves mid-stream ends the handler.
 - **Week 7 checkpoint: a fresh clone, and the docs.** A `git clone` of the
   repo, with no `.env` and nothing exported, ran as a compose project of its
   own. `docker compose up -d --build --wait` started all eight services, and
@@ -1491,6 +1496,10 @@ details a usage parser has to get right:
 It also checks each provider's credential header is present (and Anthropic's
 `anthropic-version`), so a provider configured with the wrong `auth` style
 gets a 401, as it would from the real API.
+
+Streams arrive back to back by default. `go run ./cmd/mockprovider -chunk-delay
+50ms` pauses that long before each event after the first, for exercising the
+gateway against a slow upstream.
 
 The handlers live in `internal/mockprovider`, so Go tests can run them
 in-process with `httptest.NewServer(mockprovider.Handler())`.

@@ -17,13 +17,14 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9090", "address to listen on")
+	chunkDelay := flag.Duration("chunk-delay", 0, "pause before each event of a stream after the first, e.g. 50ms; 0 sends streams back to back")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           middleware.Logging(logger)(mockprovider.Handler()),
+		Handler:           middleware.Logging(logger)(mockprovider.NewHandler(mockprovider.Options{ChunkDelay: *chunkDelay})),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

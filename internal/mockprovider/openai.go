@@ -3,17 +3,17 @@ package mockprovider
 import "net/http"
 
 // openAIChat serves POST /v1/chat/completions.
-func openAIChat(w http.ResponseWriter, r *http.Request) {
-	chatCompletions(w, r, false)
+func (m *mock) openAIChat(w http.ResponseWriter, r *http.Request) {
+	m.chatCompletions(w, r, false)
 }
 
 // groqChat serves Groq's OpenAI-compatible POST /openai/v1/chat/completions.
 // It differs from OpenAI only in where a stream reports usage.
-func groqChat(w http.ResponseWriter, r *http.Request) {
-	chatCompletions(w, r, true)
+func (m *mock) groqChat(w http.ResponseWriter, r *http.Request) {
+	m.chatCompletions(w, r, true)
 }
 
-func chatCompletions(w http.ResponseWriter, r *http.Request, groq bool) {
+func (m *mock) chatCompletions(w http.ResponseWriter, r *http.Request, groq bool) {
 	if !requireHeader(w, r, "Authorization") {
 		return
 	}
@@ -62,7 +62,7 @@ func chatCompletions(w http.ResponseWriter, r *http.Request, groq bool) {
 		}
 	}
 
-	s := startSSE(w)
+	s := m.startSSE(w, r)
 	s.event("", chunk([]object{{"index": 0, "delta": object{"role": "assistant", "content": ""}, "finish_reason": nil}}))
 	for _, word := range words() {
 		s.event("", chunk([]object{{"index": 0, "delta": object{"content": word}, "finish_reason": nil}}))

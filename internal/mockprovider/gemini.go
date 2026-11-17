@@ -8,7 +8,7 @@ import (
 
 // gemini serves POST /v1beta/models/{model}:generateContent and
 // :streamGenerateContent.
-func gemini(w http.ResponseWriter, r *http.Request) {
+func (m *mock) gemini(w http.ResponseWriter, r *http.Request) {
 	model, action, _ := strings.Cut(r.PathValue("modelAction"), ":")
 	if action != "generateContent" && action != "streamGenerateContent" {
 		writeJSON(w, http.StatusNotFound, object{
@@ -72,7 +72,7 @@ func gemini(w http.ResponseWriter, r *http.Request) {
 	// JSON array, element by element, as application/json. The gateway has to
 	// meter both.
 	if r.URL.Query().Get("alt") == "sse" {
-		s := startSSE(w)
+		s := m.startSSE(w, r)
 		for _, c := range chunks {
 			s.event("", c)
 		}
@@ -86,6 +86,9 @@ func gemini(w http.ResponseWriter, r *http.Request) {
 		sep := ",\n"
 		if i == 0 {
 			sep = "["
+		}
+		if i > 0 && !m.pause(r) {
+			return
 		}
 		b, _ := json.Marshal(c)
 		_, _ = w.Write([]byte(sep))

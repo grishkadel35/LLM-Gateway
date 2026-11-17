@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // Reply is the text every mock completion returns.
@@ -46,20 +47,56 @@ const (
 // field is the only ID Gemini gives for a request (verified live 2026-10-17).
 const GeminiResponseID = "mock"
 
-// Handler serves all three providers' APIs from one server. Their paths don't
-// collide, so the gateway can point every provider at the same address.
+// Options tunes the handler. The zero value is what Handler serves.
+type Options struct {
+	// ChunkDelay is the pause before every event of a stream after the first.
+	// Zero sends a stream back to back. Non-streaming answers never pause.
+	ChunkDelay time.Duration
+}
+
+// Handler serves all the providers' APIs from one server, with streams sent
+// back to back. Their paths don't collide, so the gateway can point every
+// provider at the same address.
 func Handler() http.Handler {
+	return NewHandler(Options{})
+}
+
+// NewHandler is Handler with opts applied.
+func NewHandler(opts Options) http.Handler {
+	m := &mock{chunkDelay: opts.ChunkDelay}
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat/completions", openAIChat)
+	mux.HandleFunc("POST /v1/chat/completions", m.openAIChat)
 	// Groq's real base URL ends in /openai, so this path also exercises the
 	// gateway's base-path preservation.
-	mux.HandleFunc("POST /openai/v1/chat/completions", groqChat)
-	mux.HandleFunc("POST /v1/messages", anthropicMessages)
+	mux.HandleFunc("POST /openai/v1/chat/completions", m.groqChat)
+	mux.HandleFunc("POST /v1/messages", m.anthropicMessages)
 	// Gemini puts the method after a colon in the last path segment:
 	// /v1beta/models/gemini-x:generateContent. ServeMux wildcards match whole
 	// segments, so the handler splits it.
-	mux.HandleFunc("POST /v1beta/models/{modelAction}", gemini)
+	mux.HandleFunc("POST /v1beta/models/{modelAction}", m.gemini)
 	return mux
+}
+
+// mock carries the settings the handlers share.
+type mock struct {
+	chunkDelay time.Duration
+}
+
+// pause waits out the chunk delay before a stream's next event, and reports
+// false if the client went away first. With no delay it never looks at the
+// context, so a stream is written exactly as it would be without this.
+func (m *mock) pause(r *http.Request) bool {
+	if m.chunkDelay <= 0 {
+		return true
+	}
+	t := time.NewTimer(m.chunkDelay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-r.Context().Done():
+		return false
+	}
 }
 
 // object keeps the nested JSON literals below readable.
@@ -102,22 +139,31 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // sseWriter writes server-sent events, flushing after each one so the client
-// sees them arrive one at a time, as it would from a real provider.
+// sees them arrive one at a time, as it would from a real provider. Events
+// after the first wait out the mock's chunk delay, and are dropped once the
+// client is gone, so a handler's loop ends at once instead of sleeping on.
 type sseWriter struct {
-	w  http.ResponseWriter
-	rc *http.ResponseController
+	w    http.ResponseWriter
+	rc   *http.ResponseController
+	r    *http.Request
+	m    *mock
+	sent bool
 }
 
-func startSSE(w http.ResponseWriter) *sseWriter {
+func (m *mock) startSSE(w http.ResponseWriter, r *http.Request) *sseWriter {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
-	return &sseWriter{w: w, rc: http.NewResponseController(w)}
+	return &sseWriter{w: w, rc: http.NewResponseController(w), r: r, m: m}
 }
 
 // event writes one event. OpenAI and Gemini send data-only events; Anthropic
 // names each one, so name is optional.
 func (s *sseWriter) event(name string, data any) {
+	if s.sent && !s.m.pause(s.r) {
+		return
+	}
+	s.sent = true
 	payload, ok := data.(string)
 	if !ok {
 		b, _ := json.Marshal(data)

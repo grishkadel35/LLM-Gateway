@@ -3,7 +3,7 @@ package mockprovider
 import "net/http"
 
 // anthropicMessages serves POST /v1/messages.
-func anthropicMessages(w http.ResponseWriter, r *http.Request) {
+func (m *mock) anthropicMessages(w http.ResponseWriter, r *http.Request) {
 	// The real API rejects requests missing either header, and both are
 	// supplied by gateway config (auth: x-api-key, plus a static header), so
 	// checking them here catches a misconfigured provider block.
@@ -38,7 +38,7 @@ func anthropicMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s := startSSE(w)
+	s := m.startSSE(w, r)
 
 	// Input usage arrives up front in message_start. Its output_tokens is a
 	// placeholder (1, as the real API sends); the true count comes in
